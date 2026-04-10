@@ -58,19 +58,19 @@ class ODataConnector(BaseSAPConnector):
         self._csrf_token: str | None = None
         self._oauth_token: str | None = None
 
-    def _resolve_proxy(self) -> dict[str, str] | None:
-        """Return httpx-compatible proxy dict or None."""
+    def _resolve_proxy(self) -> str | None:
+        """Return proxy URL string or None (httpx 0.27+ uses proxy=url, not proxies=dict)."""
         # 1. Explicit config takes priority
         if self._settings.sap_proxy:
             proxy_url = self._settings.sap_proxy
             logger.info("Using configured proxy: %s", proxy_url)
-            return {"https://": proxy_url, "http://": proxy_url}
+            return proxy_url
 
         # 2. Auto-detect from system / environment
         detected = _detect_system_proxy(self._settings.sap_base_url)
         if detected:
             logger.info("Using auto-detected system proxy: %s", detected)
-            return {"https://": detected, "http://": detected}
+            return detected
 
         return None
 
@@ -97,15 +97,17 @@ class ODataConnector(BaseSAPConnector):
             verify: ssl.SSLContext | bool = (
                 self._build_ssl_context() if self._settings.sap_verify_ssl else False
             )
-            self._client = httpx.AsyncClient(
+            client_kwargs: dict = dict(
                 base_url=self._settings.sap_base_url,
                 auth=auth,
                 headers=headers,
-                verify=verify,                            # False skips cert; SSLContext enforces TLS 1.2
-                proxies=proxy,                            # None = direct, dict = via proxy
+                verify=verify,
                 timeout=httpx.Timeout(30.0, connect=10.0),
                 follow_redirects=True,
             )
+            if proxy:
+                client_kwargs["proxy"] = proxy
+            self._client = httpx.AsyncClient(**client_kwargs)
             logger.info(
                 "OData client ready → %s (proxy=%s, ssl_verify=%s)",
                 self._settings.sap_base_url,
@@ -128,9 +130,10 @@ class ODataConnector(BaseSAPConnector):
         verify: ssl.SSLContext | bool = (
             self._build_ssl_context() if self._settings.sap_verify_ssl else False
         )
-        async with httpx.AsyncClient(
-            verify=verify, proxies=proxy
-        ) as client:
+        oauth_kwargs: dict = dict(verify=verify)
+        if proxy:
+            oauth_kwargs["proxy"] = proxy
+        async with httpx.AsyncClient(**oauth_kwargs) as client:
             cred = base64.b64encode(
                 f"{self._settings.sap_client_id}:"
                 f"{self._settings.sap_client_secret.get_secret_value()}".encode()
