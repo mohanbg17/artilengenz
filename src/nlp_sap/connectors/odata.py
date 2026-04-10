@@ -94,11 +94,14 @@ class ODataConnector(BaseSAPConnector):
 
             proxy = self._resolve_proxy()
 
+            verify: ssl.SSLContext | bool = (
+                self._build_ssl_context() if self._settings.sap_verify_ssl else False
+            )
             self._client = httpx.AsyncClient(
                 base_url=self._settings.sap_base_url,
                 auth=auth,
                 headers=headers,
-                verify=self._build_ssl_context(),         # TLS 1.2+, optional cert check
+                verify=verify,                            # False skips cert; SSLContext enforces TLS 1.2
                 proxies=proxy,                            # None = direct, dict = via proxy
                 timeout=httpx.Timeout(30.0, connect=10.0),
                 follow_redirects=True,
@@ -122,8 +125,11 @@ class ODataConnector(BaseSAPConnector):
     async def _refresh_oauth_token(self) -> None:
         """Fetch a Bearer token from the SAP OAuth2 token endpoint."""
         proxy = self._resolve_proxy()
+        verify: ssl.SSLContext | bool = (
+            self._build_ssl_context() if self._settings.sap_verify_ssl else False
+        )
         async with httpx.AsyncClient(
-            verify=self._build_ssl_context(), proxies=proxy
+            verify=verify, proxies=proxy
         ) as client:
             cred = base64.b64encode(
                 f"{self._settings.sap_client_id}:"
