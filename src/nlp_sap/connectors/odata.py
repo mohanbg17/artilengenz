@@ -166,7 +166,10 @@ class ODataConnector(BaseSAPConnector):
         expand: list[str] | None = None,
     ) -> str:
         """Construct an OData query URL with $filter, $select, $top."""
-        base = f"{self._settings.sap_odata_base_path}/{service}/{entity_set}"
+        if service:
+            base = f"{self._settings.sap_odata_base_path}/{service}/{entity_set}"
+        else:
+            base = f"{self._settings.sap_odata_base_path}/{entity_set}"
 
         params: dict[str, str] = {"$format": "json", "$top": str(top)}
 

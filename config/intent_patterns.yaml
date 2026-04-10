@@ -11,12 +11,14 @@ intents:
   # ── Finance Intents ──────────────────────────────────────────────────────
   gl_balance_inquiry:
     module: FI
-    description: "General Ledger account balances"
-    keywords: [balance, GL, general ledger, account balance, trial balance]
+    description: "General Ledger account balances and income statement"
+    keywords: [balance, GL, general ledger, account balance, trial balance, income statement, profit and loss, P&L, P&L statement, earnings, revenue expense, financial statement]
     example_queries:
       - "What is the GL balance for account 400000 in company code 1000 for 2024?"
       - "Show me the trial balance for fiscal year 2024"
       - "Get all GL balances for cost center 1001 in Q3 2024"
+      - "Generate income statement for company code 1000 for fiscal year 2024"
+      - "Show me the P&L statement for 2024"
     primary_table: ACDOCA      # S4HANA
     fallback_table: FAGLFLEXT  # ECC
     bapi: BAPI_GL_GETGLACCOUNTBALANCES
