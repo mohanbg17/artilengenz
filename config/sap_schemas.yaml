@@ -1,0 +1,417 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SAP Schema Registry
+# Describes tables, views, BAPIs and OData services used by the NLP engine.
+# The NLP engine uses these schemas to generate precise, valid SAP queries.
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "1.0"
+
+# ── Finance & Controlling (FI/CO) ─────────────────────────────────────────────
+modules:
+  FI:
+    description: "Financial Accounting"
+    tables:
+      BKPF:
+        description: "Accounting Document Header"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, BUKRS, BELNR, GJAHR]
+        fields:
+          BUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          BELNR: {type: CHAR, length: 10, description: "Accounting Document Number"}
+          GJAHR: {type: NUMC, length: 4, description: "Fiscal Year"}
+          BLART: {type: CHAR, length: 2, description: "Document Type"}
+          BLDAT: {type: DATS, length: 8, description: "Document Date"}
+          BUDAT: {type: DATS, length: 8, description: "Posting Date"}
+          MONAT: {type: NUMC, length: 2, description: "Fiscal Period"}
+          WAERS: {type: CUKY, length: 5, description: "Currency Key"}
+          BKTXT: {type: CHAR, length: 25, description: "Document Header Text"}
+          USNAM: {type: CHAR, length: 12, description: "User Name"}
+          XBLNR: {type: CHAR, length: 16, description: "Reference Document Number"}
+
+      BSEG:
+        description: "Accounting Document Segment (Line Items)"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, BUKRS, BELNR, GJAHR, BUZEI]
+        fields:
+          BUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          BELNR: {type: CHAR, length: 10, description: "Accounting Document Number"}
+          GJAHR: {type: NUMC, length: 4, description: "Fiscal Year"}
+          BUZEI: {type: NUMC, length: 3, description: "Line Item"}
+          KOART: {type: CHAR, length: 1, description: "Account Type (D=Debtor,K=Creditor,S=GL)"}
+          HKONT: {type: CHAR, length: 10, description: "General Ledger Account"}
+          KUNNR: {type: CHAR, length: 10, description: "Customer Number"}
+          LIFNR: {type: CHAR, length: 10, description: "Vendor Number"}
+          DMBTR: {type: CURR, length: 13, description: "Amount in Local Currency"}
+          WRBTR: {type: CURR, length: 13, description: "Amount in Document Currency"}
+          SHKZG: {type: CHAR, length: 1, description: "Debit/Credit Indicator"}
+          ZUONR: {type: CHAR, length: 18, description: "Assignment Number"}
+          SGTXT: {type: CHAR, length: 50, description: "Item Text"}
+
+      ACDOCA:
+        description: "Universal Journal Entry Line Items (S4/HANA only)"
+        system: [S4HANA]
+        key_fields: [MANDT, RLDNR, RBUKRS, GJAHR, BELNR, DOCLN]
+        fields:
+          RLDNR: {type: CHAR, length: 2, description: "Ledger"}
+          RBUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          GJAHR: {type: NUMC, length: 4, description: "Fiscal Year"}
+          BELNR: {type: CHAR, length: 10, description: "Accounting Document Number"}
+          DOCLN: {type: CHAR, length: 6, description: "Line Item"}
+          BLART: {type: CHAR, length: 2, description: "Document Type"}
+          BUDAT: {type: DATS, length: 8, description: "Posting Date"}
+          RACCT: {type: CHAR, length: 10, description: "Account Number"}
+          RCNTR: {type: CHAR, length: 10, description: "Cost Center"}
+          PRCTR: {type: CHAR, length: 10, description: "Profit Center"}
+          HSL: {type: CURR, length: 23, description: "Amount in Company Code Currency"}
+          KSL: {type: CURR, length: 23, description: "Amount in Global Currency"}
+          RHCUR: {type: CUKY, length: 5, description: "Company Code Currency"}
+
+      SKA1:
+        description: "G/L Account Master (Chart of Accounts)"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, KTOPL, SAKNR]
+        fields:
+          KTOPL: {type: CHAR, length: 4, description: "Chart of Accounts"}
+          SAKNR: {type: CHAR, length: 10, description: "G/L Account Number"}
+          KTOKS: {type: CHAR, length: 4, description: "Account Group"}
+          BILKT: {type: CHAR, length: 10, description: "Group Account Number"}
+          XBILK: {type: CHAR, length: 1, description: "Account is a Balance Sheet Account"}
+
+      FAGLFLEXT:
+        description: "G/L Account Totals (ECC extension ledger)"
+        system: [ECC]
+        key_fields: [MANDT, RCLNT, RLDNR, RBUKRS, RYEAR, RACCT]
+        fields:
+          RLDNR: {type: CHAR, length: 2, description: "Ledger"}
+          RBUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          RYEAR: {type: NUMC, length: 4, description: "Fiscal Year"}
+          RACCT: {type: CHAR, length: 10, description: "Account Number"}
+          PRCTR: {type: CHAR, length: 10, description: "Profit Center"}
+          HSL01..HSL16: {type: CURR, description: "Period Totals (local currency)"}
+
+      BSAD:
+        description: "Accounts Receivable: Secondary Index - Cleared Items"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, BUKRS, KUNNR, UMSKS, UMSKZ, AUGDT, AUGBL, ZUONR, GJAHR, BELNR, BUZEI]
+        fields:
+          BUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          KUNNR: {type: CHAR, length: 10, description: "Customer Number"}
+          BELNR: {type: CHAR, length: 10, description: "Accounting Document Number"}
+          GJAHR: {type: NUMC, length: 4, description: "Fiscal Year"}
+          DMBTR: {type: CURR, description: "Amount in Local Currency"}
+          BUDAT: {type: DATS, description: "Posting Date"}
+          AUGDT: {type: DATS, description: "Clearing Date"}
+
+      BSID:
+        description: "Accounts Receivable: Secondary Index - Open Items"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, BUKRS, KUNNR, UMSKS, UMSKZ, GJAHR, BELNR, BUZEI]
+        fields:
+          BUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          KUNNR: {type: CHAR, length: 10, description: "Customer Number"}
+          BELNR: {type: CHAR, length: 10, description: "Accounting Document Number"}
+          GJAHR: {type: NUMC, length: 4, description: "Fiscal Year"}
+          DMBTR: {type: CURR, description: "Amount in Local Currency"}
+          BUDAT: {type: DATS, description: "Posting Date"}
+          FAEDT: {type: DATS, description: "Due Date"}
+
+      BSAK:
+        description: "Accounts Payable: Secondary Index - Cleared Items"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, BUKRS, LIFNR, UMSKS, UMSKZ, AUGDT, AUGBL, ZUONR, GJAHR, BELNR, BUZEI]
+        fields:
+          BUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          LIFNR: {type: CHAR, length: 10, description: "Vendor Number"}
+          BELNR: {type: CHAR, length: 10, description: "Accounting Document Number"}
+          DMBTR: {type: CURR, description: "Amount in Local Currency"}
+          BUDAT: {type: DATS, description: "Posting Date"}
+          AUGDT: {type: DATS, description: "Clearing Date"}
+          FAEDT: {type: DATS, description: "Due Date"}
+
+      BSIK:
+        description: "Accounts Payable: Secondary Index - Open Items"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, BUKRS, LIFNR, UMSKS, UMSKZ, GJAHR, BELNR, BUZEI]
+        fields:
+          BUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          LIFNR: {type: CHAR, length: 10, description: "Vendor Number"}
+          BELNR: {type: CHAR, length: 10, description: "Accounting Document Number"}
+          DMBTR: {type: CURR, description: "Amount in Local Currency"}
+          FAEDT: {type: DATS, description: "Due Date"}
+
+    bapis:
+      BAPI_GL_GETGLACCOUNTBALANCES:
+        description: "Get G/L account balances for a company code and fiscal year"
+        import_params:
+          COMPANYCODE: {type: CHAR, length: 4, description: "Company Code"}
+          FISCALYEAR: {type: NUMC, length: 4, description: "Fiscal Year"}
+        export_params:
+          RETURN: "BAPIRET2 — return messages"
+        tables:
+          ACCOUNTBALANCES: "GL account balances by period"
+
+      BAPI_AR_ACC_GETOPENITEMS:
+        description: "Get open items for Accounts Receivable"
+        import_params:
+          COMPANYCODE: {type: CHAR, length: 4}
+          CUSTOMER: {type: CHAR, length: 10}
+          KEYDATE: {type: DATS, description: "Key date for open items"}
+        tables:
+          LINEITEMS: "AR open line items"
+
+      BAPI_AP_ACC_GETOPENITEMS:
+        description: "Get open items for Accounts Payable"
+        import_params:
+          COMPANYCODE: {type: CHAR, length: 4}
+          VENDOR: {type: CHAR, length: 10}
+          KEYDATE: {type: DATS}
+        tables:
+          LINEITEMS: "AP open line items"
+
+    odata_services:
+      API_GLACCOUNTLINEITEM_SRV:
+        description: "G/L Account Line Items (S4/HANA)"
+        system: [S4HANA]
+        entity_sets:
+          - A_GLAccountLineItem
+        key_query_fields: [CompanyCode, FiscalYear, GLAccount, PostingDate]
+
+      API_OPLACCTGDOCSRV:
+        description: "Operational Posting of Accounting Documents"
+        system: [S4HANA]
+        entity_sets:
+          - A_OperationalAcctgDocItem
+
+  CO:
+    description: "Controlling"
+    tables:
+      COSS:
+        description: "CO Object: Cost Totals for Internal Postings"
+        system: [ECC, S4HANA]
+        fields:
+          OBJNR: {type: CHAR, length: 22, description: "Object Number"}
+          GJAHR: {type: NUMC, length: 4, description: "Fiscal Year"}
+          WRTTP: {type: CHAR, length: 2, description: "Value Type"}
+          VERSN: {type: CHAR, length: 3, description: "Version"}
+          KSTAR: {type: CHAR, length: 10, description: "Cost Element"}
+          WKG001..WKG016: {type: CURR, description: "Total Actual Costs Per Period"}
+
+      COSP:
+        description: "CO Object: Cost Totals for External Postings"
+        system: [ECC, S4HANA]
+        fields:
+          OBJNR: {type: CHAR, length: 22, description: "Object Number"}
+          GJAHR: {type: NUMC, length: 4, description: "Fiscal Year"}
+          KSTAR: {type: CHAR, length: 10, description: "Cost Element"}
+          WKG001..WKG016: {type: CURR, description: "Actual Costs Per Period"}
+
+      CSKS:
+        description: "Cost Center Master Data"
+        system: [ECC, S4HANA]
+        fields:
+          KOSTL: {type: CHAR, length: 10, description: "Cost Center"}
+          KOKRS: {type: CHAR, length: 4, description: "Controlling Area"}
+          DATBI: {type: DATS, description: "Valid To"}
+          DATAB: {type: DATS, description: "Valid From"}
+          KHINR: {type: CHAR, length: 12, description: "Cost Center Hierarchy"}
+          VERAK: {type: CHAR, length: 20, description: "Person Responsible"}
+
+# ── Materials Management (MM) ─────────────────────────────────────────────────
+  MM:
+    description: "Materials Management"
+    tables:
+      EKKO:
+        description: "Purchasing Document Header"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, EBELN]
+        fields:
+          EBELN: {type: CHAR, length: 10, description: "Purchasing Document Number (PO)"}
+          BUKRS: {type: CHAR, length: 4, description: "Company Code"}
+          BSART: {type: CHAR, length: 4, description: "Purchasing Document Type"}
+          LIFNR: {type: CHAR, length: 10, description: "Vendor Number"}
+          EKORG: {type: CHAR, length: 4, description: "Purchasing Organization"}
+          EKGRP: {type: CHAR, length: 3, description: "Purchasing Group"}
+          BEDAT: {type: DATS, description: "Purchase Order Date"}
+          WAERS: {type: CUKY, description: "Currency"}
+          ZTERM: {type: CHAR, length: 4, description: "Payment Terms"}
+
+      EKPO:
+        description: "Purchasing Document Item"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, EBELN, EBELP]
+        fields:
+          EBELN: {type: CHAR, length: 10, description: "Purchasing Document Number"}
+          EBELP: {type: NUMC, length: 5, description: "Item Number"}
+          MATNR: {type: CHAR, length: 18, description: "Material Number"}
+          MENGE: {type: QUAN, description: "Purchase Order Quantity"}
+          MEINS: {type: UNIT, description: "Unit of Measure"}
+          NETPR: {type: CURR, description: "Net Price"}
+          WERKS: {type: CHAR, length: 4, description: "Plant"}
+          LGORT: {type: CHAR, length: 4, description: "Storage Location"}
+          EINDT: {type: DATS, description: "Delivery Date"}
+
+      MARA:
+        description: "General Material Data"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, MATNR]
+        fields:
+          MATNR: {type: CHAR, length: 18, description: "Material Number"}
+          MBRSH: {type: CHAR, length: 1, description: "Industry Sector"}
+          MTART: {type: CHAR, length: 4, description: "Material Type"}
+          MATKL: {type: CHAR, length: 9, description: "Material Group"}
+          MEINS: {type: UNIT, description: "Base Unit of Measure"}
+          BRGEW: {type: QUAN, description: "Gross Weight"}
+          NTGEW: {type: QUAN, description: "Net Weight"}
+
+      MARC:
+        description: "Plant Data for Material"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, MATNR, WERKS]
+        fields:
+          MATNR: {type: CHAR, length: 18, description: "Material Number"}
+          WERKS: {type: CHAR, length: 4, description: "Plant"}
+          MTVFP: {type: CHAR, length: 2, description: "Checking Rule"}
+          MINBE: {type: QUAN, description: "Reorder Point"}
+          EISBE: {type: QUAN, description: "Safety Stock"}
+          MABST: {type: QUAN, description: "Maximum Stock Level"}
+
+      MSEG:
+        description: "Document Segment: Material (Goods Movements)"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, MBLNR, MJAHR, ZEILE]
+        fields:
+          MBLNR: {type: CHAR, length: 10, description: "Material Document Number"}
+          MJAHR: {type: NUMC, length: 4, description: "Material Document Year"}
+          ZEILE: {type: NUMC, length: 4, description: "Line"}
+          MATNR: {type: CHAR, length: 18, description: "Material Number"}
+          WERKS: {type: CHAR, length: 4, description: "Plant"}
+          LGORT: {type: CHAR, length: 4, description: "Storage Location"}
+          BWART: {type: CHAR, length: 3, description: "Movement Type"}
+          MENGE: {type: QUAN, description: "Quantity"}
+          EBELN: {type: CHAR, length: 10, description: "Purchase Order Number"}
+
+      MCHB:
+        description: "Batch Stocks"
+        system: [ECC, S4HANA]
+        fields:
+          MATNR: {type: CHAR, description: "Material Number"}
+          WERKS: {type: CHAR, description: "Plant"}
+          LGORT: {type: CHAR, description: "Storage Location"}
+          CHARG: {type: CHAR, description: "Batch Number"}
+          CLABS: {type: QUAN, description: "Unrestricted Stock"}
+
+    odata_services:
+      API_PURCHASEORDER_PROCESS_SRV:
+        description: "Purchase Order Processing (S4/HANA)"
+        system: [S4HANA]
+        entity_sets:
+          - A_PurchaseOrder
+          - A_PurchaseOrderItem
+          - A_PurchaseOrderScheduleLine
+
+# ── Sales & Distribution (SD) ─────────────────────────────────────────────────
+  SD:
+    description: "Sales and Distribution"
+    tables:
+      VBAK:
+        description: "Sales Order Header"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, VBELN]
+        fields:
+          VBELN: {type: CHAR, length: 10, description: "Sales Document Number"}
+          ERDAT: {type: DATS, description: "Creation Date"}
+          AUART: {type: CHAR, length: 4, description: "Sales Document Type"}
+          KUNNR: {type: CHAR, length: 10, description: "Sold-to Party"}
+          VKORG: {type: CHAR, length: 4, description: "Sales Organization"}
+          VTWEG: {type: CHAR, length: 2, description: "Distribution Channel"}
+          SPART: {type: CHAR, length: 2, description: "Division"}
+          WAERK: {type: CUKY, description: "Document Currency"}
+          NETWR: {type: CURR, description: "Net Value"}
+
+      VBAP:
+        description: "Sales Order Item"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, VBELN, POSNR]
+        fields:
+          VBELN: {type: CHAR, length: 10, description: "Sales Document Number"}
+          POSNR: {type: NUMC, length: 6, description: "Item Number"}
+          MATNR: {type: CHAR, length: 18, description: "Material Number"}
+          KWMENG: {type: QUAN, description: "Cumulative Order Quantity"}
+          MEINS: {type: UNIT, description: "Base Unit"}
+          NETWR: {type: CURR, description: "Net Value"}
+          WERKS: {type: CHAR, length: 4, description: "Plant"}
+          LGORT: {type: CHAR, length: 4, description: "Storage Location"}
+          EDATU: {type: DATS, description: "Requested Delivery Date"}
+
+      VBRK:
+        description: "Billing Document Header"
+        system: [ECC, S4HANA]
+        key_fields: [MANDT, VBELN]
+        fields:
+          VBELN: {type: CHAR, length: 10, description: "Billing Document Number"}
+          FKART: {type: CHAR, length: 4, description: "Billing Type"}
+          KUNAG: {type: CHAR, length: 10, description: "Payer"}
+          FKDAT: {type: DATS, description: "Billing Date"}
+          NETWR: {type: CURR, description: "Net Value"}
+          WAERK: {type: CUKY, description: "Currency"}
+
+      LIPS:
+        description: "Delivery Item Data"
+        system: [ECC, S4HANA]
+        fields:
+          VBELN: {type: CHAR, description: "Delivery Number"}
+          POSNR: {type: NUMC, description: "Item Number"}
+          MATNR: {type: CHAR, description: "Material Number"}
+          LFIMG: {type: QUAN, description: "Actual Delivery Quantity"}
+          VGBEL: {type: CHAR, description: "Reference Sales Document"}
+
+    odata_services:
+      API_SALES_ORDER_SRV:
+        description: "Sales Order (S4/HANA)"
+        system: [S4HANA]
+        entity_sets:
+          - A_SalesOrder
+          - A_SalesOrderItem
+
+# ── Warehouse Management (WM/EWM) ────────────────────────────────────────────
+  WM:
+    description: "Warehouse Management"
+    tables:
+      LGPLA:
+        description: "Storage Bin Master Data"
+        system: [ECC, S4HANA]
+        fields:
+          LGNUM: {type: CHAR, description: "Warehouse Number"}
+          LGTYP: {type: CHAR, description: "Storage Type"}
+          LGPLA: {type: CHAR, description: "Storage Bin"}
+          LGBKZ: {type: CHAR, description: "Storage Bin Type"}
+          MAXGW: {type: QUAN, description: "Maximum Weight"}
+
+      LQUA:
+        description: "Quants (Stock in Warehouse)"
+        system: [ECC, S4HANA]
+        fields:
+          LGNUM: {type: CHAR, description: "Warehouse Number"}
+          LGTYP: {type: CHAR, description: "Storage Type"}
+          LGPLA: {type: CHAR, description: "Storage Bin"}
+          MATNR: {type: CHAR, description: "Material Number"}
+          WERKS: {type: CHAR, description: "Plant"}
+          CHARG: {type: CHAR, description: "Batch Number"}
+          VERME: {type: QUAN, description: "Available Stock"}
+          EINME: {type: QUAN, description: "Total Stock"}
+
+# ── Generic RFC ───────────────────────────────────────────────────────────────
+generic_rfc:
+  RFC_READ_TABLE:
+    description: "Generic table reader — reads any transparent table via WHERE clause"
+    warning: "Performance risk on large tables; prefer BAPIs or OData in production"
+    import_params:
+      QUERY_TABLE: {type: CHAR, length: 30, description: "Table name"}
+      DELIMITER: {type: CHAR, length: 1, description: "Field delimiter in output"}
+      NO_DATA: {type: CHAR, length: 1, description: "X = return only fields/structure"}
+      ROWSKIPS: {type: INT4, description: "Number of rows to skip"}
+      ROWCOUNT: {type: INT4, description: "Maximum rows to return"}
+    tables:
+      FIELDS: "Field list to return"
+      OPTIONS: "WHERE conditions (up to 72 chars per row)"
+      DATA: "Result rows"

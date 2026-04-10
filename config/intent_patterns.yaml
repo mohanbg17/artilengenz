@@ -1,0 +1,220 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Intent Patterns for NLP-SAP Query Engine
+# Maps natural language patterns to SAP report intents.
+# Used for few-shot prompting and fuzzy intent classification.
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "1.0"
+
+intents:
+
+  # ── Finance Intents ──────────────────────────────────────────────────────
+  gl_balance_inquiry:
+    module: FI
+    description: "General Ledger account balances"
+    keywords: [balance, GL, general ledger, account balance, trial balance]
+    example_queries:
+      - "What is the GL balance for account 400000 in company code 1000 for 2024?"
+      - "Show me the trial balance for fiscal year 2024"
+      - "Get all GL balances for cost center 1001 in Q3 2024"
+    primary_table: ACDOCA      # S4HANA
+    fallback_table: FAGLFLEXT  # ECC
+    bapi: BAPI_GL_GETGLACCOUNTBALANCES
+    odata_service: API_GLACCOUNTLINEITEM_SRV
+    required_filters: [company_code, fiscal_year]
+    optional_filters: [gl_account, cost_center, profit_center, period]
+    aggregations: [sum_amount, count_documents]
+
+  ar_open_items:
+    module: FI
+    description: "Accounts Receivable open items (unpaid customer invoices)"
+    keywords: [accounts receivable, AR, open items, customer invoice, outstanding, overdue, aging]
+    example_queries:
+      - "Show all open AR items for customer 10001"
+      - "What invoices are overdue for company code 2000?"
+      - "Give me the AR aging report for all customers"
+      - "List unpaid customer invoices older than 90 days"
+    primary_table: BSID
+    bapi: BAPI_AR_ACC_GETOPENITEMS
+    required_filters: [company_code]
+    optional_filters: [customer, due_date, amount_range, posting_date]
+    aggregations: [sum_open_amount, count_items, aging_buckets]
+
+  ap_open_items:
+    module: FI
+    description: "Accounts Payable open items (unpaid vendor invoices)"
+    keywords: [accounts payable, AP, vendor invoice, open payables, outstanding payables]
+    example_queries:
+      - "List all open AP items for vendor 20001"
+      - "What do we owe vendor ABC Corp?"
+      - "Show upcoming AP payments due this month"
+    primary_table: BSIK
+    bapi: BAPI_AP_ACC_GETOPENITEMS
+    required_filters: [company_code]
+    optional_filters: [vendor, due_date, amount_range]
+    aggregations: [sum_open_amount, count_items]
+
+  document_search:
+    module: FI
+    description: "Search accounting documents by various criteria"
+    keywords: [document, posting, journal entry, booking, accounting document]
+    example_queries:
+      - "Find all invoices posted in January 2024"
+      - "Show me document 1800000123 in company code 1000"
+      - "List all reversal documents in fiscal year 2024"
+    primary_table: BKPF
+    join_table: BSEG
+    required_filters: [company_code]
+    optional_filters: [document_number, fiscal_year, document_type, posting_date, reference]
+
+  cost_center_report:
+    module: CO
+    description: "Cost center actual vs plan costs"
+    keywords: [cost center, actual cost, planned cost, variance, overhead]
+    example_queries:
+      - "Show actual costs for cost center 1001 in period 3 of 2024"
+      - "Compare planned vs actual costs for all cost centers in Q1 2024"
+      - "What is the cost variance for department Finance?"
+    primary_table: COSP
+    secondary_table: COSS
+    required_filters: [controlling_area, fiscal_year]
+    optional_filters: [cost_center, cost_element, period, version]
+
+  profit_center_report:
+    module: CO
+    description: "Profit center P&L and balance"
+    keywords: [profit center, P&L, profit and loss, segment reporting]
+    example_queries:
+      - "Show P&L by profit center for 2024"
+      - "What is the profit margin for profit center EU-WEST?"
+    primary_table: ACDOCA  # S4HANA
+    fallback_table: FAGLFLEXT
+    required_filters: [company_code, fiscal_year]
+    optional_filters: [profit_center, period]
+
+  # ── Logistics / MM Intents ───────────────────────────────────────────────
+  purchase_order_status:
+    module: MM
+    description: "Purchase order status and details"
+    keywords: [purchase order, PO, procurement, buying, vendor order]
+    example_queries:
+      - "What is the status of PO 4500012345?"
+      - "List all open purchase orders for vendor 20001"
+      - "Show POs created this month for plant 1000"
+      - "Which POs are overdue for delivery?"
+    primary_table: EKKO
+    join_table: EKPO
+    odata_service: API_PURCHASEORDER_PROCESS_SRV
+    required_filters: []
+    optional_filters: [po_number, vendor, plant, creation_date, delivery_date, purchasing_org]
+
+  goods_movement:
+    module: MM
+    description: "Goods receipts, issues, and stock transfers"
+    keywords: [goods receipt, goods issue, GR, GI, stock transfer, movement type, MIGO]
+    example_queries:
+      - "Show all goods receipts for PO 4500012345"
+      - "What materials were issued from storage location 0001 today?"
+      - "List all stock transfers in plant 1000 this week"
+    primary_table: MSEG
+    required_filters: [movement_type]
+    optional_filters: [po_number, material, plant, storage_location, posting_date]
+
+  inventory_stock:
+    module: MM
+    description: "Current stock levels and inventory"
+    keywords: [inventory, stock, stock level, warehouse stock, available stock, on-hand]
+    example_queries:
+      - "What is the current stock of material M-001 in plant 1000?"
+      - "Show all materials below safety stock in plant 2000"
+      - "Give me the inventory report for warehouse 0001"
+    primary_table: MCHB
+    secondary_table: MARC
+    required_filters: []
+    optional_filters: [material, plant, storage_location, warehouse]
+
+  # ── Sales & Distribution Intents ─────────────────────────────────────────
+  sales_order_status:
+    module: SD
+    description: "Sales order status, value, and delivery"
+    keywords: [sales order, SO, order, customer order, delivery, shipment]
+    example_queries:
+      - "Show all open sales orders for customer 10001"
+      - "What is the delivery status of order 1000012345?"
+      - "List sales orders created in Q4 2024 by sales org 1000"
+    primary_table: VBAK
+    join_table: VBAP
+    odata_service: API_SALES_ORDER_SRV
+    required_filters: []
+    optional_filters: [order_number, customer, sales_org, creation_date, delivery_date]
+
+  revenue_report:
+    module: SD
+    description: "Billing revenue by customer, material or period"
+    keywords: [revenue, billing, invoice, sales revenue, net value, turnover]
+    example_queries:
+      - "What is the total revenue for customer 10001 in 2024?"
+      - "Show monthly revenue by sales org for 2024"
+      - "Which products generated the most revenue in Q3?"
+    primary_table: VBRK
+    join_table: VBAP
+    required_filters: [fiscal_year]
+    optional_filters: [customer, material, sales_org, billing_date]
+
+  # ── Cross-module ─────────────────────────────────────────────────────────
+  cash_flow:
+    module: FI
+    description: "Cash flow and liquidity position"
+    keywords: [cash flow, liquidity, cash position, bank balance, treasury]
+    example_queries:
+      - "What is our current cash position?"
+      - "Show cash inflows and outflows for March 2024"
+    primary_table: BSEG
+    filter_by: {KOART: "B"}  # Bank accounts
+    required_filters: [company_code]
+    optional_filters: [posting_date, house_bank]
+
+# ── Filter Value Aliases ──────────────────────────────────────────────────────
+# Maps user-friendly terms to SAP field values
+filter_aliases:
+  document_types:
+    invoice: ["RE", "KR", "DR", "KG"]
+    credit_memo: ["KG", "DG"]
+    payment: ["ZP", "ZK"]
+    journal_entry: ["SA"]
+    reversal: ["AB", "RN"]
+
+  movement_types:
+    goods_receipt: ["101", "102", "103", "104"]
+    goods_issue: ["201", "202", "261", "262"]
+    stock_transfer: ["301", "302", "311", "312"]
+    return_to_vendor: ["122", "123"]
+    scrapping: ["551", "552"]
+
+  time_expressions:
+    today: "CURRENT_DATE"
+    this_week: "CURRENT_WEEK"
+    this_month: "CURRENT_MONTH"
+    this_quarter: "CURRENT_QUARTER"
+    this_year: "CURRENT_YEAR"
+    last_month: "LAST_MONTH"
+    last_quarter: "LAST_QUARTER"
+    last_year: "LAST_YEAR"
+
+  fiscal_period_map:
+    january: "01"
+    february: "02"
+    march: "03"
+    april: "04"
+    may: "05"
+    june: "06"
+    july: "07"
+    august: "08"
+    september: "09"
+    october: "10"
+    november: "11"
+    december: "12"
+    Q1: ["01", "02", "03"]
+    Q2: ["04", "05", "06"]
+    Q3: ["07", "08", "09"]
+    Q4: ["10", "11", "12"]

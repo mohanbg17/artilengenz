@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+*.egg
+
+# Environment (NEVER commit secrets)
+.env
+.env.local
+.env.production
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# SAP NW RFC SDK (binary, not committed)
+nwrfcsdk/
+sapnwrfc.cfg
+
+# OS
+.DS_Store
+Thumbs.db
