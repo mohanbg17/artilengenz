@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from nlp_sap.config import AuthType, Settings
 from nlp_sap.connectors.base import BaseSAPConnector, SAPQueryRequest, SAPQueryResult
@@ -195,7 +195,11 @@ class ODataConnector(BaseSAPConnector):
 
         return f"{base}?{urlencode(params)}"
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)),
+    )
     async def _fetch(self, url: str) -> dict:
         client = await self._get_client()
         resp = await client.get(url)
