@@ -65,6 +65,7 @@ class SAPQueryPlan(BaseModel):
     query_type: str = "table"          # "table" | "bapi" | "odata"
     odata_service: str | None = None
     odata_entity_set: str | None = None
+    odata_expand: list[str] = Field(default_factory=list)
     bapi_name: str | None = None
     bapi_import_params: dict[str, Any] = Field(default_factory=dict)
     bapi_output_tables: list[str] = Field(default_factory=list)

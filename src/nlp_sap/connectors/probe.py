@@ -53,13 +53,6 @@ _COMMON_SAP_PORTS: list[tuple[int, bool]] = [
     (8080,  False),
 ]
 
-# NLP engine OData services that need to be activated in SAP
-_NLP_SERVICES: list[tuple[str, str]] = [
-    ("API_GLACCOUNTLINEITEM_SRV",   "A_GLAccountLineItem"),
-    ("API_PURCHASEORDER_PROCESS_SRV", "A_PurchaseOrder"),
-    ("API_SALES_ORDER_SRV",         "A_SalesOrder"),
-]
-
 
 async def probe(settings: Settings) -> ProbeResult:
     host = settings.sap_host
@@ -138,7 +131,15 @@ async def probe(settings: Settings) -> ProbeResult:
 
         # ── Per-service checks ─────────────────────────────────────────────
         if result.authenticated:
-            for svc, entity in _NLP_SERVICES:
+            # Use configured entity set for FAC service (may be HeaderSet or HeaderCollection)
+            fac_entity = getattr(settings, "sap_fac_entity_set", "HeaderSet")
+            services_to_check = [
+                ("FAC_FINANCIAL_DOCUMENT_SRV_01", fac_entity),
+                ("API_GLACCOUNTLINEITEM_SRV",     "A_GLAccountLineItem"),
+                ("API_PURCHASEORDER_PROCESS_SRV", "A_PurchaseOrder"),
+                ("API_SALES_ORDER_SRV",           "A_SalesOrder"),
+            ]
+            for svc, entity in services_to_check:
                 url = (
                     f"{base_url}/sap/opu/odata/sap/{svc}/{entity}"
                     f"?$top=1&$format=json"

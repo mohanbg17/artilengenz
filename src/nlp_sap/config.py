@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     # Set false for self-signed SAP dev certificates (common on sandbox systems)
     sap_verify_ssl: bool = Field(default=False, alias="SAP_VERIFY_SSL")
 
+    # ── SAP OData Service Overrides ───────────────────────────────────────────
+    # Override the entity set name for FAC_FINANCIAL_DOCUMENT_SRV_01.
+    # Try "HeaderSet" first; if probe returns 404 change to "HeaderCollection".
+    sap_fac_entity_set: str = Field(default="HeaderSet", alias="SAP_FAC_ENTITY_SET")
+
     # ── SAP System ───────────────────────────────────────────────────────────
     sap_system_type: SAPSystemType = Field(
         default=SAPSystemType.S4HANA, alias="SAP_SYSTEM_TYPE"

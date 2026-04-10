@@ -49,6 +49,7 @@ class QueryBuilder:
             join_on=plan.join_on,
             odata_service=plan.odata_service,
             odata_entity_set=plan.odata_entity_set,
+            odata_expand=plan.odata_expand,
             bapi_import_params=plan.bapi_import_params,
             bapi_table_params=plan.bapi_output_tables,
         )
@@ -60,6 +61,8 @@ class QueryBuilder:
 
     def _plan_gl_balance_inquiry(self, intent: ParsedIntent) -> SAPQueryPlan:
         filters = self._base_fi_filters(intent)
+        # Note: GLAccount / CostCenter / ProfitCenter are item-level in FAC service;
+        # add them as item-level hints but don't use for header-level OData filter.
         if intent.gl_account:
             filters["RACCT"] = intent.gl_account
         if intent.cost_center:
@@ -68,16 +71,22 @@ class QueryBuilder:
             filters["PRCTR"] = intent.profit_center
 
         if self._is_s4():
+            # Use FAC_FINANCIAL_DOCUMENT_SRV_01 — active on this SAP system.
+            # Header entity supports CompanyCode / FiscalYear / FiscalPeriod / PostingDate filters.
+            # Items navigation expands line items with GL account + amounts.
+            # (API_GLACCOUNTLINEITEM_SRV requires explicit Fiori activation / S_SERVICE auth.)
+            fac_entity_set = getattr(self._settings, "sap_fac_entity_set", "HeaderSet")
             return SAPQueryPlan(
                 intent=intent,
                 primary_table="ACDOCA",
                 query_type="odata",
-                odata_service="API_GLACCOUNTLINEITEM_SRV",
-                odata_entity_set="A_GLAccountLineItem",
-                filters=self._map_fi_odata_filters(filters),
-                fields=["CompanyCode", "FiscalYear", "GLAccount", "PostingDate",
-                        "AmountInCompanyCodeCurrency", "CompanyCodeCurrency",
-                        "CostCenter", "ProfitCenter"],
+                odata_service="FAC_FINANCIAL_DOCUMENT_SRV_01",
+                odata_entity_set=fac_entity_set,
+                odata_expand=["Items"],
+                filters=self._map_fac_header_filters(filters),
+                fields=["AccountingDocument", "CompanyCode", "FiscalYear", "FiscalPeriod",
+                        "PostingDate", "AccountingDocumentType", "CoCodeCurrency",
+                        "AmountInCoCodeCrcy", "AmountInTransactionCrcy", "TransactionCurrency"],
                 aggregations=["sum_amount"],
                 max_rows=intent.max_rows,
             )
@@ -367,6 +376,21 @@ class QueryBuilder:
         if intent.date_from:
             filters["BUDAT"] = {"gte": intent.date_from, "lte": intent.date_to or date.today().isoformat()}
         return filters
+
+    def _map_fac_header_filters(self, raw: dict) -> dict:
+        """Map to FAC_FINANCIAL_DOCUMENT_SRV_01 Header entity field names.
+
+        Only includes header-level filterable fields — item-level fields
+        (GLAccount, CostCenter, ProfitCenter) are dropped because the Header
+        entity does not expose them as filter parameters.
+        """
+        mapping = {
+            "BUKRS": "CompanyCode",
+            "GJAHR": "FiscalYear",
+            "MONAT": "FiscalPeriod",
+            "BUDAT": "PostingDate",
+        }
+        return {mapping[k]: v for k, v in raw.items() if k in mapping}
 
     def _map_fi_odata_filters(self, raw: dict) -> dict:
         """Map internal field names to OData API field names for FI."""

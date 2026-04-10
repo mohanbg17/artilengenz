@@ -234,9 +234,16 @@ async def connect_probe(orchestrator: OrchestratorDep) -> dict:
     result: ProbeResult = await probe(settings)
     activation_hints = []
     for svc in result.services_missing:
-        activation_hints.append(
-            f"Activate '{svc}' in SAP: transaction /IWFND/MAINT_SERVICE → Add Service"
-        )
+        if svc == "FAC_FINANCIAL_DOCUMENT_SRV_01":
+            activation_hints.append(
+                f"'{svc}' not found at EntitySet 'HeaderSet' — "
+                "try 'HeaderCollection' instead (set SAP_FAC_ENTITY_SET in .env). "
+                "Activate via /IWFND/MAINT_SERVICE if completely missing."
+            )
+        else:
+            activation_hints.append(
+                f"Activate '{svc}' in SAP: transaction /IWFND/MAINT_SERVICE → Add Service"
+            )
 
     return {
         "host":             result.host,
