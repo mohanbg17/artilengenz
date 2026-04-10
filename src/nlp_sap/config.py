@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     sap_rfc_logon_group: str = Field(default="", alias="SAP_RFC_LOGON_GROUP")
     sap_rfc_enabled: bool = Field(default=False, alias="SAP_RFC_ENABLED")
 
+    # ── SAP Network / SSL ────────────────────────────────────────────────────
+    # Proxy URL e.g. http://proxy.corp.com:8080 — leave blank to auto-detect
+    # from system (HTTPS_PROXY env var or Windows registry proxy settings)
+    sap_proxy: str = Field(default="", alias="SAP_PROXY")
+    # Set false for self-signed SAP dev certificates (common on sandbox systems)
+    sap_verify_ssl: bool = Field(default=False, alias="SAP_VERIFY_SSL")
+
     # ── SAP System ───────────────────────────────────────────────────────────
     sap_system_type: SAPSystemType = Field(
         default=SAPSystemType.S4HANA, alias="SAP_SYSTEM_TYPE"

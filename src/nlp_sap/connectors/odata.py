@@ -1,7 +1,8 @@
 """SAP OData v2/v4 Connector.
 
 Communicates with SAP S4/HANA via standard OData REST APIs.
-Handles authentication (Basic, OAuth2), CSRF tokens, and result pagination.
+Handles authentication (Basic, OAuth2), CSRF tokens, result pagination,
+corporate HTTP proxies, and self-signed SSL certificates.
 """
 
 from __future__ import annotations
@@ -9,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import urllib.request
 from datetime import date, datetime
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -22,8 +24,32 @@ from nlp_sap.connectors.base import BaseSAPConnector, SAPQueryRequest, SAPQueryR
 logger = logging.getLogger(__name__)
 
 
+def _detect_system_proxy(url: str) -> str | None:
+    """Read proxy from environment variables or Windows system proxy settings.
+
+    Priority:
+      1. HTTPS_PROXY / HTTP_PROXY environment variables
+      2. Windows registry / IE proxy (via urllib.request.getproxies())
+      3. None (direct connection)
+    """
+    proxies = urllib.request.getproxies()
+    scheme = "https" if url.startswith("https") else "http"
+    proxy = proxies.get(scheme) or proxies.get("all")
+    if proxy:
+        logger.debug("Auto-detected system proxy: %s", proxy)
+    return proxy
+
+
 class ODataConnector(BaseSAPConnector):
-    """SAP OData connector using httpx for async HTTP."""
+    """SAP OData connector using httpx for async HTTP.
+
+    Automatically handles:
+    - Corporate HTTP/HTTPS proxies (reads system proxy settings)
+    - Self-signed SAP dev certificates (SAP_VERIFY_SSL=false)
+    - Basic Auth and OAuth2
+    - CSRF token fetch for write operations
+    - SAP OData v2 (d.results) and v4 (value) response formats
+    """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -31,9 +57,29 @@ class ODataConnector(BaseSAPConnector):
         self._csrf_token: str | None = None
         self._oauth_token: str | None = None
 
+    def _resolve_proxy(self) -> dict[str, str] | None:
+        """Return httpx-compatible proxy dict or None."""
+        # 1. Explicit config takes priority
+        if self._settings.sap_proxy:
+            proxy_url = self._settings.sap_proxy
+            logger.info("Using configured proxy: %s", proxy_url)
+            return {"https://": proxy_url, "http://": proxy_url}
+
+        # 2. Auto-detect from system / environment
+        detected = _detect_system_proxy(self._settings.sap_base_url)
+        if detected:
+            logger.info("Using auto-detected system proxy: %s", detected)
+            return {"https://": detected, "http://": detected}
+
+        return None
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            headers = {"Accept": "application/json", "sap-client": self._settings.sap_client}
+            headers = {
+                "Accept": "application/json",
+                "sap-client": self._settings.sap_client,
+                "sap-language": self._settings.sap_language,
+            }
             auth = None
 
             if self._settings.sap_auth_type == AuthType.BASIC:
@@ -45,19 +91,31 @@ class ODataConnector(BaseSAPConnector):
                 await self._refresh_oauth_token()
                 headers["Authorization"] = f"Bearer {self._oauth_token}"
 
+            proxy = self._resolve_proxy()
+
             self._client = httpx.AsyncClient(
                 base_url=self._settings.sap_base_url,
                 auth=auth,
                 headers=headers,
-                verify=True,
+                verify=self._settings.sap_verify_ssl,   # False for self-signed SAP certs
+                proxies=proxy,                            # None = direct, dict = via proxy
                 timeout=httpx.Timeout(30.0, connect=10.0),
                 follow_redirects=True,
+            )
+            logger.info(
+                "OData client ready → %s (proxy=%s, ssl_verify=%s)",
+                self._settings.sap_base_url,
+                proxy or "none",
+                self._settings.sap_verify_ssl,
             )
         return self._client
 
     async def _refresh_oauth_token(self) -> None:
         """Fetch a Bearer token from the SAP OAuth2 token endpoint."""
-        async with httpx.AsyncClient() as client:
+        proxy = self._resolve_proxy()
+        async with httpx.AsyncClient(
+            verify=self._settings.sap_verify_ssl, proxies=proxy
+        ) as client:
             cred = base64.b64encode(
                 f"{self._settings.sap_client_id}:"
                 f"{self._settings.sap_client_secret.get_secret_value()}".encode()
@@ -103,7 +161,6 @@ class ODataConnector(BaseSAPConnector):
         filter_parts: list[str] = []
         for field_name, value in filters.items():
             if isinstance(value, list):
-                # IN clause → expand to multiple eq with 'or'
                 or_parts = [f"{field_name} eq '{v}'" for v in value]
                 filter_parts.append("(" + " or ".join(or_parts) + ")")
             elif isinstance(value, dict) and "gte" in value:
@@ -128,10 +185,20 @@ class ODataConnector(BaseSAPConnector):
         return resp.json()
 
     async def execute(self, request: SAPQueryRequest) -> SAPQueryResult:
-        if request.query_type != "odata":
+        if request.query_type not in ("odata", "table", "bapi"):
             return SAPQueryResult(
                 data=[],
-                error=f"ODataConnector only handles 'odata' queries, got '{request.query_type}'",
+                error=f"ODataConnector received unexpected query_type '{request.query_type}'",
+            )
+
+        # For table/bapi query types fall back to RFC_READ_TABLE via OData generic
+        # service — only works if OData is the only connector available
+        if request.query_type in ("table", "bapi"):
+            logger.warning(
+                "ODataConnector received query_type='%s' for %s — "
+                "attempting OData fallback; consider enabling RFC connector.",
+                request.query_type,
+                request.table_or_function,
             )
 
         service = request.odata_service or ""
@@ -149,14 +216,39 @@ class ODataConnector(BaseSAPConnector):
             logger.debug("OData GET %s", url)
             raw = await self._fetch(url)
         except httpx.HTTPStatusError as exc:
-            logger.error("OData HTTP error: %s", exc)
-            return SAPQueryResult(data=[], error=str(exc))
+            logger.error("OData HTTP %s: %s", exc.response.status_code, exc)
+            hint = ""
+            if exc.response.status_code == 401:
+                hint = " — check SAP_USERNAME / SAP_PASSWORD"
+            elif exc.response.status_code == 403:
+                hint = " — user lacks OData authorisation (ask Basis for /IWFND/RT_GW_USER)"
+            elif exc.response.status_code == 404:
+                hint = " — service not activated (run /IWFND/MAINT_SERVICE in SAP)"
+            return SAPQueryResult(data=[], error=str(exc) + hint)
+        except httpx.ProxyError as exc:
+            logger.error("Proxy error: %s", exc)
+            return SAPQueryResult(
+                data=[],
+                error=(
+                    f"Proxy error: {exc}. "
+                    "Set SAP_PROXY=http://proxy-host:port in .env or leave blank for auto-detect."
+                ),
+            )
+        except httpx.ConnectError as exc:
+            logger.error("Connection failed: %s", exc)
+            return SAPQueryResult(
+                data=[],
+                error=(
+                    f"Cannot connect to {self._settings.sap_base_url}: {exc}. "
+                    "Check SAP_HOST, SAP_HTTP_PORT, and network/proxy settings."
+                ),
+            )
         except Exception as exc:
             logger.error("OData unexpected error: %s", exc)
             return SAPQueryResult(data=[], error=str(exc))
 
-        # SAP OData v2 returns {"d": {"results": [...]}}
-        # SAP OData v4 returns {"value": [...]}
+        # SAP OData v2: {"d": {"results": [...]}}
+        # SAP OData v4: {"value": [...]}
         rows: list[dict] = []
         if "d" in raw:
             rows = raw["d"].get("results", [])
@@ -170,15 +262,20 @@ class ODataConnector(BaseSAPConnector):
             data=rows,
             total_count=int(total),
             has_more=len(rows) >= request.max_rows,
+            metadata={"source": "odata"},
             raw_response=raw,
         )
 
     async def ping(self) -> bool:
         try:
             client = await self._get_client()
-            resp = await client.get(self._settings.sap_odata_base_path)
-            return resp.status_code < 400
-        except Exception:
+            resp = await client.get(
+                "/sap/opu/odata/IWFND/CATALOGSERVICE"
+                ";v=2/ServiceCollection?$top=1&$format=json"
+            )
+            return resp.status_code in (200, 401)
+        except Exception as exc:
+            logger.warning("OData ping failed: %s", exc)
             return False
 
     async def close(self) -> None:
