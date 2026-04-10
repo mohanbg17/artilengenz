@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from nlp_sap.connectors.probe import ProbeResult, probe
 from nlp_sap.nlp.models import NLPQueryResponse
 from nlp_sap.orchestrator import QueryOrchestrator
 
@@ -201,4 +202,53 @@ async def ping_sap(orchestrator: OrchestratorDep) -> dict:
     return {
         "sap_reachable": reachable,
         "mock_mode": orchestrator._settings.mock_sap,
+    }
+
+
+@router.get(
+    "/connect",
+    summary="Full SAP S/4HANA connection probe (TCP + OData + Auth + Services)",
+    tags=["health"],
+)
+async def connect_probe(orchestrator: OrchestratorDep) -> dict:
+    """Run a deep connectivity check against the configured SAP system.
+
+    Returns:
+    - TCP reachability
+    - OData endpoint status
+    - Authentication result
+    - Which NLP engine OData services are activated
+    - Suggested .env block to paste
+
+    Safe to call without admin rights — only uses HTTP(S).
+    """
+    settings = orchestrator._settings
+    if settings.mock_sap:
+        return {
+            "mode": "mock",
+            "ready": True,
+            "message": "Running in mock mode — no live SAP connection needed.",
+            "to_use_live_sap": "Set MOCK_SAP=false in .env and restart.",
+        }
+
+    result: ProbeResult = await probe(settings)
+    activation_hints = []
+    for svc in result.services_missing:
+        activation_hints.append(
+            f"Activate '{svc}' in SAP: transaction /IWFND/MAINT_SERVICE → Add Service"
+        )
+
+    return {
+        "host":             result.host,
+        "port":             result.port,
+        "tcp_reachable":    result.tcp_reachable,
+        "odata_reachable":  result.odata_reachable,
+        "authenticated":    result.authenticated,
+        "services_ok":      result.services_ok,
+        "services_missing": result.services_missing,
+        "elapsed_ms":       result.elapsed_ms,
+        "ready":            result.ready,
+        "error":            result.error,
+        "activation_hints": activation_hints,
+        "suggested_env":    result.suggested_env,
     }
