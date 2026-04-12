@@ -1,19 +1,16 @@
 """
-ARTILEGENZ SAP Claude Agent v4.0
-Full READ + WRITE + CONFIGURATION + TRANSPORT operations.
+ARTILEGENZ SAP Claude Agent v5.0
+Authorization: SAP_ALL + SAP_NEW (full system access confirmed via SU01)
 User: S4ABAP24
 
-Supports:
-  - Sales order analysis (VA05, VA03, VBFA)
-  - Table reads (SE16N)
-  - Company code creation (OX02)
-  - Plant creation (OX10)
-  - Sales org creation (OVX5)
-  - Distribution channel (OVXI), Division (OVXB)
-  - Controlling area (OKKP)
-  - All SPRO customising
-  - Transport requests (SE09)
-  - Any transaction S4ABAP24 has access to
+SAP_ALL grants unrestricted access to:
+  - ALL transactions (VA*, ME*, MM*, FI*, CO*, HR*, BC*, basis, development)
+  - ALL tables (read + write via SM30/SM31/SE16N)
+  - ALL SPRO customising activities
+  - ALL ABAP development (SE38, SE37, SE80, SE11)
+  - ALL transport functions (SE09, SE10, STMS)
+  - ALL user/role administration (SU01, PFCG)
+  - ALL system administration (SM50, SM51, SM12, RZ10, RZ20)
 
 Requirements:
     pip install anthropic pywin32
@@ -244,6 +241,76 @@ def read_sap_table(table_name, max_rows=200):
     except Exception as e:
         return {"error": str(e)}
 
+def maintain_table(table_name):
+    """Open SM30 table maintenance for direct table writes."""
+    go_to_transaction("SM30")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtVIEWNAME").Text = table_name
+        # Choose Maintain (not Display)
+        try:
+            session.FindById("wnd[0]/usr/btnMAINTAIN").Press()
+        except Exception:
+            session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+        return {"table": table_name, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+def execute_abap(program_name=None, abap_code=None):
+    """
+    Execute an existing ABAP program via SA38, or
+    create+run a temporary program via SE38.
+    """
+    if program_name:
+        go_to_transaction("SA38")
+        time.sleep(1)
+        try:
+            session.FindById("wnd[0]/usr/ctxtRS38M-PROGRAMM").Text = program_name
+            session.FindById("wnd[0]").SendVKey(8)  # Execute
+            time.sleep(2)
+            return {"program": program_name, "screen": get_screen_text()}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"note": "Provide program_name to execute existing ABAP program."}
+
+def create_transport(description="ARTILEGENZ Change"):
+    """Create a new Workbench or Customising transport request via SE09."""
+    go_to_transaction("SE09")
+    time.sleep(1)
+    try:
+        # Click Create button
+        session.FindById("wnd[0]/tbar[1]/btn[13]").Press()
+        time.sleep(1)
+        popup = session.FindById("wnd[1]", False)
+        if popup:
+            # Set description if field available
+            try:
+                popup.FindById("usr/txtKO007-AS4TEXT").Text = description
+            except Exception:
+                pass
+            popup.SendVKey(0)   # Enter/Create
+            time.sleep(1.5)
+        return {"screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+def release_transport(transport_number):
+    """Release a transport request via SE09."""
+    go_to_transaction("SE09")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtKO007-TRKORR").Text = transport_number
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1)
+        # Press Release button
+        session.FindById("wnd[0]/tbar[1]/btn[19]").Press()
+        time.sleep(1)
+        handle_popup("confirm")
+        return {"transport": transport_number, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
 def get_sales_orders(date_from, date_to):
     go_to_transaction("VA05")
     time.sleep(1)
@@ -427,12 +494,85 @@ TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "maintain_table",
+        "description": (
+            "Open SM30 table maintenance view for direct table write access. "
+            "SAP_ALL grants write to all tables: T001, T001W, TVKO, EDIDC, etc. "
+            "Use discover_screen_elements after opening to find entry fields. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "table_name": {
+                    "type": "string",
+                    "description": "Table or view name e.g. T001, V_001, T001W",
+                },
+            },
+            "required": ["table_name"],
+        },
+    },
+    {
+        "name": "execute_abap_program",
+        "description": (
+            "Execute an existing ABAP report/program via SA38. "
+            "SAP_ALL allows running any program. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "program_name": {
+                    "type": "string",
+                    "description": "ABAP program name e.g. RGSPAR00, Z_MY_REPORT",
+                },
+            },
+            "required": ["program_name"],
+        },
+    },
+    {
+        "name": "create_transport_request",
+        "description": (
+            "Create a new Workbench or Customising transport request via SE09. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "Transport description e.g. 'ARTILEGENZ Org Structure'",
+                },
+            },
+            "required": ["description"],
+        },
+    },
+    {
+        "name": "release_transport_request",
+        "description": (
+            "Release an existing transport request via SE09 so it can be imported. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "transport_number": {
+                    "type": "string",
+                    "description": "Transport number e.g. S4K900123",
+                },
+            },
+            "required": ["transport_number"],
+        },
+    },
 ]
 
 # ── Write operations that need approval ───────────────────────────────────────
 WRITE_TOOLS = {
     "set_field_value", "press_button", "send_vkey",
     "handle_popup", "handle_transport_request",
+    "maintain_table", "execute_abap_program",
+    "create_transport_request", "release_transport_request",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
@@ -480,63 +620,117 @@ def dispatch(tool_name, tool_input):
         )
     if tool_name == "handle_transport_request":
         return handle_transport(tool_input.get("transport_number"))
+    if tool_name == "maintain_table":
+        return maintain_table(tool_input["table_name"])
+    if tool_name == "execute_abap_program":
+        return execute_abap(program_name=tool_input.get("program_name"))
+    if tool_name == "create_transport_request":
+        return create_transport(tool_input.get("description", "ARTILEGENZ Change"))
+    if tool_name == "release_transport_request":
+        return release_transport(tool_input["transport_number"])
 
     return {"error": f"Unknown tool: {tool_name}"}
 
 # ── System Prompt ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = f"""You are ARTILEGENZ — an expert SAP S/4 HANA consultant
-with full GUI access running as user S4ABAP24.
+with FULL SYSTEM ACCESS running as user S4ABAP24.
 
-DATE/TIME : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-SAP USER  : S4ABAP24
+DATE/TIME    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+SAP USER     : S4ABAP24
+AUTHORIZATION: SAP_ALL + SAP_NEW (verified in SU01)
+               → Unrestricted access to ALL transactions,
+                 ALL tables, ALL configuration, ALL development,
+                 ALL transport functions.
 
 ═══════════════════════════════════════════════════════════
- CAPABILITIES  (you CAN do all of these)
+ WHAT YOU CAN DO  (SAP_ALL — no restrictions)
 ═══════════════════════════════════════════════════════════
-READ
-  • Sales orders            VA05 / VA03
-  • Any SAP table           SE16N  (T001, VBAK, EDIDC, T001W …)
-  • Document flow           VA03 → Environment → Document Flow
-  • Screen content          read_screen
 
-CONFIGURE (all writes require human approval)
-  • Company Code            OX02  → fields: BUKRS, BUTXT, ORT01, LAND1, WAERS
-  • Plant                   OX10  → fields: WERKS, NAME1, LAND1, ORT01
-  • Sales Organisation      OVX5  → fields: VKORG, VTEXT, BUKRS, WAERS
-  • Distribution Channel    OVXI  → fields: VTWEG, VTEXT
-  • Division                OVXB  → fields: SPART, VTEXT
-  • Controlling Area        OKKP  → fields: KOKRS, BEZEI, BUKRS, WAERS
-  • Any SPRO IMG activity   go_to_transaction → discover → fill → save → transport
-  • Transports              SE09 (create/display/release)
+READ ANY DATA
+  • Sales/Purchase/Finance docs    VA05, ME23N, FB03 …
+  • Any table (read)               SE16N — T001, VBAK, EDIDC, BKPF …
+  • Document flow                  VA03 → Environment → Document Flow
+  • System logs                    SM21, ST22, SLG1
 
-WRITE PATTERN (always follow this order):
+WRITE / CHANGE ANY DATA (human approval required per action)
+  • Any SAP table directly         SM30 / SM31 (maintain_table tool)
+  • Sales orders                   VA02
+  • Purchase orders                ME22N
+  • FI postings                    FB01, F-02
+  • Master data                    MM02, XD02, XK02, CS02 …
+  • IDocs                          WE19, BD87
+
+CONFIGURATION (human approval required)
+  • Company Code                   OX02  BUKRS / BUTXT / ORT01 / LAND1 / WAERS
+  • Plant                          OX10  WERKS / NAME1 / LAND1 / ORT01
+  • Sales Organisation             OVX5  VKORG / VTEXT / BUKRS / WAERS
+  • Distribution Channel           OVXI  VTWEG / VTEXT
+  • Division                       OVXB  SPART / VTEXT
+  • Controlling Area               OKKP  KOKRS / BEZEI / BUKRS / WAERS
+  • All other SPRO IMG             go_to_transaction → discover → fill → save
+  • Credit Control Area            OB45
+  • Chart of Accounts              OB13
+  • Fiscal Year Variant            OB29
+  • Posting Period Variant         OBBO
+
+ABAP DEVELOPMENT (human approval required)
+  • Create / edit programs         SE38 / SE80
+  • Create function modules        SE37
+  • Data dictionary                SE11
+  • Execute programs               SA38 (execute_abap_program tool)
+
+TRANSPORT MANAGEMENT (human approval required)
+  • Create transport               SE09 (create_transport_request tool)
+  • Release transport              SE09 (release_transport_request tool)
+  • Import transport               STMS → go_to_transaction
+
+SYSTEM ADMINISTRATION (human approval required)
+  • User management                SU01, PFCG
+  • System parameters              RZ10, RZ11
+  • Process management             SM50, SM51
+  • Lock management                SM12
+  • Job scheduling                 SM36, SM37
+
+═══════════════════════════════════════════════════════════
+ STANDARD WRITE SEQUENCE (follow every time)
+═══════════════════════════════════════════════════════════
   1. go_to_transaction(tcode)
-  2. discover_screen_elements   ← learn field IDs
-  3. set_field_value(id, value) ← human approves each
-  4. send_vkey(8)               ← Execute / F8 if needed
-  5. send_vkey(0)               ← Enter
-  6. send_vkey(11) or press save button
-  7. handle_transport_request   ← assign to transport
+  2. discover_screen_elements        ← always do this first
+  3. set_field_value(id, value)      ← one field at a time, each approved
+  4. send_vkey(0) or send_vkey(8)   ← Enter or Execute
+  5. send_vkey(11)                   ← Save (F11)
+  6. handle_transport_request        ← assign to transport (config changes)
 
 ═══════════════════════════════════════════════════════════
- IDES-LIKE ORG STRUCTURE  (reference values)
+ IDES ORG STRUCTURE REFERENCE VALUES
 ═══════════════════════════════════════════════════════════
-Company Code  : 1000  IDES AG            DE  EUR
-Plant         : 1000  Werk Hamburg       DE
-Sales Org     : 1000  Deutschland        1000  EUR
+Company Code  : 1000  IDES AG               DE  EUR
+Plant         : 1000  Werk Hamburg          DE
+               1100  Werk Berlin           DE
+Sales Org     : 1000  Deutschland           1000  EUR
+               2000  Europe Export         1000  USD
 Dist Channel  : 10    Endkundenverkauf
+               12    Wiederverkäufer
 Division      : 00    Prod.übergreifend
+               01    Pumpen
 Controlling   : 1000  Kostenrechnungskreis 1000
+Credit Ctrl   : 1000
+Chart/Accounts: INT
+Fiscal Year   : K4
+Purch Org     : 1000  IDES Deutschland
 
 ═══════════════════════════════════════════════════════════
  RULES
 ═══════════════════════════════════════════════════════════
-• ALWAYS call discover_screen_elements after each navigation.
-• NEVER assume field IDs — always discover them first.
-• After saving config, ALWAYS call handle_transport_request.
-• If a field is greyed out, skip it and note in your reply.
-• Read T001 before creating company code to avoid duplicates.
-• Confirm each step by calling read_screen after it.
+• ALWAYS discover_screen_elements after every navigation.
+• NEVER guess field IDs — discover first, then fill.
+• Before creating any config object, read its table first
+  (e.g. read T001 before OX02) to avoid duplicate key errors.
+• After every config save, call handle_transport_request.
+• If a field is protected/greyed, note it and move on.
+• Confirm each step with read_screen to verify success.
+• For SM30 table writes: navigate → discover → New Entry button
+  → fill fields → Save → transport.
 """
 
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
@@ -622,16 +816,21 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v4.0  —  User: S4ABAP24")
-    print("  All write/config operations require your approval first.")
+    print("  ARTILEGENZ SAP Agent v5.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  Authorization: FULL SYSTEM ACCESS")
+    print("  All write operations require your approval first.")
     print("═" * 68)
     print("\nExample queries:")
-    print('  "Read table T001 and show existing company codes"')
+    print('  "Read table T001 and show all existing company codes"')
+    print('  "Create the full IDES org structure with transports"')
     print('  "Create company code 1000 IDES AG Germany EUR"')
-    print('  "Create plant 1000 Hamburg Germany and assign to company code 1000"')
-    print('  "Create sales org 1000 Deutschland and assign to company code 1000"')
+    print('  "Create plant 1000 Hamburg Germany"')
+    print('  "Create sales org 1000 Deutschland assign to company code 1000"')
+    print('  "Create a transport for all org structure changes"')
     print('  "Show all sales orders from January 2025"')
-    print('  "Show document flow for order 12345"')
+    print('  "Fix all failed IDocs from today"')
+    print('  "Show ABAP dumps from ST22 and propose fixes"')
+    print('  "Maintain table T001W and add plant 2000 Berlin"')
 
     while True:
         query = input("\nQuery (or exit): ").strip()
