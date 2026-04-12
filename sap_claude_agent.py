@@ -315,6 +315,244 @@ def release_transport(transport_number):
     except Exception as e:
         return {"error": str(e)}
 
+# ── ABAP Custom Code Creation ─────────────────────────────────────────────────
+def create_abap_program(program_name, title, prog_type="1", package="$TMP"):
+    """
+    Create a new ABAP program in SE38.
+    prog_type: 1=Executable, M=Module pool, F=Function group,
+               S=Subroutine pool, I=Include, J=Interface pool
+    package: $TMP = local (no transport), Z* = customer package
+    After creation, call upload_abap_source to add the code.
+    """
+    prog = program_name.strip().upper()
+    go_to_transaction("SE38")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtRS38M-PROGRAMM").Text = prog
+        session.FindById("wnd[0]").SendVKey(5)   # F5 = Create
+        time.sleep(1.5)
+
+        # Dialog 1: set title + type
+        wnd1 = session.FindById("wnd[1]", False)
+        if wnd1:
+            for fid in ("usr/txtRS38M-DBAPL", "usr/ctxtRS38M-DBAPL",
+                        "usr/txtTITLE", "usr/ctxtTITLE"):
+                try:
+                    wnd1.FindById(fid).Text = title[:40]
+                    break
+                except Exception:
+                    pass
+            for fid in ("usr/ctxtRS38M-SUBC", "usr/radSUBC_1"):
+                try:
+                    wnd1.FindById(fid).Text = prog_type
+                    break
+                except Exception:
+                    pass
+            wnd1.SendVKey(0)
+            time.sleep(1)
+
+        # Dialog 2: package / transport
+        wnd1 = session.FindById("wnd[1]", False)
+        if wnd1:
+            title2 = ""
+            try:
+                title2 = wnd1.Text
+            except Exception:
+                pass
+            if "package" in title2.lower() or "paket" in title2.lower() \
+                    or "object" in title2.lower():
+                for fid in ("usr/ctxtRS38M-DEVCLASS", "usr/ctxtDEVCLASS",
+                            "usr/ctxtOBJECT_PACKAGE"):
+                    try:
+                        wnd1.FindById(fid).Text = package
+                        break
+                    except Exception:
+                        pass
+                wnd1.SendVKey(0)
+                time.sleep(1)
+
+        # Transport popup (if package is not local)
+        if package != "$TMP":
+            handle_transport()
+
+        return {"ok": True, "program": prog, "title": title,
+                "type": prog_type, "package": package,
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def create_function_module(fm_name, func_group, short_text, package="$TMP"):
+    """
+    Create a new Function Module in SE37.
+    The function group must already exist (or create it first with SE80).
+    After creation, call upload_abap_source with the FM source.
+    """
+    fm = fm_name.strip().upper()
+    fg = func_group.strip().upper()
+    go_to_transaction("SE37")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtRS38L-NAME").Text = fm
+        session.FindById("wnd[0]").SendVKey(5)   # Create
+        time.sleep(1.5)
+
+        wnd1 = session.FindById("wnd[1]", False)
+        if wnd1:
+            for fid in ("usr/ctxtRS38L-AREA", "usr/ctxtFUNCTION_GROUP",
+                        "usr/ctxtAREA"):
+                try:
+                    wnd1.FindById(fid).Text = fg
+                    break
+                except Exception:
+                    pass
+            for fid in ("usr/txtRS38L-STEXT", "usr/txtSHORT_TEXT",
+                        "usr/txtSHORT_DESCRIPT"):
+                try:
+                    wnd1.FindById(fid).Text = short_text[:40]
+                    break
+                except Exception:
+                    pass
+            wnd1.SendVKey(0)
+            time.sleep(1.5)
+
+        return {"ok": True, "fm": fm, "func_group": fg,
+                "short_text": short_text, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def create_function_group(fg_name, short_text, package="$TMP"):
+    """
+    Create a new Function Group via SE80 (needed before creating FMs).
+    """
+    go_to_transaction("SE80")
+    time.sleep(1.5)
+    try:
+        # Select "Function Group" from dropdown
+        for fid in ("wnd[0]/usr/cmbTREE_MAIN-OCSLT",
+                    "wnd[0]/usr/cmbOBJECT_SEL",
+                    "wnd[0]/usr/cmbBROWSE_SEL"):
+            try:
+                cb = session.FindById(fid)
+                cb.Key = "F"   # Function Group key
+                break
+            except Exception:
+                pass
+        # Enter name
+        for fid in ("wnd[0]/usr/ctxtTREE_MAIN-OCNAME",
+                    "wnd[0]/usr/ctxtOBJECT_NAME"):
+            try:
+                session.FindById(fid).Text = fg_name.strip().upper()
+                break
+            except Exception:
+                pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1)
+        # Handle "Create?" popup
+        wnd1 = session.FindById("wnd[1]", False)
+        if wnd1:
+            for fid in ("usr/txtSHORT_TEXT", "usr/txtRS38L-STEXT"):
+                try:
+                    wnd1.FindById(fid).Text = short_text[:40]
+                    break
+                except Exception:
+                    pass
+            wnd1.SendVKey(0)
+            time.sleep(1)
+        return {"ok": True, "func_group": fg_name, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def add_fm_parameter(fm_name, param_name, param_type,
+                     direction="import", type_ref="", optional=False):
+    """
+    Add an import/export/changing/tables parameter to an FM in SE37.
+    direction: import | export | changing | tables | exceptions
+    """
+    fm = fm_name.strip().upper()
+    go_to_transaction("SE37")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtRS38L-NAME").Text = fm
+        session.FindById("wnd[0]").SendVKey(6)   # Change
+        time.sleep(1.5)
+
+        # Navigate to the right tab
+        tab_map = {
+            "import":     "wnd[0]/usr/tabsTABSTRIP1/tabpTAB1",
+            "export":     "wnd[0]/usr/tabsTABSTRIP1/tabpTAB2",
+            "changing":   "wnd[0]/usr/tabsTABSTRIP1/tabpTAB3",
+            "tables":     "wnd[0]/usr/tabsTABSTRIP1/tabpTAB4",
+            "exceptions": "wnd[0]/usr/tabsTABSTRIP1/tabpTAB5",
+        }
+        try:
+            session.FindById(tab_map.get(direction,
+                tab_map["import"])).Select()
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+        return {"ok": True, "fm": fm, "param": param_name,
+                "direction": direction, "screen": get_screen_text(),
+                "note": "Navigate to parameter tab and add row manually if needed."}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def se11_create_data_element(element_name, short_text, domain=None,
+                              built_in_type=None, length=None):
+    """Create a Data Element in SE11."""
+    go_to_transaction("SE11")
+    time.sleep(1)
+    try:
+        # Select Data Element radio
+        for fid in ("wnd[0]/usr/radRB_DTEL", "wnd[0]/usr/rad_DTEL"):
+            try:
+                session.FindById(fid).Select()
+                break
+            except Exception:
+                pass
+        # Enter name
+        for fid in ("wnd[0]/usr/ctxtRS38M-DTEL", "wnd[0]/usr/ctxtOBJECT_NAME"):
+            try:
+                session.FindById(fid).Text = element_name.strip().upper()
+                break
+            except Exception:
+                pass
+        session.FindById("wnd[0]").SendVKey(5)   # Create
+        time.sleep(1.5)
+        return {"ok": True, "element": element_name, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def se11_create_table(table_name, short_text, package="$TMP"):
+    """Create a transparent database table in SE11."""
+    go_to_transaction("SE11")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/radRB_TABL", "wnd[0]/usr/rad_TABL"):
+            try:
+                session.FindById(fid).Select()
+                break
+            except Exception:
+                pass
+        for fid in ("wnd[0]/usr/ctxtRS38M-TABNAME",
+                    "wnd[0]/usr/ctxtOBJECT_NAME"):
+            try:
+                session.FindById(fid).Text = table_name.strip().upper()
+                break
+            except Exception:
+                pass
+        session.FindById("wnd[0]").SendVKey(5)   # Create
+        time.sleep(1.5)
+        return {"ok": True, "table": table_name, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── ABAP Dump Functions (ST22) ────────────────────────────────────────────────
 def scan_st22_dumps(date_from=None, date_to=None):
     """List ABAP runtime errors from ST22."""
@@ -914,6 +1152,128 @@ TOOLS = [
         },
     },
 
+    # ── ABAP CUSTOM CODE CREATION ────────────────────────────────────────────
+    {
+        "name": "create_abap_program",
+        "description": (
+            "Create a NEW ABAP program/report object in SE38. "
+            "Use for custom reports, module pools, subroutine pools. "
+            "After creation, call upload_abap_source to insert the code, "
+            "then check_abap_syntax and activate_abap_object. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "program_name": {
+                    "type": "string",
+                    "description": "Name e.g. Z_ARTILEGENZ_REPORT (must start with Z or Y)",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Short description of the program (max 40 chars)",
+                },
+                "prog_type": {
+                    "type": "string",
+                    "enum": ["1","M","F","S","I","J"],
+                    "description": (
+                        "1=Executable report (default), M=Module pool, "
+                        "F=Function group, S=Subroutine pool, I=Include"
+                    ),
+                },
+                "package": {
+                    "type": "string",
+                    "description": "$TMP=local no transport, Z*=customer package",
+                },
+            },
+            "required": ["program_name", "title"],
+        },
+    },
+    {
+        "name": "create_function_module",
+        "description": (
+            "Create a NEW Function Module in SE37. "
+            "The function group must already exist. "
+            "After creation go to Source Code tab and call upload_abap_source. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fm_name": {
+                    "type": "string",
+                    "description": "FM name e.g. Z_ARTILEGENZ_CALC (must start with Z or Y)",
+                },
+                "func_group": {
+                    "type": "string",
+                    "description": "Existing function group name e.g. ZARTILEGENZ",
+                },
+                "short_text": {
+                    "type": "string",
+                    "description": "Short description (max 40 chars)",
+                },
+                "package": {
+                    "type": "string",
+                    "description": "$TMP=local, Z*=customer package",
+                },
+            },
+            "required": ["fm_name", "func_group", "short_text"],
+        },
+    },
+    {
+        "name": "create_function_group",
+        "description": (
+            "Create a new Function Group in SE80 "
+            "(required before creating function modules). "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fg_name": {
+                    "type": "string",
+                    "description": "Function group name e.g. ZARTILEGENZ",
+                },
+                "short_text": {"type": "string"},
+                "package":    {"type": "string", "description": "$TMP or Z-package"},
+            },
+            "required": ["fg_name", "short_text"],
+        },
+    },
+    {
+        "name": "create_data_element",
+        "description": (
+            "Create a Data Element in SE11 for custom fields/tables. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "element_name": {"type": "string",
+                                 "description": "e.g. ZARTILEGENZ_STATUS"},
+                "short_text":   {"type": "string"},
+            },
+            "required": ["element_name", "short_text"],
+        },
+    },
+    {
+        "name": "create_database_table",
+        "description": (
+            "Create a custom transparent database table in SE11. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "table_name":  {"type": "string",
+                                "description": "e.g. ZARTILEGENZ_LOG"},
+                "short_text":  {"type": "string"},
+                "package":     {"type": "string"},
+            },
+            "required": ["table_name", "short_text"],
+        },
+    },
+
     # ── ABAP DUMP DEBUG & FIX ─────────────────────────────────────────────────
     {
         "name": "scan_abap_dumps",
@@ -1024,6 +1384,8 @@ WRITE_TOOLS = {
     "maintain_table", "execute_abap_program",
     "create_transport_request", "release_transport_request",
     "upload_abap_source", "check_abap_syntax", "activate_abap_object",
+    "create_abap_program", "create_function_module", "create_function_group",
+    "create_data_element", "create_database_table",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
@@ -1100,6 +1462,39 @@ def dispatch(tool_name, tool_input):
         return check_abap_syntax(tool_input["program_name"])
     if tool_name == "activate_abap_object":
         return activate_abap_object(tool_input["program_name"])
+
+    # ── ABAP custom code creation tools ────────────────────────────────────────
+    if tool_name == "create_abap_program":
+        return create_abap_program(
+            tool_input["program_name"],
+            tool_input["title"],
+            tool_input.get("prog_type", "1"),
+            tool_input.get("package", "$TMP"),
+        )
+    if tool_name == "create_function_module":
+        return create_function_module(
+            tool_input["fm_name"],
+            tool_input["func_group"],
+            tool_input["short_text"],
+            tool_input.get("package", "$TMP"),
+        )
+    if tool_name == "create_function_group":
+        return create_function_group(
+            tool_input["fg_name"],
+            tool_input["short_text"],
+            tool_input.get("package", "$TMP"),
+        )
+    if tool_name == "create_data_element":
+        return se11_create_data_element(
+            tool_input["element_name"],
+            tool_input["short_text"],
+        )
+    if tool_name == "create_database_table":
+        return se11_create_table(
+            tool_input["table_name"],
+            tool_input["short_text"],
+            tool_input.get("package", "$TMP"),
+        )
 
     return {"error": f"Unknown tool: {tool_name}"}
 
@@ -1190,6 +1585,84 @@ Credit Ctrl   : 1000
 Chart/Accounts: INT
 Fiscal Year   : K4
 Purch Org     : 1000  IDES Deutschland
+
+═══════════════════════════════════════════════════════════
+ ABAP CUSTOM CODE GENERATION WORKFLOW
+═══════════════════════════════════════════════════════════
+When asked to create a custom ABAP program or FM:
+
+STEP 1  CLARIFY (ask if not provided)
+        → What should the program DO?
+        → Input parameters / selection screen fields?
+        → Output: ALV report / file / IDoc / RFC call?
+        → Which SAP tables to read/write?
+        → Naming: Z_<PREFIX>_<DESCRIPTION>
+
+STEP 2  GENERATE complete ABAP source in your response:
+        Always include:
+        ┌─────────────────────────────────────────────────┐
+        │ *&---------------------------------------------*│
+        │ *& Program: Z_ARTILEGENZ_XXXX                  *│
+        │ *& Author : ARTILEGENZ AI                       *│
+        │ *& Date   : {datetime.now().strftime('%d.%m.%Y')}             *│
+        │ *& Purpose: <description>                       *│
+        │ *&---------------------------------------------*│
+        │ REPORT Z_ARTILEGENZ_XXXX.                       │
+        │                                                 │
+        │ *--- Data Declarations ---------------------------│
+        │ TYPES: BEGIN OF ty_data, ...                    │
+        │ DATA:  lt_data TYPE STANDARD TABLE OF ty_data,  │
+        │        lv_var  TYPE string.                     │
+        │                                                 │
+        │ *--- Selection Screen ---------------------------│
+        │ SELECT-OPTIONS: so_bukrs FOR t001-bukrs.        │
+        │ PARAMETERS:     p_date   TYPE sy-datum.         │
+        │                                                 │
+        │ *--- Start of Selection -------------------------│
+        │ START-OF-SELECTION.                             │
+        │   PERFORM get_data.                             │
+        │   PERFORM display_results.                      │
+        │                                                 │
+        │ *--- Subroutines --------------------------------│
+        │ FORM get_data.                                  │
+        │   TRY.                                          │
+        │     SELECT ...                                  │
+        │   CATCH cx_root INTO DATA(lx_exc).              │
+        │     MESSAGE lx_exc->get_text() TYPE 'E'.        │
+        │   ENDTRY.                                       │
+        │ ENDFORM.                                        │
+        └─────────────────────────────────────────────────┘
+
+ABAP CODE STANDARDS (always follow):
+  Naming     : Programs=Z_*, FMs=Z_*, Tables=Z*, Data Elements=Z*
+  Variables  : lv_=local var, lt_=local table, ls_=local struct,
+               gv_=global var, gt_=global table, lc_=constant
+  Error handling: TRY...CATCH cx_root for all DB operations
+  Messages   : MESSAGE 'text' TYPE 'S'/'E'/'W'/'I'/'X'
+  ALV output : Use cl_salv_table for modern ALV grids
+  Comments   : *--- Section ---, "-- inline comment
+  No obsolete: avoid MOVE TO (use =), avoid WRITE with NEW-LINE in reports
+
+CREATION SEQUENCE FOR NEW PROGRAM:
+  1. create_abap_program(name, title, type, package)
+  2. upload_abap_source(name, full_source_code)
+  3. check_abap_syntax(name)           ← fix errors if any
+  4. activate_abap_object(name)
+  5. handle_transport_request()        ← if not $TMP
+
+CREATION SEQUENCE FOR FUNCTION MODULE:
+  1. [If new FG needed] create_function_group(fg, text)
+  2. create_function_module(fm, fg, text)
+  3. [Add parameters via SE37 tabs manually or via set_field_value]
+  4. upload_abap_source(fm_name, source)
+  5. check_abap_syntax + activate_abap_object
+  6. handle_transport_request
+
+CREATION SEQUENCE FOR CUSTOM TABLE:
+  1. create_database_table(name, text)
+  2. discover_screen_elements → add fields via set_field_value
+  3. Set table category (Transparent), delivery class
+  4. Save + activate + transport
 
 ═══════════════════════════════════════════════════════════
  ABAP DUMP DEBUG & FIX WORKFLOW  (ST22)
@@ -1342,19 +1815,20 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v6.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  ARTILEGENZ SAP Agent v7.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Authorization: FULL SYSTEM ACCESS")
     print("  All write operations require your approval first.")
     print("═" * 68)
     print("\nExample queries:")
+    print('  "Create an ABAP report that lists all open sales orders with ALV"')
+    print('  "Create a function module to validate customer credit limit"')
+    print('  "Create a custom Z-table to log all AI changes with timestamp"')
+    print('  "Write an ABAP program to reprocess all failed IDocs from today"')
+    print('  "Create a background job program that emails daily error summary"')
     print('  "Scan all ABAP dumps from today and fix them"')
-    print('  "Show me the ABAP dump for program SAPMV45A and fix it"')
-    print('  "Download and fix the source code of Z_MY_PROGRAM"')
-    print('  "Create a new ABAP report Z_ARTILEGENZ_TEST"')
-    print('  "Read table T001 and show all existing company codes"')
+    print('  "Fix the ABAP dump in program SAPMV45A"')
     print('  "Create the full IDES org structure with transports"')
     print('  "Show all sales orders from January 2025"')
-    print('  "Maintain table T001W and add plant 2000 Berlin"')
 
     while True:
         query = input("\nQuery (or exit): ").strip()
