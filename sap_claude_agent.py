@@ -315,6 +315,250 @@ def release_transport(transport_number):
     except Exception as e:
         return {"error": str(e)}
 
+# ── Table Data Loading ────────────────────────────────────────────────────────
+def read_table_structure(table_name):
+    """
+    Read field definitions of any SAP table from SE11.
+    Returns field names, types, lengths and key flags so Claude
+    knows exactly which columns to populate when loading data.
+    """
+    table = table_name.strip().upper()
+    go_to_transaction("SE11")
+    time.sleep(1)
+    try:
+        # Select Database Table radio button
+        for fid in ("wnd[0]/usr/radRB_DBTB", "wnd[0]/usr/rad_DBTB",
+                    "wnd[0]/usr/radRB_TABL"):
+            try:
+                session.FindById(fid).Select()
+                break
+            except Exception:
+                pass
+        # Enter table name
+        for fid in ("wnd[0]/usr/ctxtRS38M-TABNAME",
+                    "wnd[0]/usr/ctxtOBJECT_NAME"):
+            try:
+                session.FindById(fid).Text = table
+                break
+            except Exception:
+                pass
+        session.FindById("wnd[0]").SendVKey(7)   # Display
+        time.sleep(1.5)
+
+        # Collect field rows from the Fields tab
+        fields = []
+        try:
+            grid = session.FindById(
+                "wnd[0]/usr/tabsTAB_STRIP/tabpFIELD/ssubSUB:SAPLSD11:2100"
+                "/tblSAPLSD11TC_DD03", False)
+            if grid is None:
+                raise Exception("try ALV")
+            rows = grid.RowCount
+            for i in range(min(rows, 200)):
+                row = {}
+                for col in ["FIELDNAME","DATATYPE","LENG","DECIMALS",
+                            "KEYFLAG","NOTNULL","DDTEXT"]:
+                    try:
+                        row[col] = grid.GetCellValue(i, col)
+                    except Exception:
+                        pass
+                if row.get("FIELDNAME"):
+                    fields.append(row)
+        except Exception:
+            # Fallback: read screen text
+            pass
+
+        screen = get_screen_text()
+        return {"table": table, "fields": fields,
+                "field_count": len(fields), "screen": screen}
+    except Exception as e:
+        return {"error": str(e), "table": table}
+
+
+def load_data_to_table(table_name, records, mode="MODIFY"):
+    """
+    Load data into ANY SAP table by auto-generating an ABAP INSERT/MODIFY
+    program, uploading it to SE38, activating and executing it.
+
+    table_name : SAP table e.g. T001, VBAK, ZTABLE
+    records    : list of dicts  [{"FIELD1": "VAL1", "FIELD2": "VAL2"}, ...]
+    mode       : INSERT (new rows only) | MODIFY (upsert) | UPDATE (existing only)
+    """
+    table = table_name.strip().upper()
+    # Safe program name (max 40 chars, Z prefix)
+    safe = table.replace("/","_")[:8]
+    prog = f"Z_ARTLGZ_LD_{safe}"
+    ts   = datetime.now().strftime("%H%M%S")
+    prog = f"{prog}_{ts}"[:30]
+
+    # ── Generate ABAP source ────────────────────────────────────────────────
+    lines = [
+        f"*&{'─'*50}",
+        f"*& ARTILEGENZ Data Load",
+        f"*& Table  : {table}",
+        f"*& Records: {len(records)}",
+        f"*& Mode   : {mode}",
+        f"*& Created: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        f"*& User   : {CURRENT_USER}",
+        f"*&{'─'*50}",
+        f"REPORT {prog.lower()}.",
+        "",
+        f"DATA: lt_data  TYPE STANDARD TABLE OF {table.lower()},",
+        f"      ls_data  TYPE {table.lower()},",
+        f"       lv_count TYPE i,",
+        f"       lv_err   TYPE i.",
+        "",
+        "START-OF-SELECTION.",
+        "",
+    ]
+
+    for i, rec in enumerate(records, 1):
+        lines.append(f"  \"--- Record {i} ---")
+        lines.append( "  CLEAR ls_data.")
+        for field, value in rec.items():
+            f_name = field.strip().lower()
+            # Numeric types: no quotes; everything else: quotes
+            val_str = str(value)
+            if val_str.lstrip("-").replace(".","",1).isdigit():
+                lines.append(f"  ls_data-{f_name} = {val_str}.")
+            else:
+                escaped = val_str.replace("'","''")
+                lines.append(f"  ls_data-{f_name} = '{escaped}'.")
+        lines.append( "  APPEND ls_data TO lt_data.")
+        lines.append( "")
+
+    lines += [
+        f"  {mode} {table.lower()} FROM TABLE lt_data.",
+        "  IF sy-subrc = 0.",
+        "    lv_count = sy-dbcnt.",
+        f"    WRITE: / 'ARTILEGENZ: ' && lv_count && ' record(s) loaded to {table}'.",
+        "  ELSE.",
+        "    lv_err = sy-subrc.",
+        f"    WRITE: / 'ERROR loading {table}. SY-SUBRC:' && lv_err.",
+        "  ENDIF.",
+        f"  WRITE: / 'Done: {datetime.now().strftime(\"%d.%m.%Y %H:%M\")} User:{CURRENT_USER}'.",
+    ]
+
+    source = "\n".join(lines)
+
+    # ── Create, upload, activate, execute ───────────────────────────────────
+    r_create = create_abap_program(prog, f"Load {table} data"[:40], "1", "$TMP")
+    if not r_create.get("ok"):
+        return {"error": "create_abap_program failed", "detail": r_create}
+
+    r_upload = upload_abap_source(prog, source)
+    if not r_upload.get("ok"):
+        return {"error": "upload_abap_source failed", "detail": r_upload}
+
+    r_syntax = check_abap_syntax(prog)
+    r_act    = activate_abap_object(prog)
+    r_run    = execute_abap(program_name=prog)
+
+    audit_log("TABLE_DATA_LOAD",
+              {"table": table, "records": len(records), "mode": mode,
+               "program": prog},
+              status="executed")
+
+    return {
+        "ok":           True,
+        "table":        table,
+        "program":      prog,
+        "records":      len(records),
+        "mode":         mode,
+        "source_lines": len(lines),
+        "syntax":       r_syntax.get("screen",""),
+        "activated":    r_act.get("ok", False),
+        "execution":    r_run.get("screen",""),
+    }
+
+
+def load_csv_to_table(csv_path, table_name, mode="MODIFY", delimiter=","):
+    """
+    Read a CSV file from the local Windows machine and load its
+    contents into any SAP table using the ABAP load approach.
+
+    csv_path  : Full local path  e.g. C:\\Users\\mohan\\Downloads\\data.csv
+    table_name: Target SAP table e.g. T001, ZTABLE
+    mode      : INSERT | MODIFY | UPDATE
+    delimiter : , or ; or TAB
+    """
+    import csv as csv_mod
+    try:
+        delim = "\t" if delimiter.upper() in ("TAB", "\\T") else delimiter
+        records = []
+        with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as fh:
+            reader = csv_mod.DictReader(fh, delimiter=delim)
+            for row in reader:
+                records.append({k.strip(): v.strip() for k, v in row.items()})
+
+        if not records:
+            return {"error": "CSV empty or unreadable", "path": csv_path}
+
+        return load_data_to_table(table_name, records, mode)
+
+    except FileNotFoundError:
+        return {"error": f"File not found: {csv_path}"}
+    except Exception as e:
+        return {"error": str(e), "csv_path": csv_path}
+
+
+def sm30_load_entries(table_name, entries):
+    """
+    Load entries into a configuration/customising table via SM30.
+    Best for tables that have a maintenance view (V_ prefix).
+    entries: list of dicts with field:value pairs.
+    """
+    go_to_transaction("SM30")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtVIEWNAME").Text = table_name.strip().upper()
+        # Click Maintain
+        try:
+            session.FindById("wnd[0]/usr/btnMAINTAIN").Press()
+        except Exception:
+            session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        results = []
+        for entry in entries:
+            # Click New Entries button
+            try:
+                session.FindById("wnd[0]/tbar[1]/btn[8]").Press()  # New entries
+            except Exception:
+                try:
+                    session.FindById("wnd[0]/tbar[1]/btn[2]").Press()
+                except Exception:
+                    session.FindById("wnd[0]").SendVKey(4)
+            time.sleep(1)
+
+            # Discover fields and fill them
+            elems = discover_elements()
+            filled = []
+            for field, value in entry.items():
+                for elem in elems:
+                    if field.lower() in elem.get("id","").lower() or \
+                       field.lower() in elem.get("tooltip","").lower():
+                        set_field(elem["id"], value)
+                        filled.append(field)
+                        break
+
+            # Save row (Enter)
+            session.FindById("wnd[0]").SendVKey(0)
+            time.sleep(0.5)
+            results.append({"entry": entry, "filled_fields": filled,
+                            "screen": get_screen_text()})
+
+        # Save all (F11)
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1)
+        handle_transport()
+
+        return {"ok": True, "table": table_name,
+                "entries_loaded": len(results), "detail": results}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── ABAP Custom Code Creation ─────────────────────────────────────────────────
 def create_abap_program(program_name, title, prog_type="1", package="$TMP"):
     """
@@ -1152,6 +1396,116 @@ TOOLS = [
         },
     },
 
+    # ── TABLE DATA LOADING ────────────────────────────────────────────────────
+    {
+        "name": "read_table_structure",
+        "description": (
+            "Read the field definitions (name, type, length, key flag) of any "
+            "SAP database table from SE11. ALWAYS call this before load_data_to_table "
+            "so you know the exact field names and types to populate."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "table_name": {"type": "string",
+                               "description": "e.g. T001, VBAK, ZTABLE"},
+            },
+            "required": ["table_name"],
+        },
+    },
+    {
+        "name": "load_data_to_table",
+        "description": (
+            "Load records into ANY SAP table by auto-generating, uploading and "
+            "executing an ABAP INSERT/MODIFY program. "
+            "Works for ALL tables: config (T001, T001W), master data, "
+            "transaction data, and custom Z-tables. "
+            "Call read_table_structure first to know the correct field names. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "table_name": {
+                    "type": "string",
+                    "description": "Target SAP table name e.g. T001, LFA1, ZTABLE",
+                },
+                "records": {
+                    "type": "array",
+                    "description": (
+                        "List of records to insert. Each record is a dict of "
+                        "field_name: value pairs matching the table structure. "
+                        "e.g. [{\"BUKRS\":\"1000\",\"BUTXT\":\"IDES AG\",\"WAERS\":\"EUR\"}]"
+                    ),
+                    "items": {"type": "object"},
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["INSERT","MODIFY","UPDATE"],
+                    "description": (
+                        "INSERT=new rows only (fails if exists), "
+                        "MODIFY=upsert insert+update (recommended), "
+                        "UPDATE=update existing rows only"
+                    ),
+                },
+            },
+            "required": ["table_name", "records"],
+        },
+    },
+    {
+        "name": "load_csv_to_table",
+        "description": (
+            "Read a CSV file from the local Windows machine and load all rows "
+            "into a SAP table. Column headers in the CSV must match SAP field names. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "csv_path": {
+                    "type": "string",
+                    "description": r"Full local path e.g. C:\Users\mohan\Downloads\data.csv",
+                },
+                "table_name": {"type": "string",
+                               "description": "Target SAP table"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["INSERT","MODIFY","UPDATE"],
+                    "description": "INSERT|MODIFY(upsert)|UPDATE",
+                },
+                "delimiter": {
+                    "type": "string",
+                    "description": "CSV delimiter: , or ; or TAB",
+                },
+            },
+            "required": ["csv_path", "table_name"],
+        },
+    },
+    {
+        "name": "sm30_load_entries",
+        "description": (
+            "Load entries into a customising/config table via SM30 table maintenance. "
+            "Best for tables that have a view (V_ prefix) like V_T001, V_TVKO. "
+            "For large volumes use load_data_to_table instead. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "table_name": {
+                    "type": "string",
+                    "description": "Table or view name e.g. V_T001, T001W",
+                },
+                "entries": {
+                    "type": "array",
+                    "description": "List of entry dicts with field:value pairs",
+                    "items": {"type": "object"},
+                },
+            },
+            "required": ["table_name", "entries"],
+        },
+    },
+
     # ── ABAP CUSTOM CODE CREATION ────────────────────────────────────────────
     {
         "name": "create_abap_program",
@@ -1386,6 +1740,7 @@ WRITE_TOOLS = {
     "upload_abap_source", "check_abap_syntax", "activate_abap_object",
     "create_abap_program", "create_function_module", "create_function_group",
     "create_data_element", "create_database_table",
+    "load_data_to_table", "load_csv_to_table", "sm30_load_entries",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
@@ -1462,6 +1817,28 @@ def dispatch(tool_name, tool_input):
         return check_abap_syntax(tool_input["program_name"])
     if tool_name == "activate_abap_object":
         return activate_abap_object(tool_input["program_name"])
+
+    # ── Table data loading tools ───────────────────────────────────────────────
+    if tool_name == "read_table_structure":
+        return read_table_structure(tool_input["table_name"])
+    if tool_name == "load_data_to_table":
+        return load_data_to_table(
+            tool_input["table_name"],
+            tool_input["records"],
+            tool_input.get("mode", "MODIFY"),
+        )
+    if tool_name == "load_csv_to_table":
+        return load_csv_to_table(
+            tool_input["csv_path"],
+            tool_input["table_name"],
+            tool_input.get("mode", "MODIFY"),
+            tool_input.get("delimiter", ","),
+        )
+    if tool_name == "sm30_load_entries":
+        return sm30_load_entries(
+            tool_input["table_name"],
+            tool_input["entries"],
+        )
 
     # ── ABAP custom code creation tools ────────────────────────────────────────
     if tool_name == "create_abap_program":
@@ -1585,6 +1962,59 @@ Credit Ctrl   : 1000
 Chart/Accounts: INT
 Fiscal Year   : K4
 Purch Org     : 1000  IDES Deutschland
+
+═══════════════════════════════════════════════════════════
+ TABLE DATA LOADING — ALL TABLES
+═══════════════════════════════════════════════════════════
+You can load data into ANY SAP table. Three methods:
+
+METHOD 1 — load_data_to_table  (recommended, all tables)
+  Works by generating + running an ABAP INSERT/MODIFY program.
+  ┌─────────────────────────────────────────────────────┐
+  │ 1. read_table_structure(table) ← get field names    │
+  │ 2. Ask user to provide the data if not given        │
+  │ 3. load_data_to_table(table, records, mode)         │
+  │    → auto-generates ABAP, uploads, activates, runs  │
+  │    → returns success/error count                    │
+  └─────────────────────────────────────────────────────┘
+
+METHOD 2 — load_csv_to_table  (file upload)
+  ┌─────────────────────────────────────────────────────┐
+  │ CSV file headers MUST match SAP field names exactly │
+  │ e.g.  BUKRS,BUTXT,WAERS,LAND1                      │
+  │       1000,IDES AG,EUR,DE                           │
+  │ load_csv_to_table(path, table, mode)                │
+  └─────────────────────────────────────────────────────┘
+
+METHOD 3 — sm30_load_entries  (config/customising tables)
+  ┌─────────────────────────────────────────────────────┐
+  │ Best for tables with SM30 maintenance views         │
+  │ e.g. V_T001, V_TVKO, V_001                         │
+  │ sm30_load_entries(table, [{field:value,...},...])    │
+  └─────────────────────────────────────────────────────┘
+
+MODE choices:
+  INSERT → new rows only (fails on duplicate key)
+  MODIFY → INSERT + UPDATE (upsert — use this by default)
+  UPDATE → update existing rows only
+
+COMMON TABLE LOADS:
+  T001   Company codes      BUKRS,BUTXT,ORT01,LAND1,WAERS,SPRAS
+  T001W  Plants             WERKS,NAME1,LAND1,ORT01,REGIO,ADRNR
+  TVKO   Sales orgs         VKORG,VTEXT,BUKRS,WAERS,KNDNR
+  LFA1   Vendor master      LIFNR,KTOKK,LAND1,NAME1,ORT01
+  KNA1   Customer master    KUNNR,KTOKD,LAND1,NAME1,ORT01
+  MARA   Material master    MATNR,MTART,MBRSH,MEINS,MATKL
+  EKKO   Purchase orders    EBELN,BUKRS,BSTYP,AEDAT,LIFNR
+  VBAK   Sales orders       VBELN,AUDAT,AUART,KUNNR,VKORG
+  BKPF   FI documents       BUKRS,BELNR,GJAHR,BLART,BLDAT
+
+ALWAYS:
+  1. Call read_table_structure first to confirm field names
+  2. Include MANDT (client) = sy-mandt if table has it
+  3. Show the data to user for review before loading
+  4. Use MODIFY mode by default to avoid duplicate key errors
+  5. Audit log is written automatically after every load
 
 ═══════════════════════════════════════════════════════════
  ABAP CUSTOM CODE GENERATION WORKFLOW
@@ -1815,11 +2245,15 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v7.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  ARTILEGENZ SAP Agent v8.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Authorization: FULL SYSTEM ACCESS")
     print("  All write operations require your approval first.")
     print("═" * 68)
     print("\nExample queries:")
+    print('  "Load these company codes into T001: 1000=IDES AG DE EUR, 2000=IDES US USD"')
+    print('  "Load data from C:\\Users\\mohan\\Downloads\\vendors.csv into LFA1"')
+    print('  "Show me the structure of table KNA1 then load 3 test customers"')
+    print('  "Load the full IDES plant list into T001W"')
     print('  "Create an ABAP report that lists all open sales orders with ALV"')
     print('  "Create a function module to validate customer credit limit"')
     print('  "Create a custom Z-table to log all AI changes with timestamp"')
