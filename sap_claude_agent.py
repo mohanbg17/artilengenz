@@ -1,5 +1,5 @@
 """
-ARTILEGENZ SAP Claude Agent v10.0
+ARTILEGENZ SAP Claude Agent v11.0
 Authorization: SAP_ALL + SAP_NEW (full system access confirmed via SU01)
 User: S4ABAP24
 
@@ -2236,6 +2236,667 @@ def scan_gr_ir_clearing(company_code="1000", date_from=None, date_to=None):
         return {"error": str(e)}
 
 
+# ── Sales Order Error Resolution ─────────────────────────────────────────────
+
+SD_ERROR_FIX_MAP = {
+    "credit":                  ("release_credit_block",      "HIGH"),
+    "credit limit":            ("release_credit_block",      "HIGH"),
+    "credit block":            ("release_credit_block",      "HIGH"),
+    "delivery block":          ("release_sd_delivery_block", "MEDIUM"),
+    "billing block":           ("release_billing_block",     "MEDIUM"),
+    "pricing":                 ("reprice_sales_order",       "MEDIUM"),
+    "condition":               ("reprice_sales_order",       "MEDIUM"),
+    "price 0":                 ("reprice_sales_order",       "HIGH"),
+    "incomplete":              ("complete_sales_order",      "MEDIUM"),
+    "incompletion":            ("complete_sales_order",      "MEDIUM"),
+    "missing field":           ("complete_sales_order",      "MEDIUM"),
+    "payment terms":           ("complete_sales_order",      "LOW"),
+    "partner":                 ("fix_partner_determination", "MEDIUM"),
+    "ship-to":                 ("fix_partner_determination", "MEDIUM"),
+    "sold-to":                 ("fix_partner_determination", "HIGH"),
+    "output":                  ("create_sd_output",          "LOW"),
+    "message":                 ("create_sd_output",          "LOW"),
+    "availability":            ("check_atp",                 "MEDIUM"),
+    "not available":           ("check_atp",                 "MEDIUM"),
+    "schedule line":           ("check_atp",                 "MEDIUM"),
+    "no confirmed quantity":   ("check_atp",                 "HIGH"),
+    "backorder":               ("check_atp",                 "MEDIUM"),
+    "plant":                   ("complete_sales_order",      "MEDIUM"),
+    "shipping point":          ("complete_sales_order",      "MEDIUM"),
+    "route":                   ("complete_sales_order",      "LOW"),
+    "rejection":               ("remove_rejection_reason",   "HIGH"),
+    "rejected":                ("remove_rejection_reason",   "HIGH"),
+    "account":                 ("complete_sales_order",      "MEDIUM"),
+}
+
+
+def scan_sd_errors(date_from=None, date_to=None, sales_org="",
+                   error_type="all"):
+    """
+    Scan for failed/blocked sales orders via VA05.
+    error_type: 'credit'=credit-blocked, 'delivery'=delivery-blocked,
+                'billing'=billing-blocked, 'incomplete'=incompletion log,
+                'all'=every open order.
+    Returns list of orders with status, customer, value, and fix_hints.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    # Choose the right list transaction based on error type
+    if error_type == "credit":
+        go_to_transaction("VKM1")     # Credit management: blocked orders
+    else:
+        go_to_transaction("VA05")     # General order list
+    time.sleep(1.5)
+
+    try:
+        # VA05 date and sales org fields
+        for fid in ("wnd[0]/usr/ctxtSD_VBAK-AUDAT_LOW",
+                    "wnd[0]/usr/ctxtAUDAT_LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtSD_VBAK-AUDAT_HIGH",
+                    "wnd[0]/usr/ctxtAUDAT_HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        if sales_org:
+            for fid in ("wnd[0]/usr/ctxtSD_VBAK-VKORG",
+                        "wnd[0]/usr/ctxtVKORG"):
+                try: session.FindById(fid).Text = sales_org; break
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        orders = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 300)):
+                    row = {}
+                    for col in ["VBELN","AUDAT","AUART","KUNNR","VKORG",
+                                "NETWR","WAERS","GBSTK","LIFSK","FAKSK",
+                                "CMGST","UVVLS","NAME1","BSTNK"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if not row.get("VBELN"):
+                        continue
+                    issues = []
+                    if row.get("CMGST") in ("B","C"):  issues.append("credit_block")
+                    if row.get("LIFSK"):               issues.append("delivery_block")
+                    if row.get("FAKSK"):               issues.append("billing_block")
+                    row["issues"] = issues
+
+                    # Apply error_type filter
+                    if error_type == "credit" and "credit_block" not in issues:
+                        continue
+                    if error_type == "delivery" and "delivery_block" not in issues:
+                        continue
+                    if error_type == "billing" and "billing_block" not in issues:
+                        continue
+
+                    combined = " ".join(str(v) for v in row.values()).lower()
+                    row["fix_hints"] = [
+                        {"pattern": pat, "fix_action": fa, "risk": risk}
+                        for pat, (fa, risk) in SD_ERROR_FIX_MAP.items()
+                        if pat in combined
+                    ]
+                    orders.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "sd_errors": orders, "count": len(orders),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(orders)} sales orders. "
+                     "Call get_sd_order_detail for root cause per order."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_sd_order_detail(sales_order):
+    """
+    Open a sales order in VA03 and extract: header status (credit/delivery/
+    billing block), item pricing, partner data, schedule lines, incompletion
+    log, and auto-computed fix_hints from SD_ERROR_FIX_MAP.
+    """
+    go_to_transaction("VA03")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        detail = {
+            "sales_order": str(sales_order),
+            "error_messages": [],
+            "screen": get_screen_text(),
+        }
+
+        texts = []
+        def walk(comp, depth=0):
+            if depth > 8: return
+            try:
+                n = comp.Children.Count
+            except Exception:
+                return
+            for i in range(n):
+                try:
+                    ch = comp.Children(i)
+                    if ch.Type in ("GuiTextField","GuiCTextField","GuiLabel"):
+                        try:
+                            t = ch.Text.strip()
+                            if t and len(t) > 2: texts.append(t)
+                        except Exception: pass
+                    walk(ch, depth+1)
+                except Exception: pass
+        walk(session.FindById("wnd[0]"))
+        detail["all_screen_text"] = "\n".join(texts[:300])
+
+        combined = detail["all_screen_text"].lower()
+        for phrase in ["credit","block","incomplete","pricing","condition",
+                        "partner","output","availability","rejection",
+                        "not found","billing","delivery","schedule line"]:
+            if phrase in combined:
+                detail["error_messages"].append(phrase)
+
+        detail["fix_hints"] = [
+            {"pattern": pat, "fix_action": fa, "risk": risk}
+            for pat, (fa, risk) in SD_ERROR_FIX_MAP.items()
+            if pat in combined
+        ]
+
+        # Also try to read VA03 header fields directly
+        header = {}
+        for field_id, field_key in [
+            ("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBAK-KUNNR", "KUNNR"),
+            ("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBAK-VKORG", "VKORG"),
+            ("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBAK-LIFSK", "LIFSK"),
+            ("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBAK-FAKSK", "FAKSK"),
+            ("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBAK-CMGST", "CMGST"),
+        ]:
+            try: header[field_key] = session.FindById(field_id).Text
+            except Exception: pass
+        detail["header_fields"] = header
+
+        return detail
+    except Exception as e:
+        return {"error": str(e), "sales_order": str(sales_order)}
+
+
+def release_credit_block(sales_order, release_type="order"):
+    """
+    Release a credit-blocked sales order via VKM3.
+    release_type: 'order'=single order, 'all'=all orders for this customer.
+    """
+    go_to_transaction("VKM3")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBELN",
+                    "wnd[0]/usr/ctxtS_VBELN-LOW"):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+
+        # Select the order row
+        session.FindById("wnd[0]").SendVKey(16)
+        time.sleep(0.5)
+
+        # Press Release button
+        for fid in ("wnd[0]/tbar[1]/btn[20]",
+                    "wnd[0]/tbar[1]/btn[16]",
+                    "wnd[0]/tbar[1]/btn[5]"):
+            try: session.FindById(fid).Press(); time.sleep(1.5); break
+            except Exception: pass
+
+        # Confirm popup
+        for fid in ("wnd[1]/usr/btnSPOP-OPTION1",
+                    "wnd[1]/tbar[0]/btn[0]"):
+            try: session.FindById(fid).Press(); time.sleep(1); break
+            except Exception: pass
+
+        audit_log("SD_CREDIT_RELEASE",
+                  {"order": str(sales_order), "release_type": release_type},
+                  status="executed")
+        return {"ok": True, "sales_order": str(sales_order),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def release_sd_delivery_block(sales_order, block_code=""):
+    """
+    Remove the delivery block from a sales order header via VA02.
+    Sets VBAK-LIFSK to blank (no block). block_code is informational only.
+    """
+    go_to_transaction("VA02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        # Clear delivery block field
+        for fid in (
+            "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBAK-LIFSK",
+        ):
+            try:
+                session.FindById(fid).Text = ""
+                break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(11)   # Save
+        time.sleep(1.5)
+        handle_transport(None)
+
+        audit_log("SD_DELIVERY_BLOCK_RELEASE",
+                  {"order": str(sales_order), "block_code": block_code},
+                  status="executed")
+        return {"ok": True, "sales_order": str(sales_order),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def release_billing_block(sales_order, block_code=""):
+    """
+    Remove the billing block from a sales order via VA02.
+    Sets VBAK-FAKSK to blank.
+    """
+    go_to_transaction("VA02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        for fid in (
+            "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBAK-FAKSK",
+        ):
+            try: session.FindById(fid).Text = ""; break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+        handle_transport(None)
+
+        audit_log("SD_BILLING_BLOCK_RELEASE",
+                  {"order": str(sales_order), "block_code": block_code},
+                  status="executed")
+        return {"ok": True, "sales_order": str(sales_order),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def reprice_sales_order(sales_order):
+    """
+    Reprice a sales order via VA02 (update pricing / carry out new pricing).
+    Triggers fresh condition determination to fix zero-price or wrong-price items.
+    """
+    go_to_transaction("VA02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        # Menu: Edit → Update pricing  (or toolbar Update button)
+        try:
+            session.FindById("wnd[0]/mbar/menu[1]/menu[9]").Select()
+            time.sleep(1)
+        except Exception:
+            try:
+                session.FindById("wnd[0]/mbar/menu[1]/menu[8]").Select()
+                time.sleep(1)
+            except Exception:
+                pass
+
+        # Reprice dialog: choose B=Carry out new pricing
+        for fid in ("wnd[1]/usr/radKALKME-B",
+                    "wnd[1]/usr/radNEWPRICE"):
+            try: session.FindById(fid).Select(); break
+            except Exception: pass
+        for fid in ("wnd[1]/tbar[0]/btn[0]",):
+            try: session.FindById(fid).Press(); time.sleep(1); break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("SD_REPRICE",
+                  {"order": str(sales_order)},
+                  status="executed")
+        return {"ok": True, "sales_order": str(sales_order),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def complete_sales_order(sales_order, field_name, new_value, item_number=""):
+    """
+    Fix an incomplete sales order by setting a missing mandatory field via VA02.
+    Common fields: LIFSK=delivery block (clear), FAKSK=billing block (clear),
+    KUNNR=sold-to, ZTERM=payment terms, VSTEL=shipping point, ROUTE=route,
+    WERKS=plant, MATNR=material, KDMAT=customer material.
+    item_number: blank=header field, '00010'=first item.
+    """
+    go_to_transaction("VA02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        elems = discover_elements()
+        changed = False
+        for e in elems:
+            if (field_name.upper() in e.get("id","").upper() or
+                    field_name.upper() in e.get("tooltip","").upper()):
+                set_field(e["id"], str(new_value))
+                changed = True
+                break
+
+        if not changed:
+            return {"ok": False,
+                    "note": f"Field {field_name} not found. "
+                            "Use discover_screen_elements to locate the correct ID.",
+                    "elements": [e["id"] for e in elems[:30]]}
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("SD_ORDER_COMPLETE",
+                  {"order": str(sales_order), "field": field_name,
+                   "new_value": str(new_value)},
+                  status="executed")
+        return {"ok": True, "sales_order": str(sales_order),
+                "field": field_name, "new_value": new_value,
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def fix_partner_determination(sales_order):
+    """
+    Re-trigger partner determination for a sales order via VA02.
+    Opens the order, navigates to partner tab, and re-determines partners
+    (sold-to, ship-to, bill-to, payer) from customer master.
+    """
+    go_to_transaction("VA02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        # Navigate to Partners tab
+        for fid in ("wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\\01",
+                    "wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\\02"):
+            try: session.FindById(fid).Select(); break
+            except Exception: pass
+        time.sleep(1)
+
+        # Discover and report current partner state
+        elems = discover_elements()
+        partner_fields = [e for e in elems
+                          if any(p in e.get("id","").upper()
+                                 for p in ["KUNNR","PARVW","PARNR"])]
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("SD_PARTNER_FIX",
+                  {"order": str(sales_order)},
+                  status="executed")
+        return {"ok": True, "sales_order": str(sales_order),
+                "partner_fields": partner_fields[:20],
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def create_sd_output(sales_order, output_type="BA00", medium="1"):
+    """
+    Create/resend output (order confirmation etc.) for a sales order via VA02.
+    output_type: BA00=order confirmation, RD00=invoice, LIEF=delivery note.
+    medium: 1=print, 5=external send, 6=EDI.
+    """
+    go_to_transaction("VA02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        # Extras → Output → Header → Issue output
+        try:
+            session.FindById("wnd[0]/mbar/menu[3]/menu[0]/menu[0]").Select()
+            time.sleep(1)
+        except Exception:
+            pass
+
+        # Add output record
+        elems = discover_elements()
+        for e in elems:
+            if "KSCHL" in e.get("id","").upper():
+                set_field(e["id"], output_type)
+                break
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("SD_OUTPUT",
+                  {"order": str(sales_order), "output_type": output_type},
+                  status="executed")
+        return {"ok": True, "sales_order": str(sales_order),
+                "output_type": output_type, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_atp(sales_order, item_number="00010"):
+    """
+    Run ATP (Available-to-Promise) check for a sales order line via VA02.
+    Re-schedules the order and confirms quantity / delivery date from stock.
+    """
+    go_to_transaction("VA02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        # Select item and run ATP: Edit → Check availability
+        try:
+            session.FindById("wnd[0]/mbar/menu[1]/menu[1]").Select()
+            time.sleep(1.5)
+        except Exception:
+            try:
+                session.FindById("wnd[0]").SendVKey(8)
+                time.sleep(1)
+            except Exception:
+                pass
+
+        result = {"ok": True, "sales_order": str(sales_order),
+                  "item": item_number, "screen": get_screen_text()}
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("SD_ATP_CHECK",
+                  {"order": str(sales_order), "item": item_number},
+                  status="executed")
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def remove_rejection_reason(sales_order, item_number="00010"):
+    """
+    Remove the rejection reason from a rejected sales order item via VA02.
+    Sets VBAP-ABGRU to blank to reactivate the item.
+    """
+    go_to_transaction("VA02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtVBAK-VBELN",):
+            try: session.FindById(fid).Text = str(sales_order); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        elems = discover_elements()
+        for e in elems:
+            if "ABGRU" in e.get("id","").upper():
+                set_field(e["id"], "")
+                break
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("SD_REJECTION_REMOVE",
+                  {"order": str(sales_order), "item": item_number},
+                  status="executed")
+        return {"ok": True, "sales_order": str(sales_order),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def scan_credit_blocks(date_from=None, date_to=None, sales_org=""):
+    """
+    Scan VKM1 for all orders currently blocked by credit management.
+    Returns order number, customer, credit exposure, credit limit, and block reason.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("VKM1")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtS_CMFDAT-LOW",
+                    "wnd[0]/usr/ctxtDATE_LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtS_CMFDAT-HIGH",
+                    "wnd[0]/usr/ctxtDATE_HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        if sales_org:
+            for fid in ("wnd[0]/usr/ctxtS_VKORG-LOW",):
+                try: session.FindById(fid).Text = sales_org; break
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        blocks = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["VBELN","KUNNR","BLDAT","NETWR","WAERS",
+                                "KLIMK","SKFOR","CMGST","NAME1"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if row.get("VBELN"):
+                        row["fix_action"] = "release_credit_block"
+                        blocks.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "credit_blocks": blocks, "count": len(blocks),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(blocks)} credit-blocked orders. "
+                     "Call release_credit_block for each."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def scan_incomplete_orders(date_from=None, date_to=None, sales_org=""):
+    """
+    Scan V.02 for incomplete sales orders (incompletion log has open items).
+    Returns order list with the incompletion group/procedure details.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("V.02")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtSP$00001-LOW",
+                    "wnd[0]/usr/ctxtAUDAT_LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtSP$00001-HIGH",
+                    "wnd[0]/usr/ctxtAUDAT_HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        if sales_org:
+            for fid in ("wnd[0]/usr/ctxtS_VKORG-LOW",):
+                try: session.FindById(fid).Text = sales_org; break
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        orders = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["VBELN","AUDAT","KUNNR","UVVLS","UVALL",
+                                "NETWR","WAERS","NAME1"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if row.get("VBELN"):
+                        row["fix_action"] = "complete_sales_order"
+                        orders.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "incomplete_orders": orders, "count": len(orders),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(orders)} incomplete orders. "
+                     "Call get_sd_order_detail then complete_sales_order."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def get_sales_orders(date_from, date_to):
     go_to_transaction("VA05")
     time.sleep(1)
@@ -2825,6 +3486,238 @@ TOOLS = [
         },
     },
 
+    # ── SALES ORDER ERROR RESOLUTION ─────────────────────────────────────────
+    {
+        "name": "scan_sd_errors",
+        "description": (
+            "Scan VA05/VKM1 for failed or blocked sales orders. "
+            "error_type: 'credit'=credit-blocked, 'delivery'=delivery-blocked, "
+            "'billing'=billing-blocked, 'incomplete'=incompletion log, 'all'=everything. "
+            "Returns order list with status flags and fix_hints. "
+            "ALWAYS call this first when investigating SD errors."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from":  {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":    {"type": "string", "description": "DD.MM.YYYY"},
+                "sales_org":  {"type": "string", "description": "e.g. 1000"},
+                "error_type": {"type": "string",
+                               "enum": ["credit","delivery","billing",
+                                        "incomplete","all"],
+                               "description": "Type of error to filter"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_sd_order_detail",
+        "description": (
+            "Open a sales order in VA03 and extract: header fields (credit/delivery/"
+            "billing block, sold-to, sales org), item pricing, partner data, "
+            "schedule lines, and auto-computed fix_hints from error text. "
+            "Call after scan_sd_errors for each order."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string",
+                                "description": "10-digit sales order number"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "release_credit_block",
+        "description": (
+            "Release a credit-blocked sales order via VKM3. "
+            "Use when fix_hints shows 'release_credit_block' or CMGST=B/C. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order":  {"type": "string", "description": "Sales order number"},
+                "release_type": {"type": "string",
+                                 "enum": ["order","all"],
+                                 "description": "order=this order only, all=all customer orders"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "release_sd_delivery_block",
+        "description": (
+            "Remove the delivery block from a sales order header via VA02. "
+            "Clears VBAK-LIFSK so the order can be delivered. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string"},
+                "block_code":  {"type": "string",
+                                "description": "Existing block code (informational)"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "release_billing_block",
+        "description": (
+            "Remove the billing block from a sales order via VA02. "
+            "Clears VBAK-FAKSK so the order can be invoiced. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string"},
+                "block_code":  {"type": "string",
+                                "description": "Existing block code (informational)"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "reprice_sales_order",
+        "description": (
+            "Reprice a sales order via VA02 — triggers fresh condition determination. "
+            "Use when pricing is zero, wrong, or conditions have expired. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "complete_sales_order",
+        "description": (
+            "Fix an incomplete sales order by setting a missing mandatory field via VA02. "
+            "Common: ZTERM=payment terms, VSTEL=shipping point, ROUTE=route, "
+            "WERKS=plant, LIFSK=delivery block (set blank). "
+            "item_number: blank=header, '00010'=first item. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string"},
+                "field_name":  {"type": "string",
+                                "description": "SAP field name e.g. ZTERM, VSTEL, ROUTE"},
+                "new_value":   {"type": "string", "description": "Value to set"},
+                "item_number": {"type": "string",
+                                "description": "Item number e.g. 00010 (blank=header)"},
+            },
+            "required": ["sales_order", "field_name", "new_value"],
+        },
+    },
+    {
+        "name": "fix_partner_determination",
+        "description": (
+            "Re-trigger partner determination for a sales order via VA02. "
+            "Fixes missing or wrong sold-to, ship-to, bill-to, payer partners. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "create_sd_output",
+        "description": (
+            "Create or resend output for a sales order via VA02. "
+            "output_type: BA00=order confirmation, RD00=invoice, LIEF=delivery. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string"},
+                "output_type": {"type": "string",
+                                "description": "BA00=confirmation, RD00=invoice, LIEF=delivery"},
+                "medium":      {"type": "string",
+                                "description": "1=print, 5=external, 6=EDI"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "check_atp",
+        "description": (
+            "Run ATP (Available-to-Promise) check on a sales order item via VA02. "
+            "Re-schedules the line and confirms deliverable quantity and date. "
+            "Use when schedule lines are missing or confirmed quantity is zero. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string"},
+                "item_number": {"type": "string",
+                                "description": "Item number e.g. 00010"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "remove_rejection_reason",
+        "description": (
+            "Remove the rejection reason from a sales order item via VA02, "
+            "reactivating the item for processing. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sales_order": {"type": "string"},
+                "item_number": {"type": "string",
+                                "description": "Item number e.g. 00010"},
+            },
+            "required": ["sales_order"],
+        },
+    },
+    {
+        "name": "scan_credit_blocks",
+        "description": (
+            "Scan VKM1 for all sales orders blocked by credit management. "
+            "Returns order, customer, credit exposure vs limit, block reason."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":   {"type": "string", "description": "DD.MM.YYYY"},
+                "sales_org": {"type": "string", "description": "e.g. 1000"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "scan_incomplete_orders",
+        "description": (
+            "Scan V.02 for incomplete sales orders (incompletion log has open items). "
+            "Returns orders where mandatory fields are missing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":   {"type": "string", "description": "DD.MM.YYYY"},
+                "sales_org": {"type": "string", "description": "e.g. 1000"},
+            },
+            "required": [],
+        },
+    },
+
     # ── PURCHASE ORDER ERROR RESOLUTION ──────────────────────────────────────
     {
         "name": "scan_po_errors",
@@ -3260,6 +4153,11 @@ WRITE_TOOLS = {
     "release_po", "change_po_field", "cancel_po_item",
     "release_blocked_invoice", "unblock_vendor",
     "create_po_output", "convert_pr_to_po",
+    # SD write tools
+    "release_credit_block", "release_sd_delivery_block",
+    "release_billing_block", "reprice_sales_order",
+    "complete_sales_order", "fix_partner_determination",
+    "create_sd_output", "check_atp", "remove_rejection_reason",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
@@ -3436,6 +4334,71 @@ def dispatch(tool_name, tool_input):
             tool_input.get("message_type", ""),
             tool_input.get("date_from"),
             tool_input.get("date_to"),
+        )
+
+    # ── Sales Order error resolution tools ────────────────────────────────────
+    if tool_name == "scan_sd_errors":
+        return scan_sd_errors(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("sales_org", ""),
+            tool_input.get("error_type", "all"),
+        )
+    if tool_name == "get_sd_order_detail":
+        return get_sd_order_detail(tool_input["sales_order"])
+    if tool_name == "release_credit_block":
+        return release_credit_block(
+            tool_input["sales_order"],
+            tool_input.get("release_type", "order"),
+        )
+    if tool_name == "release_sd_delivery_block":
+        return release_sd_delivery_block(
+            tool_input["sales_order"],
+            tool_input.get("block_code", ""),
+        )
+    if tool_name == "release_billing_block":
+        return release_billing_block(
+            tool_input["sales_order"],
+            tool_input.get("block_code", ""),
+        )
+    if tool_name == "reprice_sales_order":
+        return reprice_sales_order(tool_input["sales_order"])
+    if tool_name == "complete_sales_order":
+        return complete_sales_order(
+            tool_input["sales_order"],
+            tool_input["field_name"],
+            tool_input["new_value"],
+            tool_input.get("item_number", ""),
+        )
+    if tool_name == "fix_partner_determination":
+        return fix_partner_determination(tool_input["sales_order"])
+    if tool_name == "create_sd_output":
+        return create_sd_output(
+            tool_input["sales_order"],
+            tool_input.get("output_type", "BA00"),
+            tool_input.get("medium", "1"),
+        )
+    if tool_name == "check_atp":
+        return check_atp(
+            tool_input["sales_order"],
+            tool_input.get("item_number", "00010"),
+        )
+    if tool_name == "remove_rejection_reason":
+        return remove_rejection_reason(
+            tool_input["sales_order"],
+            tool_input.get("item_number", "00010"),
+        )
+    if tool_name == "scan_credit_blocks":
+        return scan_credit_blocks(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("sales_org", ""),
+        )
+    if tool_name == "scan_incomplete_orders":
+        return scan_incomplete_orders(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("sales_org", ""),
         )
 
     # ── Purchase Order error resolution tools ─────────────────────────────────
@@ -3634,7 +4597,7 @@ METHOD 3 — sm30_load_entries  (config/customising tables)
   ┌─────────────────────────────────────────────────────┐
   │ Best for tables with SM30 maintenance views         │
   │ e.g. V_T001, V_TVKO, V_001                         │
-  │ sm30_load_entries(table, [{field:value,...},...])    │
+  │ sm30_load_entries(table, [{{field:value,...}},...])   │
   └─────────────────────────────────────────────────────┘
 
 MODE choices:
@@ -3787,6 +4750,62 @@ STEP 9  handle_transport_request()
 
 STEP 10 scan_abap_dumps(today, today)
         → Verify dump no longer appears
+
+═══════════════════════════════════════════════════════════
+ SALES ORDER ERROR RESOLUTION WORKFLOW
+═══════════════════════════════════════════════════════════
+When asked to fix sales order errors, follow this sequence:
+
+STEP 1  scan_sd_errors(date_from, date_to, error_type)
+        → error_type='credit' for credit blocks, 'all' for everything
+        → Returns orders with issues[] and fix_hints[]
+
+STEP 2  get_sd_order_detail(sales_order) — for each error order
+        → Returns header_fields (LIFSK/FAKSK/CMGST), all_screen_text,
+          error_messages[], fix_hints[]
+
+STEP 3  IDENTIFY ROOT CAUSE and PROPOSE SOLUTION to user:
+        ─────────────────────────────────────────────────────────────
+        fix_action               root cause            tool
+        ─────────────────────────────────────────────────────────────
+        release_credit_block   → credit limit exceeded → release_credit_block
+        release_sd_delivery_block → delivery blocked   → release_sd_delivery_block
+        release_billing_block  → billing blocked       → release_billing_block
+        reprice_sales_order    → price 0 / wrong cond  → reprice_sales_order
+        complete_sales_order   → missing mandatory fld → scan_incomplete_orders
+                                                         complete_sales_order
+        fix_partner_determination → wrong/missing partner → fix_partner_determination
+        create_sd_output       → no output sent        → create_sd_output
+        check_atp              → no confirmed qty/date → check_atp
+        remove_rejection_reason → item rejected        → remove_rejection_reason
+        ─────────────────────────────────────────────────────────────
+
+STEP 4  ASK BEFORE FIXING — present root cause and proposed fix:
+        "Order 1000001234 is credit-blocked (CMGST=B). Customer 1001 has
+         exceeded credit limit of 50,000 EUR. Proposed fix: release_credit_block.
+         Approve? [A/R]"
+
+STEP 5  Execute fix after approval, then verify with get_sd_order_detail.
+
+COMMON SD ERROR PATTERNS:
+  CMGST = B or C          → credit block      → scan_credit_blocks → release_credit_block
+  LIFSK not blank         → delivery block    → release_sd_delivery_block
+  FAKSK not blank         → billing block     → release_billing_block
+  NETWR = 0 or pricing err→ pricing error     → reprice_sales_order
+  UVVLS or UVALL set      → incompletion log  → scan_incomplete_orders → complete_sales_order
+  No schedule lines       → ATP failure       → check_atp
+  ABGRU set on item       → item rejected     → remove_rejection_reason
+  Ship-to/payer missing   → partner det. err  → fix_partner_determination
+  No output records       → output not sent   → create_sd_output(BA00)
+
+CREDIT MANAGEMENT STATUS (CMGST):
+  blank = no credit check  A = OK  B = Warning  C = Blocked  D = Approved
+
+DELIVERY BLOCK CODES (LIFSK — SAP standard):
+  01=Check credit  02=Check export  Z1=Manual block  Z2=Awaiting contract
+
+BILLING BLOCK CODES (FAKSK):
+  01=Approval req  02=Pricing incomplete  Z1=Manual  ZP=Partial delivery
 
 ═══════════════════════════════════════════════════════════
  PURCHASE ORDER ERROR RESOLUTION WORKFLOW
@@ -4014,11 +5033,17 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v10.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  ARTILEGENZ SAP Agent v11.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Authorization: FULL SYSTEM ACCESS")
     print("  All write operations require your approval first.")
     print("═" * 68)
     print("\nExample queries:")
+    print('  "Scan all failed sales orders from today and propose fixes"')
+    print('  "Show all credit-blocked orders from this week"')
+    print('  "Release the delivery block on sales order 1000001234"')
+    print('  "Order 1000001234 has zero pricing — reprice it"')
+    print('  "Show all incomplete sales orders from April 2026"')
+    print('  "Run ATP check on sales order 1000001234 item 10"')
     print('  "Scan all purchase order errors from this month and fix them"')
     print('  "PO 4500001234 is blocked — diagnose and propose a fix"')
     print('  "Show all blocked invoices for company code 1000 this week"')
