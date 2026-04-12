@@ -25,6 +25,10 @@ import os
 import getpass
 from datetime import datetime
 
+# Temp folder for ABAP source downloads/uploads
+TEMP_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "SAP_ABAP_Temp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 # ── SAP Connection ─────────────────────────────────────────────────────────────
 def connect_sap():
     SapGuiAuto = win32com.client.GetObject("SAPGUI")
@@ -311,6 +315,350 @@ def release_transport(transport_number):
     except Exception as e:
         return {"error": str(e)}
 
+# ── ABAP Dump Functions (ST22) ────────────────────────────────────────────────
+def scan_st22_dumps(date_from=None, date_to=None):
+    """List ABAP runtime errors from ST22."""
+    go_to_transaction("ST22")
+    time.sleep(1.5)
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+    try:
+        for fid in ("wnd[0]/usr/ctxtSEL_DATUM-LOW", "wnd[0]/usr/ctxtP_DATUM"):
+            try:
+                session.FindById(fid).Text = df
+                break
+            except Exception:
+                pass
+        for fid in ("wnd[0]/usr/ctxtSEL_DATUM-HIGH", "wnd[0]/usr/ctxtP_DATUM2"):
+            try:
+                session.FindById(fid).Text = dt
+                break
+            except Exception:
+                pass
+    except Exception:
+        pass
+    session.FindById("wnd[0]").SendVKey(8)   # Execute
+    time.sleep(2)
+
+    dumps = []
+    # Try ALV grid first
+    try:
+        shell = session.FindById(
+            "wnd[0]/usr/cntlST22_CONTAINER/shellcont/shell", False)
+        if shell:
+            rows = shell.RowCount
+            for i in range(min(rows, 50)):
+                row = {}
+                for col in ["DATUM","UZEIT","UNAME","REPID","ERTYP","MANDT"]:
+                    try:
+                        row[col] = shell.GetCellValue(i, col)
+                    except Exception:
+                        pass
+                if any(row.values()):
+                    row["index"] = i
+                    dumps.append(row)
+    except Exception:
+        pass
+
+    return {"date": df, "dumps": dumps, "count": len(dumps),
+            "screen": get_screen_text()}
+
+
+def get_dump_detail(dump_index=0):
+    """
+    Open a specific dump from ST22 (by row index) and extract:
+    error type, program, include, line number, error text, call stack, variables.
+    """
+    try:
+        # Try ALV double-click
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlST22_CONTAINER/shellcont/shell", False)
+            if shell:
+                shell.SetCurrentCell(dump_index, "DATUM")
+                shell.DoubleClickCurrentCell()
+                time.sleep(2)
+            else:
+                raise Exception("no shell")
+        except Exception:
+            # Fallback: position cursor and press Enter
+            session.FindById("wnd[0]").SendVKey(2)
+            time.sleep(2)
+
+        # Walk all text from dump detail screen
+        texts = []
+        def walk_text(comp, depth=0):
+            if depth > 9:
+                return
+            try:
+                n = comp.Children.Count
+            except Exception:
+                return
+            for i in range(n):
+                try:
+                    child = comp.Children(i)
+                    if child.Type in ("GuiTextField","GuiCTextField",
+                                     "GuiLabel","GuiStatusbar","GuiTitlebar"):
+                        try:
+                            t = child.Text.strip()
+                            if t:
+                                texts.append(t)
+                        except Exception:
+                            pass
+                    walk_text(child, depth + 1)
+                except Exception:
+                    pass
+
+        walk_text(session.FindById("wnd[0]"))
+        raw = "\n".join(texts[:300])
+
+        # Parse key fields from raw text
+        result = {"dump_index": dump_index, "raw": raw,
+                  "screen": get_screen_text()}
+
+        # Extract program name from dump text
+        for line in texts:
+            if "Program" in line or "REPID" in line:
+                result["program_hint"] = line
+                break
+
+        return result
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _clipboard_copy_from_sap():
+    """Select all text in current SAP editor and copy to clipboard."""
+    try:
+        import win32api, win32con, win32clipboard
+        # Ctrl+A
+        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+        win32api.keybd_event(0x41, 0, 0, 0)
+        win32api.keybd_event(0x41, 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.4)
+        # Ctrl+C
+        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+        win32api.keybd_event(0x43, 0, 0, 0)
+        win32api.keybd_event(0x43, 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.5)
+        win32clipboard.OpenClipboard()
+        data = win32clipboard.GetClipboardData(win32clipboard.CF_TEXT)
+        win32clipboard.CloseClipboard()
+        if isinstance(data, bytes):
+            data = data.decode("latin-1", errors="replace")
+        return data
+    except Exception as e:
+        return None
+
+
+def _clipboard_paste_to_sap(text):
+    """Put text on clipboard then Ctrl+A / Ctrl+V into current SAP editor."""
+    try:
+        import win32api, win32con, win32clipboard
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardText(text)
+        win32clipboard.CloseClipboard()
+        time.sleep(0.3)
+        # Ctrl+A
+        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+        win32api.keybd_event(0x41, 0, 0, 0)
+        win32api.keybd_event(0x41, 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.3)
+        # Ctrl+V
+        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+        win32api.keybd_event(0x56, 0, 0, 0)
+        win32api.keybd_event(0x56, 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.8)
+        return True
+    except Exception:
+        return False
+
+
+def download_abap_source(program_name):
+    """
+    Download ABAP source from SE38 to local file + return as string.
+    Tries clipboard first, then menu download as fallback.
+    """
+    prog = program_name.strip().upper()
+    filepath = os.path.join(TEMP_DIR, f"{prog}.abap")
+
+    go_to_transaction("SE38")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtRS38M-PROGRAMM").Text = prog
+        session.FindById("wnd[0]").SendVKey(7)   # F7 = Display
+        time.sleep(1.5)
+    except Exception as e:
+        return {"error": f"SE38 navigate: {e}"}
+
+    # Method 1 — clipboard
+    source = _clipboard_copy_from_sap()
+    if source and len(source) > 10:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(source)
+        return {"program": prog, "source": source,
+                "lines": len(source.splitlines()), "file": filepath,
+                "method": "clipboard"}
+
+    # Method 2 — SE38 menu download
+    menu_candidates = [
+        "wnd[0]/mbar/menu[0]/menu[7]",
+        "wnd[0]/mbar/menu[0]/menu[6]",
+        "wnd[0]/mbar/menu[4]/menu[9]/menu[0]",
+    ]
+    for mp in menu_candidates:
+        try:
+            session.FindById(mp).Select()
+            time.sleep(1)
+            wnd1 = session.FindById("wnd[1]", False)
+            if wnd1:
+                for fid in ("usr/ctxtDY_FILENAME","usr/ctxtFILENAME","usr/txtFILENAME"):
+                    try:
+                        wnd1.FindById(fid).Text = filepath
+                        break
+                    except Exception:
+                        pass
+                wnd1.SendVKey(0)
+                time.sleep(1)
+                handle_popup("confirm")
+                time.sleep(1)
+                if os.path.exists(filepath):
+                    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                        source = f.read()
+                    return {"program": prog, "source": source,
+                            "lines": len(source.splitlines()), "file": filepath,
+                            "method": "menu_download"}
+        except Exception:
+            continue
+
+    return {"program": prog, "error": "Could not download source automatically. "
+            "Please manually save from SE38 → Program → Download.",
+            "file_would_be": filepath}
+
+
+def upload_abap_source(program_name, source_code, is_new=False):
+    """
+    Upload fixed ABAP source to SE38.
+    Saves to temp file then pastes via clipboard (Ctrl+A / Ctrl+V).
+    """
+    prog = program_name.strip().upper()
+    filepath = os.path.join(TEMP_DIR, f"{prog}_fixed.abap")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(source_code)
+
+    go_to_transaction("SE38")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtRS38M-PROGRAMM").Text = prog
+        if is_new:
+            session.FindById("wnd[0]").SendVKey(5)   # F5 = Create
+            time.sleep(1.5)
+            wnd1 = session.FindById("wnd[1]", False)
+            if wnd1:
+                wnd1.SendVKey(0)
+                time.sleep(1)
+        else:
+            session.FindById("wnd[0]").SendVKey(6)   # F6 = Change
+            time.sleep(1.5)
+    except Exception as e:
+        return {"error": f"SE38 open: {e}"}
+
+    # Paste via clipboard
+    ok = _clipboard_paste_to_sap(source_code)
+    if ok:
+        return {"ok": True, "program": prog, "method": "clipboard_paste",
+                "lines": len(source_code.splitlines()),
+                "file": filepath, "screen": get_screen_text()}
+
+    # Fallback: menu upload
+    menu_candidates = [
+        "wnd[0]/mbar/menu[0]/menu[8]",
+        "wnd[0]/mbar/menu[0]/menu[7]",
+    ]
+    for mp in menu_candidates:
+        try:
+            session.FindById(mp).Select()
+            time.sleep(1)
+            wnd1 = session.FindById("wnd[1]", False)
+            if wnd1:
+                for fid in ("usr/ctxtDY_FILENAME","usr/ctxtFILENAME","usr/txtFILENAME"):
+                    try:
+                        wnd1.FindById(fid).Text = filepath
+                        break
+                    except Exception:
+                        pass
+                wnd1.SendVKey(0)
+                time.sleep(1)
+                return {"ok": True, "program": prog, "method": "menu_upload",
+                        "file": filepath, "screen": get_screen_text()}
+        except Exception:
+            continue
+
+    return {"ok": False, "program": prog,
+            "error": "Upload failed. Source saved locally: " + filepath}
+
+
+def check_abap_syntax(program_name):
+    """Syntax check in SE38 (must be in change mode first)."""
+    prog = program_name.strip().upper()
+    go_to_transaction("SE38")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtRS38M-PROGRAMM").Text = prog
+        session.FindById("wnd[0]").SendVKey(6)   # Change
+        time.sleep(1.5)
+        # Syntax check button (toolbar btn[2]) or Ctrl+F2
+        try:
+            session.FindById("wnd[0]/tbar[1]/btn[2]").Press()
+        except Exception:
+            try:
+                session.FindById("wnd[0]/mbar/menu[0]/menu[1]").Select()
+            except Exception:
+                pass
+        time.sleep(2)
+        return {"program": prog, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def activate_abap_object(program_name):
+    """Activate ABAP program in SE38 after fix is uploaded."""
+    prog = program_name.strip().upper()
+    go_to_transaction("SE38")
+    time.sleep(1)
+    try:
+        session.FindById("wnd[0]/usr/ctxtRS38M-PROGRAMM").Text = prog
+        session.FindById("wnd[0]").SendVKey(6)   # Change
+        time.sleep(1.5)
+        # Activate: toolbar btn[3] or menu Program → Activate
+        try:
+            session.FindById("wnd[0]/tbar[1]/btn[3]").Press()
+        except Exception:
+            try:
+                session.FindById("wnd[0]/mbar/menu[0]/menu[2]").Select()
+            except Exception:
+                pass
+        time.sleep(2)
+        # Handle any activation dialog (e.g. "inactive includes")
+        try:
+            wnd1 = session.FindById("wnd[1]", False)
+            if wnd1:
+                wnd1.SendVKey(0)
+                time.sleep(1)
+        except Exception:
+            pass
+        return {"ok": True, "program": prog, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def get_sales_orders(date_from, date_to):
     go_to_transaction("VA05")
     time.sleep(1)
@@ -565,6 +913,108 @@ TOOLS = [
             "required": ["transport_number"],
         },
     },
+
+    # ── ABAP DUMP DEBUG & FIX ─────────────────────────────────────────────────
+    {
+        "name": "scan_abap_dumps",
+        "description": (
+            "Scan ST22 for ABAP runtime errors (dumps). "
+            "Returns list of dumps with date, time, user, program, error type. "
+            "Always call this first when asked to fix ABAP dumps."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string",
+                              "description": "DD.MM.YYYY (defaults to today)"},
+                "date_to":   {"type": "string",
+                              "description": "DD.MM.YYYY (defaults to today)"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_dump_detail",
+        "description": (
+            "Open a specific ABAP dump from ST22 by its row index and extract: "
+            "error type, program name, include, line number, error message, "
+            "call stack, and variable values. Call scan_abap_dumps first to "
+            "get the index."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dump_index": {"type": "integer",
+                               "description": "Row index from scan_abap_dumps (0-based)"},
+            },
+            "required": ["dump_index"],
+        },
+    },
+    {
+        "name": "download_abap_source",
+        "description": (
+            "Download the full ABAP source code of a program from SE38. "
+            "Use after get_dump_detail identifies the failing program. "
+            "Returns complete source code for analysis."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "program_name": {"type": "string",
+                                 "description": "ABAP program name e.g. Z_MY_PROG, SAPMV45A"},
+            },
+            "required": ["program_name"],
+        },
+    },
+    {
+        "name": "upload_abap_source",
+        "description": (
+            "Upload corrected ABAP source code to SE38, replacing the existing code. "
+            "Use after generating the fix. Pastes via clipboard. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "program_name": {"type": "string"},
+                "source_code":  {"type": "string",
+                                 "description": "Complete corrected ABAP source code"},
+                "is_new":       {"type": "boolean",
+                                 "description": "True if creating a new program"},
+            },
+            "required": ["program_name", "source_code"],
+        },
+    },
+    {
+        "name": "check_abap_syntax",
+        "description": (
+            "Run syntax check on an ABAP program in SE38. "
+            "Call after upload_abap_source and before activation. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "program_name": {"type": "string"},
+            },
+            "required": ["program_name"],
+        },
+    },
+    {
+        "name": "activate_abap_object",
+        "description": (
+            "Activate an ABAP program in SE38 after uploading the fix. "
+            "Only call after check_abap_syntax returns no errors. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "program_name": {"type": "string"},
+            },
+            "required": ["program_name"],
+        },
+    },
 ]
 
 # ── Write operations that need approval ───────────────────────────────────────
@@ -573,6 +1023,7 @@ WRITE_TOOLS = {
     "handle_popup", "handle_transport_request",
     "maintain_table", "execute_abap_program",
     "create_transport_request", "release_transport_request",
+    "upload_abap_source", "check_abap_syntax", "activate_abap_object",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
@@ -628,6 +1079,27 @@ def dispatch(tool_name, tool_input):
         return create_transport(tool_input.get("description", "ARTILEGENZ Change"))
     if tool_name == "release_transport_request":
         return release_transport(tool_input["transport_number"])
+
+    # ── ABAP dump debug tools ──────────────────────────────────────────────────
+    if tool_name == "scan_abap_dumps":
+        return scan_st22_dumps(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+        )
+    if tool_name == "get_dump_detail":
+        return get_dump_detail(tool_input.get("dump_index", 0))
+    if tool_name == "download_abap_source":
+        return download_abap_source(tool_input["program_name"])
+    if tool_name == "upload_abap_source":
+        return upload_abap_source(
+            tool_input["program_name"],
+            tool_input["source_code"],
+            tool_input.get("is_new", False),
+        )
+    if tool_name == "check_abap_syntax":
+        return check_abap_syntax(tool_input["program_name"])
+    if tool_name == "activate_abap_object":
+        return activate_abap_object(tool_input["program_name"])
 
     return {"error": f"Unknown tool: {tool_name}"}
 
@@ -720,6 +1192,56 @@ Fiscal Year   : K4
 Purch Org     : 1000  IDES Deutschland
 
 ═══════════════════════════════════════════════════════════
+ ABAP DUMP DEBUG & FIX WORKFLOW  (ST22)
+═══════════════════════════════════════════════════════════
+When asked to fix/debug ABAP dumps, follow this exact sequence:
+
+STEP 1  scan_abap_dumps(date_from, date_to)
+        → Returns list of dumps with index, program, error type
+
+STEP 2  get_dump_detail(dump_index)
+        → Returns full error text, failing program/include/line,
+          call stack, variable values at time of crash
+
+STEP 3  download_abap_source(program_name)
+        → Returns complete ABAP source code of the failing program
+
+STEP 4  ANALYSE (no tool needed)
+        → Read the dump detail + source code
+        → Identify the exact line causing the error
+        → Common errors and fixes:
+          COMPUTE_BCD_OVERFLOW    → add CHECK / TRY CATCH around arithmetic
+          CONVT_NO_NUMBER         → add CHECK sy-subrc / CONDENSE / validate input
+          DATA_LENGTH_0           → check internal table is not empty before access
+          GETWA_NOT_ASSIGNED      → check FIELD-SYMBOL is assigned before use
+          MESSAGE_TYPE_X          → find the MESSAGE ... TYPE 'X' line and fix logic
+          MOVE_CAST_ERROR         → check type compatibility before MOVE/CAST
+          RAISE_EXCEPTION         → find unhandled RAISE and add TRY...CATCH
+          CONNE_IMPORT_WRONG_VER  → program/transport version mismatch
+        → Generate the corrected ABAP source in full
+
+STEP 5  Show proposed fix to user:
+        - Which line is wrong
+        - What the original code does
+        - What the fix changes and why
+        → Wait for user approval
+
+STEP 6  upload_abap_source(program_name, corrected_source)
+        → REQUIRES approval → pastes corrected source into SE38
+
+STEP 7  check_abap_syntax(program_name)
+        → REQUIRES approval → verifies no syntax errors before activate
+
+STEP 8  activate_abap_object(program_name)
+        → REQUIRES approval → activates the fixed program
+
+STEP 9  handle_transport_request()
+        → REQUIRES approval → assigns fix to transport for migration
+
+STEP 10 scan_abap_dumps(today, today)
+        → Verify dump no longer appears
+
+═══════════════════════════════════════════════════════════
  RULES
 ═══════════════════════════════════════════════════════════
 • ALWAYS discover_screen_elements after every navigation.
@@ -731,6 +1253,10 @@ Purch Org     : 1000  IDES Deutschland
 • Confirm each step with read_screen to verify success.
 • For SM30 table writes: navigate → discover → New Entry button
   → fill fields → Save → transport.
+• For ABAP fixes: NEVER skip syntax check before activation.
+• Always show the user what changed in the code before uploading.
+• If source download fails, tell the user the program name so
+  they can paste it manually.
 """
 
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
@@ -816,20 +1342,18 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v5.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  ARTILEGENZ SAP Agent v6.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Authorization: FULL SYSTEM ACCESS")
     print("  All write operations require your approval first.")
     print("═" * 68)
     print("\nExample queries:")
+    print('  "Scan all ABAP dumps from today and fix them"')
+    print('  "Show me the ABAP dump for program SAPMV45A and fix it"')
+    print('  "Download and fix the source code of Z_MY_PROGRAM"')
+    print('  "Create a new ABAP report Z_ARTILEGENZ_TEST"')
     print('  "Read table T001 and show all existing company codes"')
     print('  "Create the full IDES org structure with transports"')
-    print('  "Create company code 1000 IDES AG Germany EUR"')
-    print('  "Create plant 1000 Hamburg Germany"')
-    print('  "Create sales org 1000 Deutschland assign to company code 1000"')
-    print('  "Create a transport for all org structure changes"')
     print('  "Show all sales orders from January 2025"')
-    print('  "Fix all failed IDocs from today"')
-    print('  "Show ABAP dumps from ST22 and propose fixes"')
     print('  "Maintain table T001W and add plant 2000 Berlin"')
 
     while True:
