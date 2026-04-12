@@ -1,5 +1,5 @@
 """
-ARTILEGENZ SAP Claude Agent v5.0
+ARTILEGENZ SAP Claude Agent v9.0
 Authorization: SAP_ALL + SAP_NEW (full system access confirmed via SU01)
 User: S4ABAP24
 
@@ -427,6 +427,7 @@ def load_data_to_table(table_name, records, mode="MODIFY"):
         lines.append( "  APPEND ls_data TO lt_data.")
         lines.append( "")
 
+    _ts = datetime.now().strftime("%d.%m.%Y %H:%M")
     lines += [
         f"  {mode} {table.lower()} FROM TABLE lt_data.",
         "  IF sy-subrc = 0.",
@@ -436,7 +437,7 @@ def load_data_to_table(table_name, records, mode="MODIFY"):
         "    lv_err = sy-subrc.",
         f"    WRITE: / 'ERROR loading {table}. SY-SUBRC:' && lv_err.",
         "  ENDIF.",
-        f"  WRITE: / 'Done: {datetime.now().strftime(\"%d.%m.%Y %H:%M\")} User:{CURRENT_USER}'.",
+        f"  WRITE: / 'Done: {_ts} User:{CURRENT_USER}'.",
     ]
 
     source = "\n".join(lines)
@@ -1141,6 +1142,502 @@ def activate_abap_object(program_name):
         return {"error": str(e)}
 
 
+# ── IDoc Error Analysis & Auto-Fix ───────────────────────────────────────────
+
+# IDoc status codes and their meaning
+IDOC_STATUS = {
+    "01": "IDoc generated",
+    "02": "Error passing data to port",
+    "03": "Data passed to port OK",
+    "04": "Error within control info",
+    "05": "Error during translation",
+    "06": "Translation OK",
+    "07": "Error during syntax check",
+    "08": "Syntax check OK",
+    "09": "Error during interchange handling",
+    "12": "Dispatch OK",
+    "13": "Retransmission OK",
+    "17": "Error passing status to R/2",
+    "20": "Error triggering EDI subsystem",
+    "26": "Error during syntax check",
+    "29": "Error in ALE service",
+    "30": "IDoc ready for dispatch",
+    "31": "Error — no further processing",
+    "51": "Application document not posted",
+    "52": "Application document not fully posted",
+    "53": "Application document posted",
+    "56": "IDoc with errors added",
+    "61": "Processing despite syntax errors",
+    "64": "IDoc ready to be transferred to application",
+    "65": "Error in ALE service",
+    "68": "Error — no further processing",
+    "70": "Original of an IDoc that was edited",
+    "71": "IDoc is an edited copy",
+}
+
+# Common error messages and their auto-fix actions
+IDOC_FIX_MAP = {
+    "partner not found":              ("fix_partner_profile", "MEDIUM"),
+    "partner profile":                ("fix_partner_profile", "MEDIUM"),
+    "no partner agreement":           ("fix_partner_profile", "MEDIUM"),
+    "posting period":                 ("open_posting_period", "HIGH"),
+    "period is not open":             ("open_posting_period", "HIGH"),
+    "company code":                   ("check_company_code",  "LOW"),
+    "plant":                          ("check_plant",         "LOW"),
+    "material":                       ("check_material",      "MEDIUM"),
+    "does not exist":                 ("check_master_data",   "MEDIUM"),
+    "customer":                       ("check_customer",      "MEDIUM"),
+    "vendor":                         ("check_vendor",        "MEDIUM"),
+    "account":                        ("check_gl_account",    "MEDIUM"),
+    "authorization":                  ("check_authorization", "LOW"),
+    "duplicate":                      ("mark_duplicate",      "LOW"),
+    "message type":                   ("fix_message_type",    "MEDIUM"),
+    "segment":                        ("fix_segment_data",    "HIGH"),
+    "syntax":                         ("fix_idoc_syntax",     "HIGH"),
+    "no inbound function module":     ("fix_partner_profile", "MEDIUM"),
+    "function module":                ("check_fm_exists",     "HIGH"),
+    "tax":                            ("check_tax_config",    "LOW"),
+    "exchange rate":                  ("check_exchange_rate", "LOW"),
+}
+
+
+def scan_idoc_errors(date_from=None, date_to=None, direction="both",
+                     status_filter="51"):
+    """
+    Scan for IDoc errors using WE05 (IDoc list).
+    Returns list of failed IDocs with number, status, message type, partner.
+    status_filter: comma-separated status codes to search e.g. '51,26,56'
+    direction: 'inbound', 'outbound', or 'both'
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("WE05")
+    time.sleep(1.5)
+
+    try:
+        # Set date range
+        for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-LOW",
+                    "wnd[0]/usr/ctxtLOW_DATE"):
+            try:
+                session.FindById(fid).Text = df
+                break
+            except Exception:
+                pass
+        for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-HIGH",
+                    "wnd[0]/usr/ctxtHIGH_DATE"):
+            try:
+                session.FindById(fid).Text = dt
+                break
+            except Exception:
+                pass
+
+        # Set direction (inbound/outbound)
+        if direction == "inbound":
+            for fid in ("wnd[0]/usr/radRB_DIRECT_1",
+                        "wnd[0]/usr/radINBOUND"):
+                try:
+                    session.FindById(fid).Select()
+                    break
+                except Exception:
+                    pass
+        elif direction == "outbound":
+            for fid in ("wnd[0]/usr/radRB_DIRECT_2",
+                        "wnd[0]/usr/radOUTBOUND"):
+                try:
+                    session.FindById(fid).Select()
+                    break
+                except Exception:
+                    pass
+
+        # Execute
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        # Read ALV grid
+        idocs = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlWE05_CONTAINER/shellcont/shell", False)
+            if shell:
+                rows = shell.RowCount
+                for i in range(min(rows, 200)):
+                    row = {}
+                    for col in ["DOCNUM","STATUS","MANDT","DIRECT",
+                                "MESTYP","MESCOD","MESFCT","SNDPRT",
+                                "SNDPRN","RCVPRT","RCVPRN","CREDAT",
+                                "CRETIM","UPDDAT","STATXT"]:
+                        try:
+                            row[col] = shell.GetCellValue(i, col)
+                        except Exception:
+                            pass
+                    if row.get("DOCNUM"):
+                        row["status_desc"] = IDOC_STATUS.get(
+                            row.get("STATUS",""), "Unknown")
+                        # Filter by status
+                        if status_filter == "all" or \
+                           row.get("STATUS","") in status_filter.split(","):
+                            idocs.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from":   df,
+            "date_to":     dt,
+            "idoc_errors": idocs,
+            "count":       len(idocs),
+            "screen":      get_screen_text(),
+            "note": (f"Found {len(idocs)} IDocs matching status {status_filter}. "
+                     "Call get_idoc_detail for each to analyse root cause."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_idoc_detail(idoc_number):
+    """
+    Display a specific IDoc in WE02 and extract:
+    - Control record (partner, message type, status, direction)
+    - ALL status records with timestamps and error text
+    - ALL segment data (key fields from each segment)
+    Returns structured dict for root cause analysis.
+    """
+    go_to_transaction("WE02")
+    time.sleep(1)
+    try:
+        # Enter IDoc number
+        for fid in ("wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
+                    "wnd[0]/usr/ctxtDOCNUM"):
+            try:
+                session.FindById(fid).Text = str(idoc_number).zfill(16)
+                break
+            except Exception:
+                pass
+        session.FindById("wnd[0]").SendVKey(8)   # Execute
+        time.sleep(2)
+
+        detail = {
+            "idoc_number": str(idoc_number),
+            "status_records": [],
+            "segments": [],
+            "error_messages": [],
+            "screen": get_screen_text(),
+        }
+
+        # Try to read tree/ALV structure
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlWE02_CONTAINER/shellcont/shell", False)
+            if shell:
+                rows = shell.RowCount
+                for i in range(min(rows, 300)):
+                    row = {}
+                    for col in ["DOCNUM","STATUS","LOGDAT","LOGTIM",
+                                "STAMQU","STATXT","SEGNAM","HLEVEL",
+                                "DTINT2"]:
+                        try:
+                            row[col] = shell.GetCellValue(i, col)
+                        except Exception:
+                            pass
+                    if row.get("STATXT"):
+                        detail["status_records"].append(row)
+                        txt = row.get("STATXT","").lower()
+                        if any(e in txt for e in ["error","fehler","not found",
+                                                   "nicht","invalid","missing"]):
+                            detail["error_messages"].append(row["STATXT"])
+                    if row.get("SEGNAM"):
+                        detail["segments"].append(row)
+        except Exception:
+            pass
+
+        # Also walk all text elements for any missed error text
+        texts = []
+        def walk_t(comp, depth=0):
+            if depth > 8:
+                return
+            try:
+                n = comp.Children.Count
+            except Exception:
+                return
+            for i in range(n):
+                try:
+                    child = comp.Children(i)
+                    if child.Type in ("GuiTextField","GuiCTextField","GuiLabel"):
+                        try:
+                            t = child.Text.strip()
+                            if t and len(t) > 5:
+                                texts.append(t)
+                        except Exception:
+                            pass
+                    walk_t(child, depth + 1)
+                except Exception:
+                    pass
+        walk_t(session.FindById("wnd[0]"))
+        detail["all_screen_text"] = "\n".join(texts[:200])
+
+        # Determine fix hint from error messages
+        fix_hints = []
+        combined_error = " ".join(detail["error_messages"]).lower()
+        combined_error += " " + detail["all_screen_text"].lower()
+        for pattern, (fix_action, risk) in IDOC_FIX_MAP.items():
+            if pattern in combined_error:
+                fix_hints.append({
+                    "pattern":    pattern,
+                    "fix_action": fix_action,
+                    "risk":       risk,
+                })
+        detail["fix_hints"] = fix_hints
+
+        return detail
+
+    except Exception as e:
+        return {"error": str(e), "idoc_number": str(idoc_number)}
+
+
+def get_idoc_segments(idoc_number):
+    """
+    Read raw segment data from IDoc via EDIDD table (SE16N).
+    Returns all segment content for deep data-level analysis.
+    """
+    result = read_sap_table("EDIDD", max_rows=500)
+    # Also read control record
+    ctrl  = read_sap_table("EDIDC", max_rows=10)
+    return {
+        "idoc_number": str(idoc_number),
+        "control_record": ctrl,
+        "segment_data":   result,
+    }
+
+
+def reprocess_idoc(idoc_number, edit_mode=False):
+    """
+    Reprocess a failed IDoc via WE19.
+    edit_mode=False: reprocess as-is (standard retry).
+    edit_mode=True:  open in edit mode so field values can be changed first.
+    """
+    go_to_transaction("WE19")
+    time.sleep(1)
+    try:
+        # Enter IDoc number
+        for fid in ("wnd[0]/usr/ctxtWE19-DOCNUM",
+                    "wnd[0]/usr/ctxtDOCNUM"):
+            try:
+                session.FindById(fid).Text = str(idoc_number).zfill(16)
+                break
+            except Exception:
+                pass
+
+        if edit_mode:
+            # Select "Edit IDoc" option
+            for fid in ("wnd[0]/usr/radWE19-CEDITYPE_2",
+                        "wnd[0]/usr/radEDIT"):
+                try:
+                    session.FindById(fid).Select()
+                    break
+                except Exception:
+                    pass
+
+        session.FindById("wnd[0]").SendVKey(8)   # Execute
+        time.sleep(2)
+
+        result = {"ok": True, "idoc": str(idoc_number),
+                  "edit_mode": edit_mode, "screen": get_screen_text()}
+
+        if not edit_mode:
+            # Standard processing — trigger inbound function module
+            try:
+                session.FindById("wnd[0]/tbar[1]/btn[8]").Press()
+                time.sleep(2)
+            except Exception:
+                try:
+                    session.FindById("wnd[0]").SendVKey(8)
+                    time.sleep(2)
+                except Exception:
+                    pass
+            result["screen_after"] = get_screen_text()
+
+        audit_log("IDOC_REPROCESS",
+                  {"idoc": str(idoc_number), "edit_mode": edit_mode},
+                  status="executed")
+        return result
+    except Exception as e:
+        return {"error": str(e), "idoc": str(idoc_number)}
+
+
+def edit_idoc_field(idoc_number, segment_name, field_name, new_value):
+    """
+    Open IDoc in WE19 edit mode, navigate to a specific segment field
+    and change its value, then reprocess.
+    Use when the root cause is wrong data in a segment field.
+    """
+    # First open in edit mode
+    open_result = reprocess_idoc(idoc_number, edit_mode=True)
+    if not open_result.get("ok"):
+        return open_result
+    time.sleep(1)
+
+    # Discover elements and try to find the segment/field
+    elems = discover_elements()
+    found = False
+    for elem in elems:
+        eid = elem.get("id","").upper()
+        tip = elem.get("tooltip","").upper()
+        if field_name.upper() in eid or field_name.upper() in tip:
+            set_field(elem["id"], str(new_value))
+            found = True
+            break
+
+    if not found:
+        return {
+            "ok":      False,
+            "note":    f"Field {field_name} not found on screen. "
+                       "Use discover_screen_elements to find the correct ID.",
+            "elements": [e["id"] for e in elems[:30]],
+        }
+
+    # Save and reprocess
+    session.FindById("wnd[0]").SendVKey(11)   # Save
+    time.sleep(1)
+    session.FindById("wnd[0]").SendVKey(8)    # Execute/Reprocess
+    time.sleep(2)
+
+    audit_log("IDOC_FIELD_EDIT",
+              {"idoc": str(idoc_number), "segment": segment_name,
+               "field": field_name, "new_value": str(new_value)},
+              status="executed")
+    return {"ok": True, "field_changed": field_name,
+            "new_value": new_value, "screen": get_screen_text()}
+
+
+def check_partner_profile(partner_number, direction="1", message_type=""):
+    """
+    Check WE20 partner profile for a specific partner.
+    direction: '1'=inbound, '2'=outbound
+    Returns whether profile exists and configured message types.
+    """
+    go_to_transaction("WE20")
+    time.sleep(1.5)
+    try:
+        # Try to search for the partner
+        for fid in ("wnd[0]/usr/ctxtWE20-PARNR",
+                    "wnd[0]/usr/ctxtPARTNER_NO"):
+            try:
+                session.FindById(fid).Text = str(partner_number)
+                break
+            except Exception:
+                pass
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(1.5)
+        return {"partner": str(partner_number),
+                "screen":  get_screen_text(),
+                "elements": discover_elements()[:40]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def create_partner_profile(partner_number, partner_type, direction,
+                            message_type, process_code, func_module=""):
+    """
+    Create or fix a partner profile entry in WE20.
+    partner_type: LS=Logical system, KU=Customer, LI=Vendor
+    direction: 1=Inbound, 2=Outbound
+    process_code: e.g. ORDE, DELVRY, INVOIC, DESADV
+    """
+    go_to_transaction("WE20")
+    time.sleep(1.5)
+    try:
+        # Click Create / New
+        for fid in ("wnd[0]/tbar[1]/btn[8]",
+                    "wnd[0]/tbar[0]/btn[3]"):
+            try:
+                session.FindById(fid).Press()
+                time.sleep(1)
+                break
+            except Exception:
+                pass
+
+        elems = discover_elements()
+        field_map = {
+            "PARNR": partner_number,
+            "PARVW": partner_type,
+        }
+        for field, val in field_map.items():
+            for e in elems:
+                if field in e.get("id","").upper():
+                    set_field(e["id"], val)
+                    break
+
+        session.FindById("wnd[0]").SendVKey(0)   # Enter
+        time.sleep(1)
+
+        return {"ok": True, "partner": partner_number,
+                "type": partner_type, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def bd87_reprocess_all(message_type="", date_from=None, date_to=None):
+    """
+    Reprocess ALL failed IDocs of a given message type via BD87.
+    Leave message_type blank to reprocess all error IDocs.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("BD87")
+    time.sleep(1.5)
+    try:
+        # Set date
+        for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-LOW",
+                    "wnd[0]/usr/ctxtLOW_DATE"):
+            try:
+                session.FindById(fid).Text = df
+                break
+            except Exception:
+                pass
+        for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-HIGH",
+                    "wnd[0]/usr/ctxtHIGH_DATE"):
+            try:
+                session.FindById(fid).Text = dt
+                break
+            except Exception:
+                pass
+        if message_type:
+            for fid in ("wnd[0]/usr/ctxtSEL_MESTYP-LOW",
+                        "wnd[0]/usr/ctxtMESTYP"):
+                try:
+                    session.FindById(fid).Text = message_type.upper()
+                    break
+                except Exception:
+                    pass
+
+        session.FindById("wnd[0]").SendVKey(8)   # Execute
+        time.sleep(2.5)
+
+        # Select all IDocs and trigger reprocessing
+        session.FindById("wnd[0]").SendVKey(16)  # Select all
+        time.sleep(0.5)
+
+        # Click Execute/Reprocess
+        try:
+            session.FindById("wnd[0]/tbar[1]/btn[9]").Press()
+            time.sleep(2)
+        except Exception:
+            session.FindById("wnd[0]").SendVKey(9)
+            time.sleep(2)
+
+        audit_log("IDOC_BATCH_REPROCESS",
+                  {"message_type": message_type or "ALL",
+                   "date_from": df, "date_to": dt},
+                  status="executed")
+        return {"ok": True, "message_type": message_type or "ALL",
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def get_sales_orders(date_from, date_to):
     go_to_transaction("VA05")
     time.sleep(1)
@@ -1729,6 +2226,184 @@ TOOLS = [
             "required": ["program_name"],
         },
     },
+
+    # ── IDOC ERROR ANALYSIS & AUTO-FIX ───────────────────────────────────────
+    {
+        "name": "scan_idoc_errors",
+        "description": (
+            "Scan WE05 for failed IDocs in a date range. "
+            "Returns list with IDoc number, status code, message type, "
+            "sender/receiver partner. "
+            "status_filter: comma-separated status codes e.g. '51,26,56' "
+            "or 'all' for every status. "
+            "direction: 'inbound', 'outbound', or 'both'. "
+            "ALWAYS call this first when diagnosing IDoc errors."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from":     {"type": "string",
+                                  "description": "DD.MM.YYYY (defaults to today)"},
+                "date_to":       {"type": "string",
+                                  "description": "DD.MM.YYYY (defaults to today)"},
+                "direction":     {"type": "string",
+                                  "enum": ["inbound", "outbound", "both"],
+                                  "description": "IDoc direction filter"},
+                "status_filter": {"type": "string",
+                                  "description": "Comma-separated status codes or 'all'"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_idoc_detail",
+        "description": (
+            "Open a specific IDoc in WE02 and extract: "
+            "control record, ALL status records with error text, segment list, "
+            "and auto-computed fix_hints based on the error messages. "
+            "Always call after scan_idoc_errors to get root cause per IDoc."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "idoc_number": {"type": "string",
+                                "description": "IDoc document number (up to 16 digits)"},
+            },
+            "required": ["idoc_number"],
+        },
+    },
+    {
+        "name": "get_idoc_segments",
+        "description": (
+            "Read raw segment data for an IDoc from tables EDIDD (segments) "
+            "and EDIDC (control record) via SE16N. "
+            "Use for deep data-level analysis when fix_hints suggest a data problem."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "idoc_number": {"type": "string",
+                                "description": "IDoc document number"},
+            },
+            "required": ["idoc_number"],
+        },
+    },
+    {
+        "name": "reprocess_idoc",
+        "description": (
+            "Reprocess a failed IDoc via WE19. "
+            "edit_mode=false: standard retry using existing data. "
+            "edit_mode=true: open in edit mode so you can change field values first. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "idoc_number": {"type": "string",
+                                "description": "IDoc document number"},
+                "edit_mode":   {"type": "boolean",
+                                "description": "True=open for editing, False=direct retry"},
+            },
+            "required": ["idoc_number"],
+        },
+    },
+    {
+        "name": "edit_idoc_field",
+        "description": (
+            "Open IDoc in WE19 edit mode, locate a specific segment field "
+            "and change its value, then reprocess. "
+            "Use when root cause is wrong data in a segment (e.g. wrong partner number, "
+            "wrong plant code, wrong date format). "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "idoc_number":   {"type": "string",
+                                  "description": "IDoc document number"},
+                "segment_name":  {"type": "string",
+                                  "description": "Segment name e.g. E1EDKA1, E1EDP01"},
+                "field_name":    {"type": "string",
+                                  "description": "Field name within the segment e.g. KUNNR, MATNR"},
+                "new_value":     {"type": "string",
+                                  "description": "Corrected field value"},
+            },
+            "required": ["idoc_number", "segment_name", "field_name", "new_value"],
+        },
+    },
+    {
+        "name": "check_partner_profile",
+        "description": (
+            "Check WE20 partner profile for a partner number. "
+            "Confirms whether the profile exists and which message types are configured. "
+            "Call when get_idoc_detail fix_hints show 'fix_partner_profile'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "partner_number": {"type": "string",
+                                   "description": "Partner number e.g. PLANT1000, 1000"},
+                "direction":      {"type": "string",
+                                   "enum": ["1", "2"],
+                                   "description": "1=Inbound, 2=Outbound"},
+                "message_type":   {"type": "string",
+                                   "description": "IDoc message type e.g. ORDERS, DESADV"},
+            },
+            "required": ["partner_number"],
+        },
+    },
+    {
+        "name": "create_partner_profile",
+        "description": (
+            "Create or fix a partner profile entry in WE20. "
+            "Use when IDoc fails with 'partner not found' or 'no partner agreement'. "
+            "partner_type: LS=Logical system, KU=Customer, LI=Vendor. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "partner_number": {"type": "string",
+                                   "description": "Partner number"},
+                "partner_type":   {"type": "string",
+                                   "enum": ["LS", "KU", "LI", "KR"],
+                                   "description": "Partner type: LS=Logical system, KU=Customer, LI=Vendor"},
+                "direction":      {"type": "string",
+                                   "enum": ["1", "2"],
+                                   "description": "1=Inbound, 2=Outbound"},
+                "message_type":   {"type": "string",
+                                   "description": "IDoc message type e.g. ORDERS, INVOIC"},
+                "process_code":   {"type": "string",
+                                   "description": "Process code e.g. ORDE, DELVRY, INVOIC"},
+                "func_module":    {"type": "string",
+                                   "description": "Function module (optional)"},
+            },
+            "required": ["partner_number", "partner_type", "direction",
+                         "message_type", "process_code"],
+        },
+    },
+    {
+        "name": "bd87_reprocess_all",
+        "description": (
+            "Batch reprocess ALL failed IDocs of a message type via BD87. "
+            "Leave message_type blank to reprocess all error IDocs. "
+            "Use after fixing the root cause (e.g. partner profile, posting period) "
+            "to reprocess the backlog in one shot. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message_type": {"type": "string",
+                                 "description": "IDoc message type e.g. ORDERS (blank=all)"},
+                "date_from":    {"type": "string",
+                                 "description": "DD.MM.YYYY (defaults to today)"},
+                "date_to":      {"type": "string",
+                                 "description": "DD.MM.YYYY (defaults to today)"},
+            },
+            "required": [],
+        },
+    },
 ]
 
 # ── Write operations that need approval ───────────────────────────────────────
@@ -1741,6 +2416,9 @@ WRITE_TOOLS = {
     "create_abap_program", "create_function_module", "create_function_group",
     "create_data_element", "create_database_table",
     "load_data_to_table", "load_csv_to_table", "sm30_load_entries",
+    # IDoc write tools
+    "reprocess_idoc", "edit_idoc_field",
+    "create_partner_profile", "bd87_reprocess_all",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
@@ -1871,6 +2549,52 @@ def dispatch(tool_name, tool_input):
             tool_input["table_name"],
             tool_input["short_text"],
             tool_input.get("package", "$TMP"),
+        )
+
+    # ── IDoc error analysis & auto-fix tools ───────────────────────────────────
+    if tool_name == "scan_idoc_errors":
+        return scan_idoc_errors(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("direction", "both"),
+            tool_input.get("status_filter", "51,26,56"),
+        )
+    if tool_name == "get_idoc_detail":
+        return get_idoc_detail(tool_input["idoc_number"])
+    if tool_name == "get_idoc_segments":
+        return get_idoc_segments(tool_input["idoc_number"])
+    if tool_name == "reprocess_idoc":
+        return reprocess_idoc(
+            tool_input["idoc_number"],
+            tool_input.get("edit_mode", False),
+        )
+    if tool_name == "edit_idoc_field":
+        return edit_idoc_field(
+            tool_input["idoc_number"],
+            tool_input["segment_name"],
+            tool_input["field_name"],
+            tool_input["new_value"],
+        )
+    if tool_name == "check_partner_profile":
+        return check_partner_profile(
+            tool_input["partner_number"],
+            tool_input.get("direction", "1"),
+            tool_input.get("message_type", ""),
+        )
+    if tool_name == "create_partner_profile":
+        return create_partner_profile(
+            tool_input["partner_number"],
+            tool_input["partner_type"],
+            tool_input["direction"],
+            tool_input["message_type"],
+            tool_input["process_code"],
+            tool_input.get("func_module", ""),
+        )
+    if tool_name == "bd87_reprocess_all":
+        return bd87_reprocess_all(
+            tool_input.get("message_type", ""),
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
         )
 
     return {"error": f"Unknown tool: {tool_name}"}
@@ -2145,6 +2869,73 @@ STEP 10 scan_abap_dumps(today, today)
         → Verify dump no longer appears
 
 ═══════════════════════════════════════════════════════════
+ IDOC ROOT CAUSE ANALYSIS & AUTO-FIX WORKFLOW
+═══════════════════════════════════════════════════════════
+When asked to find/fix IDoc errors, follow this exact sequence:
+
+STEP 1  scan_idoc_errors(date_from, date_to, direction, status_filter)
+        → Returns list of failed IDocs with number, status, partner, message type
+        → Default status_filter covers the most common error codes:
+          51 = Application document not posted
+          26 = Error during syntax check
+          56 = IDoc with errors added
+          64 = IDoc ready to be transferred (stuck)
+          68 = Error — no further processing
+
+STEP 2  get_idoc_detail(idoc_number) — for EACH failed IDoc
+        → Returns error_messages[], status_records[], fix_hints[]
+        → fix_hints are auto-computed from the error text; act on them:
+
+        fix_hint → fix_action              → what to do
+        ─────────────────────────────────────────────────────────
+        fix_partner_profile   → check_partner_profile → if missing: create_partner_profile
+        open_posting_period   → go to OB52 or MMPV/MMRV → maintain_table or set_field
+        check_master_data     → read_sap_table(KNA1/LFA1/MARA) → fix or create master data
+        fix_segment_data      → get_idoc_segments → identify bad field → edit_idoc_field
+        fix_idoc_syntax       → get_idoc_segments → correct and edit_idoc_field
+        check_authorization   → read_sap_table(UST12) → SU01 → add profile
+        check_exchange_rate   → go to OB08 → maintain exchange rate
+        check_gl_account      → go to FS00 → verify/create GL account
+        check_tax_config      → go to FTXP → verify/create tax code
+        check_fm_exists       → read_sap_table(TFDIR) → fix/create function module
+
+STEP 3  PRESENT findings to user:
+        - List all failed IDocs with status and error text
+        - For each: state the root cause identified
+        - Propose the specific fix action
+        - ASK BEFORE FIXING: "I found X IDocs with error Y.
+          Root cause: Z. Proposed fix: [action]. Approve? [A/R]"
+
+STEP 4  Execute fix (only after user approves per IDoc or batch):
+        PARTNER PROFILE MISSING:
+          create_partner_profile(partner, type, direction, msg_type, process_code)
+        WRONG SEGMENT DATA:
+          edit_idoc_field(idoc, segment, field, corrected_value)
+        STANDARD RETRY (data was fixed externally):
+          reprocess_idoc(idoc_number, edit_mode=False)
+        BATCH REPROCESS (after fixing root cause):
+          bd87_reprocess_all(message_type, date_from, date_to)
+
+STEP 5  Verify: scan_idoc_errors again to confirm count dropped to zero
+
+COMMON ROOT CAUSES (memorize these patterns):
+  "Partner ... not found"       → WE20 partner profile missing → create_partner_profile
+  "No inbound function module"  → WE20 missing process code → create_partner_profile
+  "Posting period ... not open" → OB52/MMPV/MMRV → open fiscal period
+  "Company code ... not defined"→ OX02 → check/create company code
+  "Material ... does not exist" → MM03/MM01 → check/create material
+  "Customer ... does not exist" → XD03/XD01 → check/create customer
+  "Vendor ... does not exist"   → XK03/XK01 → check/create vendor
+  "Segment ... error"           → edit_idoc_field to correct segment data
+  "Syntax error"                → get_idoc_segments → fix and edit_idoc_field
+  "Authorization"               → SU01 → verify user has correct profiles
+
+IDOC STATUS CODE QUICK REFERENCE:
+  01=Generated  03=Dispatched  12=Dispatch OK  53=Posted OK
+  26=Syntax err 51=Not posted  52=Partial post 56=With errors
+  64=Ready      65=ALE error   68=No further   71=Edited copy
+
+═══════════════════════════════════════════════════════════
  RULES
 ═══════════════════════════════════════════════════════════
 • ALWAYS discover_screen_elements after every navigation.
@@ -2245,20 +3036,22 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v8.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  ARTILEGENZ SAP Agent v9.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Authorization: FULL SYSTEM ACCESS")
     print("  All write operations require your approval first.")
     print("═" * 68)
     print("\nExample queries:")
+    print('  "Scan all IDoc errors from today and tell me the root cause"')
+    print('  "Find all failed IDocs from this week and fix them"')
+    print('  "IDoc 0000000000123456 is failing — diagnose and propose a fix"')
+    print('  "Reprocess all failed ORDERS IDocs from 01.04.2026 to 12.04.2026"')
+    print('  "Check partner profile for partner 1000 inbound ORDERS"')
     print('  "Load these company codes into T001: 1000=IDES AG DE EUR, 2000=IDES US USD"')
     print('  "Load data from C:\\Users\\mohan\\Downloads\\vendors.csv into LFA1"')
     print('  "Show me the structure of table KNA1 then load 3 test customers"')
-    print('  "Load the full IDES plant list into T001W"')
     print('  "Create an ABAP report that lists all open sales orders with ALV"')
     print('  "Create a function module to validate customer credit limit"')
     print('  "Create a custom Z-table to log all AI changes with timestamp"')
-    print('  "Write an ABAP program to reprocess all failed IDocs from today"')
-    print('  "Create a background job program that emails daily error summary"')
     print('  "Scan all ABAP dumps from today and fix them"')
     print('  "Fix the ABAP dump in program SAPMV45A"')
     print('  "Create the full IDES org structure with transports"')
