@@ -1,5 +1,5 @@
 """
-ARTILEGENZ SAP Claude Agent v9.0
+ARTILEGENZ SAP Claude Agent v10.0
 Authorization: SAP_ALL + SAP_NEW (full system access confirmed via SU01)
 User: S4ABAP24
 
@@ -1638,6 +1638,604 @@ def bd87_reprocess_all(message_type="", date_from=None, date_to=None):
         return {"error": str(e)}
 
 
+# ── Purchase Order Error Resolution ──────────────────────────────────────────
+
+PO_ERROR_FIX_MAP = {
+    "release":                ("release_po",              "HIGH"),
+    "blocked for release":    ("release_po",              "HIGH"),
+    "no release strategy":    ("release_po",              "HIGH"),
+    "tolerance":              ("release_blocked_invoice",  "HIGH"),
+    "price variance":         ("release_blocked_invoice",  "HIGH"),
+    "quantity variance":      ("release_blocked_invoice",  "HIGH"),
+    "invoice blocked":        ("release_blocked_invoice",  "HIGH"),
+    "stochastic":             ("release_blocked_invoice",  "MEDIUM"),
+    "vendor":                 ("check_vendor_master",      "MEDIUM"),
+    "vendor blocked":         ("unblock_vendor",           "HIGH"),
+    "material":               ("change_po_field",          "MEDIUM"),
+    "account":                ("change_po_field",          "MEDIUM"),
+    "cost center":            ("change_po_field",          "MEDIUM"),
+    "wbs":                    ("change_po_field",          "MEDIUM"),
+    "delivery date":          ("change_po_field",          "LOW"),
+    "overdue":                ("change_po_field",          "LOW"),
+    "output":                 ("create_po_output",         "LOW"),
+    "message":                ("create_po_output",         "LOW"),
+    "deletion":               ("cancel_po_item",           "HIGH"),
+    "closed":                 ("cancel_po_item",           "MEDIUM"),
+    "gr/ir":                  ("scan_gr_ir_clearing",      "LOW"),
+    "not cleared":            ("scan_gr_ir_clearing",      "LOW"),
+    "requisition":            ("convert_pr_to_po",         "MEDIUM"),
+}
+
+
+def scan_po_errors(date_from=None, date_to=None, company_code="",
+                   purchase_org="", error_type="all"):
+    """
+    Scan for failed/blocked purchase orders via ME2M.
+    error_type: 'blocked'=release blocked, 'overdue'=delivery overdue, 'all'=everything.
+    Returns list of POs with vendor, items, status, and auto-computed fix_hints.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("ME2M")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtS_BEDAT-LOW", "wnd[0]/usr/ctxtBEDAT-LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtS_BEDAT-HIGH", "wnd[0]/usr/ctxtBEDAT-HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        if company_code:
+            for fid in ("wnd[0]/usr/ctxtS_BUKRS-LOW", "wnd[0]/usr/ctxtBUKRS"):
+                try: session.FindById(fid).Text = company_code; break
+                except Exception: pass
+        if purchase_org:
+            for fid in ("wnd[0]/usr/ctxtS_EKORG-LOW", "wnd[0]/usr/ctxtEKORG"):
+                try: session.FindById(fid).Text = purchase_org; break
+                except Exception: pass
+        if error_type == "blocked":
+            for fid in ("wnd[0]/usr/ctxtS_SCOPE", "wnd[0]/usr/ctxtSCOPE"):
+                try: session.FindById(fid).Text = "BL"; break
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        pos = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 300)):
+                    row = {}
+                    for col in ["EBELN","EBELP","AEDAT","LIFNR","MATNR",
+                                "MENGE","MEINS","NETPR","WAERS","WERKS",
+                                "LOEKZ","EINDT","FRGKE","FRGZU"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if not row.get("EBELN"):
+                        continue
+                    issues = []
+                    if row.get("FRGKE"):  issues.append("release_required")
+                    if row.get("LOEKZ"):  issues.append("deletion_flag")
+                    row["issues"] = issues
+                    combined = " ".join(str(v) for v in row.values()).lower()
+                    row["fix_hints"] = [
+                        {"pattern": pat, "fix_action": fa, "risk": risk}
+                        for pat, (fa, risk) in PO_ERROR_FIX_MAP.items()
+                        if pat in combined
+                    ]
+                    pos.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "po_errors": pos, "count": len(pos),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(pos)} PO records. "
+                     "Call get_po_detail for each to analyse root cause."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_po_detail(po_number):
+    """
+    Open a Purchase Order in ME23N and extract header, items, pricing,
+    account assignment, delivery dates, release status, and fix_hints.
+    """
+    go_to_transaction("ME23N")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtME23N-EBELN",):
+            try: session.FindById(fid).Text = str(po_number).zfill(10); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(2)
+
+        detail = {
+            "po_number": str(po_number),
+            "error_messages": [],
+            "screen": get_screen_text(),
+        }
+
+        texts = []
+        def walk(comp, depth=0):
+            if depth > 8: return
+            try:
+                n = comp.Children.Count
+            except Exception:
+                return
+            for i in range(n):
+                try:
+                    child = comp.Children(i)
+                    if child.Type in ("GuiTextField","GuiCTextField","GuiLabel"):
+                        try:
+                            t = child.Text.strip()
+                            if t and len(t) > 2: texts.append(t)
+                        except Exception: pass
+                    walk(child, depth+1)
+                except Exception: pass
+        walk(session.FindById("wnd[0]"))
+        detail["all_screen_text"] = "\n".join(texts[:300])
+
+        combined = detail["all_screen_text"].lower()
+        for phrase in ["error","blocked","no release","tolerance","variance",
+                        "vendor","account","price","quantity","overdue",
+                        "not found","invalid","missing","deletion"]:
+            if phrase in combined:
+                detail["error_messages"].append(phrase)
+
+        detail["fix_hints"] = [
+            {"pattern": pat, "fix_action": fa, "risk": risk}
+            for pat, (fa, risk) in PO_ERROR_FIX_MAP.items()
+            if pat in combined
+        ]
+        return detail
+    except Exception as e:
+        return {"error": str(e), "po_number": str(po_number)}
+
+
+def release_po(po_number, release_code="01"):
+    """
+    Release a purchase order blocked for approval via ME29N.
+    release_code: 01=standard. Check EKKO-FRGKE for the required code.
+    """
+    go_to_transaction("ME29N")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtME29N-EBELN",):
+            try: session.FindById(fid).Text = str(po_number).zfill(10); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(2)
+
+        for fid in ("wnd[0]/tbar[1]/btn[20]","wnd[0]/tbar[1]/btn[16]",
+                    "wnd[0]/tbar[0]/btn[11]"):
+            try: session.FindById(fid).Press(); time.sleep(1.5); break
+            except Exception: pass
+
+        for fid in ("wnd[1]/usr/btnSPOP-OPTION1","wnd[1]/tbar[0]/btn[0]"):
+            try: session.FindById(fid).Press(); time.sleep(1); break
+            except Exception: pass
+
+        audit_log("PO_RELEASE",
+                  {"po": str(po_number), "release_code": release_code},
+                  status="executed")
+        return {"ok": True, "po_number": str(po_number),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e), "po_number": str(po_number)}
+
+
+def change_po_field(po_number, item_number, field_name, new_value):
+    """
+    Change a field on a PO line via ME22N.
+    Common: EINDT=delivery date, MENGE=qty, NETPR=price, WERKS=plant,
+    KOSTL=cost centre, ANLN1=asset, PSPNR=WBS element.
+    """
+    go_to_transaction("ME22N")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtME22N-EBELN",):
+            try: session.FindById(fid).Text = str(po_number).zfill(10); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(2)
+
+        elems = discover_elements()
+        changed = False
+        for e in elems:
+            if (field_name.upper() in e.get("id","").upper() or
+                    field_name.upper() in e.get("tooltip","").upper()):
+                set_field(e["id"], str(new_value))
+                changed = True
+                break
+
+        if not changed:
+            return {"ok": False,
+                    "note": f"Field {field_name} not found on screen. "
+                            "Use discover_screen_elements to locate it.",
+                    "elements": [e["id"] for e in elems[:30]]}
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+        handle_transport(None)
+
+        audit_log("PO_FIELD_CHANGE",
+                  {"po": str(po_number), "item": item_number,
+                   "field": field_name, "new_value": str(new_value)},
+                  status="executed")
+        return {"ok": True, "po_number": str(po_number),
+                "field": field_name, "new_value": new_value,
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def cancel_po_item(po_number, item_number, reason=""):
+    """
+    Set deletion flag on a PO line item via ME22N.
+    Marks the item for deletion at the next MRP run.
+    """
+    go_to_transaction("ME22N")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtME22N-EBELN",):
+            try: session.FindById(fid).Text = str(po_number).zfill(10); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(2)
+
+        elems = discover_elements()
+        for e in elems:
+            if "LOEKZ" in e.get("id","").upper():
+                set_field(e["id"], "L")
+                break
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("PO_ITEM_CANCEL",
+                  {"po": str(po_number), "item": item_number, "reason": reason},
+                  status="executed")
+        return {"ok": True, "po_number": str(po_number),
+                "item": item_number, "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def scan_blocked_invoices(date_from=None, date_to=None, company_code="1000"):
+    """
+    Scan for blocked MM invoices via MRBR.
+    Returns invoices blocked due to price/quantity variance or manual block.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("MRBR")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRM08R-RBUKR","wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRM08R-BUDAT_FROM","wnd[0]/usr/ctxtBUDAT_FROM"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRM08R-BUDAT_TO","wnd[0]/usr/ctxtBUDAT_TO"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        invoices = []
+        BLOCK_REASONS = {"R":"Price variance","M":"Manual block",
+                         "Q":"Quantity variance","D":"Date variance",
+                         "A":"Amount exceeded","S":"Stochastic block"}
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["BELNR","GJAHR","BUKRS","LIFNR",
+                                "BLDAT","RMWWR","WAERS","SPGRU","SPGRP"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if not row.get("BELNR"):
+                        continue
+                    code = row.get("SPGRU") or row.get("SPGRP","")
+                    row["block_reason_desc"] = BLOCK_REASONS.get(code, f"Code:{code}")
+                    row["fix_action"] = "release_blocked_invoice"
+                    invoices.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "blocked_invoices": invoices, "count": len(invoices),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(invoices)} blocked invoices. "
+                     "Call release_blocked_invoice to clear each one."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def release_blocked_invoice(invoice_number, company_code="1000",
+                             fiscal_year=""):
+    """
+    Release a blocked MM invoice via MRBR so it can be paid.
+    Clears price/quantity/manual blocks. Requires approval.
+    """
+    go_to_transaction("MRBR")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRM08R-RBUKR","wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRM08R-BELNR_FROM","wnd[0]/usr/ctxtBELNR"):
+            try: session.FindById(fid).Text = str(invoice_number); break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+        session.FindById("wnd[0]").SendVKey(16)   # Select all
+        time.sleep(0.5)
+
+        for fid in ("wnd[0]/tbar[1]/btn[20]","wnd[0]/tbar[1]/btn[17]",
+                    "wnd[0]/tbar[1]/btn[16]"):
+            try: session.FindById(fid).Press(); time.sleep(1.5); break
+            except Exception: pass
+
+        for fid in ("wnd[1]/usr/btnSPOP-OPTION1","wnd[1]/tbar[0]/btn[0]"):
+            try: session.FindById(fid).Press(); time.sleep(1); break
+            except Exception: pass
+
+        audit_log("INVOICE_RELEASE",
+                  {"invoice": str(invoice_number), "company_code": company_code},
+                  status="executed")
+        return {"ok": True, "invoice": str(invoice_number),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_vendor_master(vendor_number, company_code="1000"):
+    """
+    Check vendor master via XK03: payment terms, bank details, reconciliation
+    account, purchasing data, block status. Used when PO fails on vendor issues.
+    """
+    go_to_transaction("XK03")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRF02K-LIFNR","wnd[0]/usr/ctxtLIFNR"):
+            try: session.FindById(fid).Text = str(vendor_number).zfill(10); break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF02K-BUKRS","wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1)
+        try: session.FindById("wnd[0]/usr/chkRF02K-XBANK").Selected = True
+        except Exception: pass
+        try: session.FindById("wnd[0]/usr/chkRF02K-XKAUF").Selected = True
+        except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        texts = []
+        def wv(comp, depth=0):
+            if depth > 6: return
+            try:
+                n = comp.Children.Count
+            except Exception:
+                return
+            for i in range(n):
+                try:
+                    c2 = comp.Children(i)
+                    if c2.Type in ("GuiTextField","GuiCTextField","GuiLabel"):
+                        try:
+                            t = c2.Text.strip()
+                            if t: texts.append(t)
+                        except Exception: pass
+                    wv(c2, depth+1)
+                except Exception: pass
+        wv(session.FindById("wnd[0]"))
+
+        scr = "\n".join(texts[:200])
+        blocked = any(b in scr.lower() for b in ["blocked","gesperrt","sperre"])
+        return {
+            "vendor": str(vendor_number), "company_code": company_code,
+            "is_blocked": blocked, "screen_text": scr,
+            "screen": get_screen_text(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def unblock_vendor(vendor_number, company_code="1000", block_type="purchase"):
+    """
+    Remove vendor block via XK05.
+    block_type: 'purchase'=purchasing block, 'payment'=payment block, 'all'=both.
+    """
+    go_to_transaction("XK05")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRF02K-LIFNR","wnd[0]/usr/ctxtLIFNR"):
+            try: session.FindById(fid).Text = str(vendor_number).zfill(10); break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF02K-BUKRS","wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        elems = discover_elements()
+        for e in elems:
+            eid = e.get("id","").upper()
+            if block_type in ("purchase","all") and "SPERR" in eid:
+                try: session.FindById(e["id"]).Selected = False
+                except Exception: pass
+            if block_type in ("payment","all") and "ZAHLS" in eid:
+                try: session.FindById(e["id"]).Selected = False
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("VENDOR_UNBLOCK",
+                  {"vendor": str(vendor_number), "company_code": company_code,
+                   "block_type": block_type},
+                  status="executed")
+        return {"ok": True, "vendor": str(vendor_number),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def create_po_output(po_number, output_type="NEU", medium="1"):
+    """
+    Resend/create output message for a PO via ME9F.
+    output_type: NEU=original, MAHN=reminder. medium: 1=print, 5=external, 6=EDI.
+    """
+    go_to_transaction("ME9F")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtS_EBELN-LOW","wnd[0]/usr/ctxtEBELN_LOW"):
+            try: session.FindById(fid).Text = str(po_number).zfill(10); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+        session.FindById("wnd[0]").SendVKey(16)   # Select all
+        time.sleep(0.5)
+        for fid in ("wnd[0]/tbar[1]/btn[8]",):
+            try: session.FindById(fid).Press(); time.sleep(1.5); break
+            except Exception: pass
+
+        audit_log("PO_OUTPUT",
+                  {"po": str(po_number), "output_type": output_type},
+                  status="executed")
+        return {"ok": True, "po_number": str(po_number),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def scan_open_purchase_reqs(date_from=None, date_to=None,
+                             plant="", material=""):
+    """
+    Scan for open/unprocessed purchase requisitions via ME5A.
+    Returns PRs not yet converted to POs (scope=WA open items).
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("ME5A")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtS_BADAT-LOW","wnd[0]/usr/ctxtBADAT_LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtS_BADAT-HIGH","wnd[0]/usr/ctxtBADAT_HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        if plant:
+            try: session.FindById("wnd[0]/usr/ctxtS_WERKS-LOW").Text = plant
+            except Exception: pass
+        if material:
+            try: session.FindById("wnd[0]/usr/ctxtS_MATNR-LOW").Text = material
+            except Exception: pass
+        try: session.FindById("wnd[0]/usr/ctxtP_SCOPE").Text = "WA"
+        except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        reqs = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["BANFN","BNFPO","MATNR","MENGE","MEINS",
+                                "WERKS","BADAT","LIFNR","KNTTP","TXZ01"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if row.get("BANFN"):
+                        reqs.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "open_reqs": reqs, "count": len(reqs),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(reqs)} open purchase requisitions. "
+                     "Use convert_pr_to_po or ME57/ME59N to assign and convert."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def convert_pr_to_po(pr_number, vendor_number, purchase_org="1000",
+                     company_code="1000"):
+    """
+    Assign source and convert a purchase requisition to a PO via ME57.
+    """
+    go_to_transaction("ME57")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtS_BANFN-LOW","wnd[0]/usr/ctxtBANFN_LOW"):
+            try: session.FindById(fid).Text = str(pr_number); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+        session.FindById("wnd[0]").SendVKey(16)
+        time.sleep(0.5)
+        for fid in ("wnd[0]/tbar[1]/btn[9]",):
+            try: session.FindById(fid).Press(); time.sleep(1.5); break
+            except Exception: pass
+
+        audit_log("PR_TO_PO",
+                  {"pr": str(pr_number), "vendor": str(vendor_number)},
+                  status="executed")
+        return {"ok": True, "pr_number": str(pr_number),
+                "vendor": str(vendor_number), "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def scan_gr_ir_clearing(company_code="1000", date_from=None, date_to=None):
+    """
+    Scan for uncleared GR/IR balance items via MB5S.
+    These represent goods receipts without matching invoices (or vice versa).
+    """
+    go_to_transaction("MB5S")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtS_BUKRS-LOW","wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+        return {
+            "company_code": company_code,
+            "screen": get_screen_text(),
+            "note": ("GR/IR clearing report displayed. "
+                     "Review items and post clearing via MR11."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def get_sales_orders(date_from, date_to):
     go_to_transaction("VA05")
     time.sleep(1)
@@ -2227,6 +2825,245 @@ TOOLS = [
         },
     },
 
+    # ── PURCHASE ORDER ERROR RESOLUTION ──────────────────────────────────────
+    {
+        "name": "scan_po_errors",
+        "description": (
+            "Scan ME2M for failed/blocked purchase orders in a date range. "
+            "Returns PO numbers, vendor, items, release status, and fix_hints. "
+            "error_type: 'blocked'=release-blocked only, 'all'=every PO with issues. "
+            "ALWAYS call this first when investigating PO errors."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from":     {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":       {"type": "string", "description": "DD.MM.YYYY"},
+                "company_code":  {"type": "string", "description": "e.g. 1000"},
+                "purchase_org":  {"type": "string", "description": "e.g. 1000"},
+                "error_type":    {"type": "string",
+                                  "enum": ["blocked","overdue","all"],
+                                  "description": "Filter: blocked=release-blocked, all=everything"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_po_detail",
+        "description": (
+            "Open a specific PO in ME23N and extract header, items, pricing, "
+            "account assignment, delivery dates, release strategy status, and "
+            "auto-computed fix_hints. Call after scan_po_errors for each PO."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "po_number": {"type": "string",
+                              "description": "10-digit PO number e.g. 4500001234"},
+            },
+            "required": ["po_number"],
+        },
+    },
+    {
+        "name": "release_po",
+        "description": (
+            "Release a purchase order blocked for approval via ME29N. "
+            "Use when fix_hints shows 'release_po' or FRGKE field is set. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "po_number":     {"type": "string", "description": "PO number"},
+                "release_code":  {"type": "string",
+                                  "description": "Release code from EKKO-FRGKE (default 01)"},
+            },
+            "required": ["po_number"],
+        },
+    },
+    {
+        "name": "change_po_field",
+        "description": (
+            "Change a field on a PO line item via ME22N. "
+            "Common fixes: EINDT=delivery date, MENGE=quantity, NETPR=net price, "
+            "WERKS=plant, KOSTL=cost centre, PSPNR=WBS element. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "po_number":    {"type": "string", "description": "PO number"},
+                "item_number":  {"type": "string",
+                                 "description": "Item number e.g. 00010 (or blank for header)"},
+                "field_name":   {"type": "string",
+                                 "description": "SAP field name e.g. EINDT, MENGE, NETPR, KOSTL"},
+                "new_value":    {"type": "string", "description": "New field value"},
+            },
+            "required": ["po_number", "item_number", "field_name", "new_value"],
+        },
+    },
+    {
+        "name": "cancel_po_item",
+        "description": (
+            "Set deletion flag on a PO line item via ME22N to cancel it. "
+            "Use when item is no longer required or vendor cannot deliver. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "po_number":   {"type": "string"},
+                "item_number": {"type": "string", "description": "Line item number"},
+                "reason":      {"type": "string", "description": "Reason for cancellation"},
+            },
+            "required": ["po_number", "item_number"],
+        },
+    },
+    {
+        "name": "scan_blocked_invoices",
+        "description": (
+            "Scan MRBR for blocked MM invoices (price/quantity/manual block). "
+            "Returns invoice numbers, vendors, block reason codes. "
+            "Call this when POs have been received but invoices are stuck."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from":    {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":      {"type": "string", "description": "DD.MM.YYYY"},
+                "company_code": {"type": "string", "description": "e.g. 1000"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "release_blocked_invoice",
+        "description": (
+            "Release a blocked MM invoice via MRBR so it can proceed to payment. "
+            "Clears price variance, quantity variance, and manual blocks. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "invoice_number": {"type": "string",
+                                   "description": "Invoice document number (BELNR)"},
+                "company_code":   {"type": "string", "description": "e.g. 1000"},
+                "fiscal_year":    {"type": "string", "description": "e.g. 2026 (optional)"},
+            },
+            "required": ["invoice_number"],
+        },
+    },
+    {
+        "name": "check_vendor_master",
+        "description": (
+            "Check vendor master record via XK03. "
+            "Returns block status, payment terms, bank details, purchasing data. "
+            "Call when PO fails due to vendor-related errors."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "vendor_number": {"type": "string",
+                                  "description": "Vendor number (LIFNR)"},
+                "company_code":  {"type": "string", "description": "e.g. 1000"},
+            },
+            "required": ["vendor_number"],
+        },
+    },
+    {
+        "name": "unblock_vendor",
+        "description": (
+            "Remove a vendor block via XK05. "
+            "block_type: 'purchase'=purchasing block, 'payment'=payment block, "
+            "'all'=remove all blocks. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "vendor_number": {"type": "string"},
+                "company_code":  {"type": "string", "description": "e.g. 1000"},
+                "block_type":    {"type": "string",
+                                  "enum": ["purchase","payment","all"],
+                                  "description": "Which block to remove"},
+            },
+            "required": ["vendor_number"],
+        },
+    },
+    {
+        "name": "create_po_output",
+        "description": (
+            "Resend/create output message for a PO via ME9F. "
+            "Use when vendor has not received the PO or output failed. "
+            "output_type: NEU=original, MAHN=reminder. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "po_number":    {"type": "string"},
+                "output_type":  {"type": "string",
+                                 "description": "NEU=original, MAHN=reminder"},
+                "medium":       {"type": "string",
+                                 "description": "1=print, 5=external send, 6=EDI"},
+            },
+            "required": ["po_number"],
+        },
+    },
+    {
+        "name": "scan_open_purchase_reqs",
+        "description": (
+            "Scan ME5A for open purchase requisitions not yet converted to POs. "
+            "Returns PR numbers, materials, quantities, plants, requested delivery dates."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":   {"type": "string", "description": "DD.MM.YYYY"},
+                "plant":     {"type": "string", "description": "Plant code e.g. 1000"},
+                "material":  {"type": "string", "description": "Material number"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "convert_pr_to_po",
+        "description": (
+            "Convert a purchase requisition to a purchase order via ME57. "
+            "Assigns source of supply and creates the PO. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pr_number":     {"type": "string", "description": "PR number (BANFN)"},
+                "vendor_number": {"type": "string", "description": "Vendor to assign"},
+                "purchase_org":  {"type": "string", "description": "e.g. 1000"},
+                "company_code":  {"type": "string", "description": "e.g. 1000"},
+            },
+            "required": ["pr_number", "vendor_number"],
+        },
+    },
+    {
+        "name": "scan_gr_ir_clearing",
+        "description": (
+            "Scan MB5S for uncleared GR/IR items: goods receipts without matching "
+            "invoices, or invoices without GR. Returns imbalance for review. "
+            "Use MR11 to post clearing after reviewing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "company_code": {"type": "string", "description": "e.g. 1000"},
+                "date_from":    {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":      {"type": "string", "description": "DD.MM.YYYY"},
+            },
+            "required": [],
+        },
+    },
+
     # ── IDOC ERROR ANALYSIS & AUTO-FIX ───────────────────────────────────────
     {
         "name": "scan_idoc_errors",
@@ -2419,6 +3256,10 @@ WRITE_TOOLS = {
     # IDoc write tools
     "reprocess_idoc", "edit_idoc_field",
     "create_partner_profile", "bd87_reprocess_all",
+    # PO write tools
+    "release_po", "change_po_field", "cancel_po_item",
+    "release_blocked_invoice", "unblock_vendor",
+    "create_po_output", "convert_pr_to_po",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
@@ -2593,6 +3434,85 @@ def dispatch(tool_name, tool_input):
     if tool_name == "bd87_reprocess_all":
         return bd87_reprocess_all(
             tool_input.get("message_type", ""),
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+        )
+
+    # ── Purchase Order error resolution tools ─────────────────────────────────
+    if tool_name == "scan_po_errors":
+        return scan_po_errors(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("company_code", ""),
+            tool_input.get("purchase_org", ""),
+            tool_input.get("error_type", "all"),
+        )
+    if tool_name == "get_po_detail":
+        return get_po_detail(tool_input["po_number"])
+    if tool_name == "release_po":
+        return release_po(
+            tool_input["po_number"],
+            tool_input.get("release_code", "01"),
+        )
+    if tool_name == "change_po_field":
+        return change_po_field(
+            tool_input["po_number"],
+            tool_input.get("item_number", "00010"),
+            tool_input["field_name"],
+            tool_input["new_value"],
+        )
+    if tool_name == "cancel_po_item":
+        return cancel_po_item(
+            tool_input["po_number"],
+            tool_input.get("item_number", "00010"),
+            tool_input.get("reason", ""),
+        )
+    if tool_name == "scan_blocked_invoices":
+        return scan_blocked_invoices(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("company_code", "1000"),
+        )
+    if tool_name == "release_blocked_invoice":
+        return release_blocked_invoice(
+            tool_input["invoice_number"],
+            tool_input.get("company_code", "1000"),
+            tool_input.get("fiscal_year", ""),
+        )
+    if tool_name == "check_vendor_master":
+        return check_vendor_master(
+            tool_input["vendor_number"],
+            tool_input.get("company_code", "1000"),
+        )
+    if tool_name == "unblock_vendor":
+        return unblock_vendor(
+            tool_input["vendor_number"],
+            tool_input.get("company_code", "1000"),
+            tool_input.get("block_type", "purchase"),
+        )
+    if tool_name == "create_po_output":
+        return create_po_output(
+            tool_input["po_number"],
+            tool_input.get("output_type", "NEU"),
+            tool_input.get("medium", "1"),
+        )
+    if tool_name == "scan_open_purchase_reqs":
+        return scan_open_purchase_reqs(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("plant", ""),
+            tool_input.get("material", ""),
+        )
+    if tool_name == "convert_pr_to_po":
+        return convert_pr_to_po(
+            tool_input["pr_number"],
+            tool_input["vendor_number"],
+            tool_input.get("purchase_org", "1000"),
+            tool_input.get("company_code", "1000"),
+        )
+    if tool_name == "scan_gr_ir_clearing":
+        return scan_gr_ir_clearing(
+            tool_input.get("company_code", "1000"),
             tool_input.get("date_from"),
             tool_input.get("date_to"),
         )
@@ -2869,6 +3789,64 @@ STEP 10 scan_abap_dumps(today, today)
         → Verify dump no longer appears
 
 ═══════════════════════════════════════════════════════════
+ PURCHASE ORDER ERROR RESOLUTION WORKFLOW
+═══════════════════════════════════════════════════════════
+When asked to investigate or fix PO errors, follow this sequence:
+
+STEP 1  scan_po_errors(date_from, date_to, error_type)
+        → Returns list of POs with issue flags and fix_hints[]
+        → error_type='blocked' for release-only, 'all' for everything
+
+STEP 2  get_po_detail(po_number) — for each PO with errors
+        → Returns all_screen_text, error_messages[], fix_hints[]
+        → fix_hints auto-map to the correct fix action
+
+STEP 3  IDENTIFY ROOT CAUSE from fix_hints and present to user:
+        ─────────────────────────────────────────────────────────
+        fix_action              root cause           tool to call
+        ─────────────────────────────────────────────────────────
+        release_po            → approval required  → release_po
+        release_blocked_invoice→ price/qty variance→ scan_blocked_invoices
+                                                     release_blocked_invoice
+        check_vendor_master   → vendor issue       → check_vendor_master
+        unblock_vendor        → vendor blocked     → unblock_vendor
+        change_po_field       → wrong data         → change_po_field
+        cancel_po_item        → item not needed    → cancel_po_item
+        create_po_output      → no output sent     → create_po_output
+        convert_pr_to_po      → PR not converted   → scan_open_purchase_reqs
+                                                     convert_pr_to_po
+        scan_gr_ir_clearing   → GR/IR mismatch     → scan_gr_ir_clearing
+        ─────────────────────────────────────────────────────────
+
+STEP 4  ASK BEFORE FIXING — present findings and proposed fix:
+        "PO 4500001234 is blocked for release (FRGKE=01).
+         Root cause: Release strategy requires approval.
+         Proposed fix: release_po. Approve? [A/R]"
+
+STEP 5  Execute fix after approval, then verify with get_po_detail.
+
+COMMON PO ERROR PATTERNS:
+  "blocked for release" / FRGKE set  → release_po(po_number)
+  "tolerance limit exceeded"         → release_blocked_invoice
+                                       OR change_po_field(NETPR, corrected price)
+  "vendor … blocked"                 → check_vendor_master → unblock_vendor
+  "no info record / price"           → change_po_field(NETPR, agreed price)
+  "account assignment mandatory"     → change_po_field(KOSTL/PSPNR, value)
+  "delivery date in past"            → change_po_field(EINDT, new date)
+  "output not sent"                  → create_po_output
+  "PR not assigned"                  → scan_open_purchase_reqs → convert_pr_to_po
+  "GR/IR not cleared"                → scan_gr_ir_clearing → MR11 posting
+  "invoice blocked"                  → scan_blocked_invoices → release_blocked_invoice
+
+BLOCKED INVOICE REASON CODES:
+  R = Price variance (net price differs from GR)
+  Q = Quantity variance (invoiced qty > GR qty)
+  M = Manual block set by user
+  D = Date variance
+  A = Amount exceeded tolerance
+  S = Stochastic block (random QA check)
+
+═══════════════════════════════════════════════════════════
  IDOC ROOT CAUSE ANALYSIS & AUTO-FIX WORKFLOW
 ═══════════════════════════════════════════════════════════
 When asked to find/fix IDoc errors, follow this exact sequence:
@@ -3036,11 +4014,20 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v9.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  ARTILEGENZ SAP Agent v10.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Authorization: FULL SYSTEM ACCESS")
     print("  All write operations require your approval first.")
     print("═" * 68)
     print("\nExample queries:")
+    print('  "Scan all purchase order errors from this month and fix them"')
+    print('  "PO 4500001234 is blocked — diagnose and propose a fix"')
+    print('  "Show all blocked invoices for company code 1000 this week"')
+    print('  "Release all blocked invoices from April 2026"')
+    print('  "Check vendor 100012 master data and unblock if blocked"')
+    print('  "Resend output for PO 4500001234"')
+    print('  "Show all open purchase requisitions not yet converted to POs"')
+    print('  "Convert PR 1000000123 to a PO for vendor 100012"')
+    print('  "Show GR/IR clearing items for company code 1000"')
     print('  "Scan all IDoc errors from today and tell me the root cause"')
     print('  "Find all failed IDocs from this week and fix them"')
     print('  "IDoc 0000000000123456 is failing — diagnose and propose a fix"')
