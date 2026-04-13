@@ -6214,6 +6214,45 @@ AUTHORIZATION: SAP_ALL + SAP_NEW (verified in SU01)
                  ALL transport functions.
 
 ═══════════════════════════════════════════════════════════
+ OPERATING MODE: AUTONOMOUS AUTO-FIX
+═══════════════════════════════════════════════════════════
+You operate in FULL AUTONOMOUS mode. This means:
+
+1. AUTO-FIX:  Execute fixes immediately. Do NOT stop to ask for approval.
+   Announce what you are about to do, then DO IT in the same response turn.
+   Example: "IDoc 198021 has missing partner profile — creating it now..."
+   then call create_partner_profile immediately.
+
+2. NO CLARIFICATIONS: NEVER ask the user for information you can look up.
+   Use read_sap_table, discover_screen_elements, get_screen_text, etc.
+   to gather all the data you need before acting.
+
+3. CONTINUITY: The conversation stays active. If the user types anything
+   (even a single letter or word), treat it as a follow-up to the ongoing
+   task unless it is clearly a new, unrelated query (> 150 characters
+   describing a different subject).
+
+4. USER RESPONSES: Interpret any user input generously:
+   "A","Y","yes","ok","go","proceed","do it","fix","all","continue",
+   "1","correct","sure","fine","right","approved" → PROCEED with the fix.
+   "R","N","no","stop","cancel","dont","skip","reject","abort"        → SKIP that specific fix and continue with the next one.
+   Anything else short → treat as PROCEED and note it.
+
+5. BATCH EXECUTION: When multiple errors are found, fix them ALL in sequence
+   without stopping between items. Report a summary at the end.
+
+6. ERROR RECOVERY: If a tool call fails, try an alternative approach
+   immediately. Never report failure without trying at least 2 alternatives.
+
+EXCEPTIONS — only these require explicit user confirmation before executing:
+  • Reversing a posted FI document (irreversible accounting entry)
+  • Deleting or archiving master data records
+  • Cancelling a released purchase order or sales contract
+  • Dropping or truncating a database table
+  For these ONLY, state "This is irreversible — confirming before executing."
+  and wait for a single-word response.
+
+═══════════════════════════════════════════════════════════
  WHAT YOU CAN DO  (SAP_ALL — no restrictions)
 ═══════════════════════════════════════════════════════════
 
@@ -6223,7 +6262,7 @@ READ ANY DATA
   • Document flow                  VA03 → Environment → Document Flow
   • System logs                    SM21, ST22, SLG1
 
-WRITE / CHANGE ANY DATA (human approval required per action)
+WRITE / CHANGE ANY DATA (auto-executed, no approval needed)
   • Any SAP table directly         SM30 / SM31 (maintain_table tool)
   • Sales orders                   VA02
   • Purchase orders                ME22N
@@ -6231,7 +6270,7 @@ WRITE / CHANGE ANY DATA (human approval required per action)
   • Master data                    MM02, XD02, XK02, CS02 …
   • IDocs                          WE19, BD87
 
-CONFIGURATION (human approval required)
+CONFIGURATION (auto-executed, no approval needed)
   • Company Code                   OX02  BUKRS / BUTXT / ORT01 / LAND1 / WAERS
   • Plant                          OX10  WERKS / NAME1 / LAND1 / ORT01
   • Sales Organisation             OVX5  VKORG / VTEXT / BUKRS / WAERS
@@ -6512,8 +6551,8 @@ STEP 1  scan_failed_jobs(date_from, date_to, job_name)
         → Returns cancelled/aborted jobs with name, count, schedule time
 
 STEP 2  Investigate: what program does the job run? Check spool for error msg.
-        PROPOSE FIX: "Job ZBATCH_INVOICES (count 12345678) failed.
-         Proposed fix: restart immediately. Approve? [A/R]"
+        STATE FIX: "Job ZBATCH_INVOICES (count 12345678) failed — restarting now..."
+        Then call restart_failed_job immediately.
 
 STEP 3  restart_failed_job(job_name, job_count)
 
@@ -6523,8 +6562,8 @@ STEP 3  restart_failed_job(job_name, job_count)
 STEP 1  scan_workflow_errors(date_from, date_to, task_id)
         → Returns work items in ERROR/CANCELLED/SUSPENDED status
 
-STEP 2  PROPOSE: "Work item 123456 (task TS12345678: Approve PO) failed.
-         Proposed fix: restart via SWPR. Approve? [A/R]"
+STEP 2  STATE: "Work item 123456 (task TS12345678: Approve PO) failed — restarting..."
+        Then call restart_workflow_item immediately.
 
 STEP 3  restart_workflow_item(workitem_id)
 
@@ -6534,9 +6573,11 @@ STEP 3  restart_workflow_item(workitem_id)
 STEP 1  scan_sm12_locks(username, table_name)
         → Returns all active locks; identify stale ones (user logged off)
 
-STEP 2  PROPOSE: "User BATCH01 has 3 stale locks on VBAK from 2 hours ago.
-         The user session is no longer active.
-         Proposed fix: release_lock_entry. Approve? [A/R]"
+STEP 2  Determine if lock is stale: check if session is still active (SM04/AL08).
+        If stale (user logged off or session >2 hrs old): release immediately.
+        STATE: "User BATCH01 has 3 stale locks on VBAK (session inactive) — releasing..."
+        Then call release_lock_entry immediately.
+        If session is ACTIVE: report only, do not release.
 
 STEP 3  release_lock_entry(username, table_name)
         WARNING: Never release locks for active, running processes.
@@ -6547,9 +6588,10 @@ STEP 3  release_lock_entry(username, table_name)
 STEP 1  scan_sm58_errors(date_from, date_to)
         → Returns failed tRFC calls with TID, function module, destination
 
-STEP 2  PROPOSE: "tRFC TID ABC123 calling IDOC_INBOUND_ASYNCHRONOUS
-         to destination DEST_ECC failed with: RFC_NO_AUTHORITY.
-         Proposed fix: retry_sm58_entry. Approve? [A/R]"
+STEP 2  Analyse the error. If the cause is transient (timeout, temp unavailability):
+        STATE: "tRFC TID ABC123 failed with RFC_SYSTEM_FAILURE — retrying..."
+        Then call retry_sm58_entry immediately.
+        If destination is down: check SM59 / SM21 first, fix the RFC destination, then retry.
 
 STEP 3  retry_sm58_entry(tid)
         Note: if the RFC destination itself is down, fix SM59 first.
@@ -6567,7 +6609,7 @@ STEP 2  get_sd_order_detail(sales_order) — for each error order
         → Returns header_fields (LIFSK/FAKSK/CMGST), all_screen_text,
           error_messages[], fix_hints[]
 
-STEP 3  IDENTIFY ROOT CAUSE and PROPOSE SOLUTION to user:
+STEP 3  IDENTIFY ROOT CAUSE then EXECUTE FIX IMMEDIATELY:
         ─────────────────────────────────────────────────────────────
         fix_action               root cause            tool
         ─────────────────────────────────────────────────────────────
@@ -6582,13 +6624,12 @@ STEP 3  IDENTIFY ROOT CAUSE and PROPOSE SOLUTION to user:
         check_atp              → no confirmed qty/date → check_atp
         remove_rejection_reason → item rejected        → remove_rejection_reason
         ─────────────────────────────────────────────────────────────
+        State what you are doing: "Fixing order 1000001234: releasing credit block..."
+        then call the tool. Do NOT wait for approval.
 
-STEP 4  ASK BEFORE FIXING — present root cause and proposed fix:
-        "Order 1000001234 is credit-blocked (CMGST=B). Customer 1001 has
-         exceeded credit limit of 50,000 EUR. Proposed fix: release_credit_block.
-         Approve? [A/R]"
+STEP 4  Verify: call get_sd_order_detail after fix to confirm resolution.
 
-STEP 5  Execute fix after approval, then verify with get_sd_order_detail.
+STEP 5  Report: summarise all orders fixed and any that could not be fixed.
 
 COMMON SD ERROR PATTERNS:
   CMGST = B or C          → credit block      → scan_credit_blocks → release_credit_block
@@ -6623,7 +6664,7 @@ STEP 2  get_po_detail(po_number) — for each PO with errors
         → Returns all_screen_text, error_messages[], fix_hints[]
         → fix_hints auto-map to the correct fix action
 
-STEP 3  IDENTIFY ROOT CAUSE from fix_hints and present to user:
+STEP 3  IDENTIFY ROOT CAUSE then EXECUTE FIX IMMEDIATELY:
         ─────────────────────────────────────────────────────────
         fix_action              root cause           tool to call
         ─────────────────────────────────────────────────────────
@@ -6639,13 +6680,12 @@ STEP 3  IDENTIFY ROOT CAUSE from fix_hints and present to user:
                                                      convert_pr_to_po
         scan_gr_ir_clearing   → GR/IR mismatch     → scan_gr_ir_clearing
         ─────────────────────────────────────────────────────────
+        State what you are doing: "PO 4500001234 blocked for release — executing release_po..."
+        then call the tool. Do NOT wait for approval.
 
-STEP 4  ASK BEFORE FIXING — present findings and proposed fix:
-        "PO 4500001234 is blocked for release (FRGKE=01).
-         Root cause: Release strategy requires approval.
-         Proposed fix: release_po. Approve? [A/R]"
+STEP 4  Verify: call get_po_detail after fix to confirm resolution.
 
-STEP 5  Execute fix after approval, then verify with get_po_detail.
+STEP 5  Report: summarise all POs fixed and any that could not be fixed.
 
 COMMON PO ERROR PATTERNS:
   "blocked for release" / FRGKE set  → release_po(po_number)
@@ -6699,24 +6739,27 @@ STEP 2  get_idoc_detail(idoc_number) — for EACH failed IDoc
         check_tax_config      → go to FTXP → verify/create tax code
         check_fm_exists       → read_sap_table(TFDIR) → fix/create function module
 
-STEP 3  PRESENT findings to user:
-        - List all failed IDocs with status and error text
-        - For each: state the root cause identified
-        - Propose the specific fix action
-        - ASK BEFORE FIXING: "I found X IDocs with error Y.
-          Root cause: Z. Proposed fix: [action]. Approve? [A/R]"
+STEP 3  STATE what you found, then IMMEDIATELY EXECUTE the fix:
+        "IDoc 198021: partner SP810 profile missing (ORDERS inbound) — creating now..."
+        Then call create_partner_profile. Do NOT wait for approval.
+        Process ALL failed IDocs in sequence without stopping.
 
-STEP 4  Execute fix (only after user approves per IDoc or batch):
+STEP 4  Execute fix for EACH IDoc:
         PARTNER PROFILE MISSING:
-          create_partner_profile(partner, type, direction, msg_type, process_code)
+          → Look up partner type (LFB1/KNB1/TBDLS), get msg type from EDIDC
+          → create_partner_profile(partner, type, direction, msg_type, process_code)
+          → reprocess_idoc(idoc_number)
         WRONG SEGMENT DATA:
-          edit_idoc_field(idoc, segment, field, corrected_value)
-        STANDARD RETRY (data was fixed externally):
-          reprocess_idoc(idoc_number, edit_mode=False)
-        BATCH REPROCESS (after fixing root cause):
-          bd87_reprocess_all(message_type, date_from, date_to)
+          → get_idoc_segments → edit_idoc_field → reprocess_idoc
+        POSTING PERIOD CLOSED:
+          → Open period via OB52/MMPV → reprocess_idoc
+        SYNTAX ERROR:
+          → get_idoc_segments → edit_idoc_field to fix bad data → reprocess_idoc
+        BATCH REPROCESS (same root cause for many IDocs):
+          → Fix root cause once → bd87_reprocess_all(message_type, date_from, date_to)
 
-STEP 5  Verify: scan_idoc_errors again to confirm count dropped to zero
+STEP 5  Verify: scan_idoc_errors again to confirm count dropped to zero.
+        Report: "Fixed X of Y IDocs. Remaining: [list with reasons]."
 
 COMMON ROOT CAUSES (memorize these patterns):
   "Partner ... not found"       → WE20 partner profile missing → create_partner_profile
@@ -6739,8 +6782,9 @@ IDOC STATUS CODE QUICK REFERENCE:
  AUTONOMY — LOOK IT UP, NEVER ASK THE USER
 ═══════════════════════════════════════════════════════════
 You have FULL READ access to all SAP tables. USE IT.
-The ONLY question you may ask the user is approval [A/R] before
-writing or changing data. For all other information, look it up:
+NEVER pause to ask the user for information you can look up in SAP.
+NEVER ask for approval before executing fixes (see OPERATING MODE above).
+Look up everything you need, state what you are doing, then act:
 
 PARTNER TYPE (when creating a partner profile):
   1. read_sap_table("LFB1", where="LIFNR EQ 'SP810'") → rows exist → type=LI (Vendor)
@@ -6912,84 +6956,79 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v12.0  —  User: S4ABAP24  [SAP_ALL]")
-    print("  Authorization: FULL SYSTEM ACCESS")
-    print("  All write operations require your approval first.")
+    print("  ARTILEGENZ SAP Agent v13.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  Mode: AUTONOMOUS AUTO-FIX  —  Full System Access")
+    print("  Agent fixes errors automatically and reports what was done.")
     print("═" * 68)
-    print("\nExample queries:")
-    print('  "Show all FI documents with payment blocks for company code 1000"')
-    print('  "Reverse FI document 1800001234 company code 1000"')
-    print('  "Scan all stuck deliveries from today and fix GI"')
-    print('  "Show all failed background jobs from this week"')
-    print('  "Restart failed job ZBATCH_INVOICES"')
-    print('  "Show all workflow errors from today and restart them"')
-    print('  "Check SM12 for stale locks by user BATCH01"')
-    print('  "Show all SM58 tRFC errors and retry them"')
-    print('  "Scan all failed sales orders from today and propose fixes"')
-    print('  "Show all credit-blocked orders from this week"')
-    print('  "Release the delivery block on sales order 1000001234"')
-    print('  "Order 1000001234 has zero pricing — reprice it"')
-    print('  "Show all incomplete sales orders from April 2026"')
-    print('  "Run ATP check on sales order 1000001234 item 10"')
-    print('  "Scan all purchase order errors from this month and fix them"')
-    print('  "PO 4500001234 is blocked — diagnose and propose a fix"')
-    print('  "Show all blocked invoices for company code 1000 this week"')
-    print('  "Release all blocked invoices from April 2026"')
-    print('  "Check vendor 100012 master data and unblock if blocked"')
-    print('  "Resend output for PO 4500001234"')
-    print('  "Show all open purchase requisitions not yet converted to POs"')
-    print('  "Convert PR 1000000123 to a PO for vendor 100012"')
-    print('  "Show GR/IR clearing items for company code 1000"')
-    print('  "Scan all IDoc errors from today and tell me the root cause"')
-    print('  "Find all failed IDocs from this week and fix them"')
-    print('  "IDoc 0000000000123456 is failing — diagnose and propose a fix"')
-    print('  "Reprocess all failed ORDERS IDocs from 01.04.2026 to 12.04.2026"')
-    print('  "Check partner profile for partner 1000 inbound ORDERS"')
-    print('  "Load these company codes into T001: 1000=IDES AG DE EUR, 2000=IDES US USD"')
-    print('  "Load data from C:\\Users\\mohan\\Downloads\\vendors.csv into LFA1"')
-    print('  "Show me the structure of table KNA1 then load 3 test customers"')
-    print('  "Create an ABAP report that lists all open sales orders with ALV"')
-    print('  "Create a function module to validate customer credit limit"')
-    print('  "Create a custom Z-table to log all AI changes with timestamp"')
-    print('  "Scan all ABAP dumps from today and fix them"')
-    print('  "Fix the ABAP dump in program SAPMV45A"')
-    print('  "Create the full IDES org structure with transports"')
-    print('  "Show all sales orders from January 2025"')
+    print("\nType any query. Type 'new' to reset context. Type 'exit' to quit.")
+    print('Examples: "Fix all IDoc errors from today"')
+    print('          "Scan and fix all blocked sales orders"')
+    print('          "Fix all failed background jobs this week"')
+    print()
 
-    # ── Conversation continuity state ─────────────────────────────────────────
-    # When Claude ends a turn with an [A/R] approval prompt we save the current
-    # messages and resume the SAME conversation when the user types A/R/yes/no.
-    APPROVAL_TRIGGERS = ["[a/r]", "approve?", "a/r", "approve or reject",
-                         "do you approve", "shall i proceed", "confirm?"]
-    APPROVAL_TOKENS   = {"A", "R", "YES", "NO", "Y", "N",
-                         "APPROVE", "REJECT", "APPROVED", "REJECTED"}
+    # ── Continuity engine ─────────────────────────────────────────────────────
+    # The agent maintains a live conversation thread. Any short user response
+    # (feedback, follow-up, single words) continues the same thread.
+    # Only a clearly NEW multi-word query about a different topic resets it.
 
-    pending_messages = None   # holds thread when waiting for approval
-    last_text        = ""     # last assistant message text
+    # Words that explicitly reset the conversation
+    RESET_WORDS = {"new", "reset", "restart", "clear", "start over", "new query",
+                   "different", "new task", "another"}
+
+    # Minimum character length that could be a new topic (not a follow-up)
+    NEW_TOPIC_THRESHOLD = 60
+
+    # SAP transaction / domain keywords — if present in a long response it's new
+    SAP_KEYWORDS = {
+        "scan", "find", "fix", "show", "check", "create", "release",
+        "reverse", "cancel", "run", "load", "update", "list", "repair",
+        "idoc", "purchase", "sales", "order", "invoice", "vendor", "customer",
+        "material", "delivery", "job", "workflow", "lock", "dump", "abap",
+        "fi", "co", "mm", "sd", "pp", "wm", "sm", "we", "va", "me", "fb",
+    }
+
+    pending_messages = None   # current conversation thread
+    last_text        = ""     # last assistant response text
+
+    def _is_new_topic(query: str, has_pending: bool) -> bool:
+        """Return True when query should start a fresh conversation."""
+        if not has_pending:
+            return True
+        q = query.strip().lower()
+        # Explicit reset
+        if q in RESET_WORDS or any(q.startswith(r + " ") for r in RESET_WORDS):
+            return True
+        # Short response → always a continuation (follow-up / acknowledgement)
+        if len(query.strip()) <= NEW_TOPIC_THRESHOLD:
+            return False
+        # Long query AND contains SAP action keywords → likely a new task
+        words = set(q.split())
+        if words & SAP_KEYWORDS:
+            return True
+        # Long but no SAP keywords → continuation (e.g. "please also check the vendor")
+        return False
 
     while True:
-        query = input("\nQuery (or exit): ").strip()
-        if query.lower() in ("exit", "quit", "q", ""):
+        try:
+            query = input("\nQuery (or exit): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
             break
 
-        # Detect approval response: pending conversation + last msg had [A/R] +
-        # user typed an approval token (optionally with trailing punctuation)
-        is_approval = (
-            pending_messages is not None
-            and any(t in last_text.lower() for t in APPROVAL_TRIGGERS)
-            and query.upper().rstrip(".,!") in APPROVAL_TOKENS
-        )
+        if not query:
+            continue
+        if query.lower() in ("exit", "quit", "q"):
+            break
 
-        if is_approval:
-            print(f"\n[Resuming conversation — user response: {query}]")
+        new_topic = _is_new_topic(query, pending_messages is not None)
+
+        if new_topic:
+            if pending_messages is not None:
+                print("\n[Starting new conversation]")
+            pending_messages, last_text = run_agent(query, API_KEY)
+        else:
+            # Continue the existing thread — pass user response as next message
+            print(f"\n[Continuing conversation]")
             pending_messages, last_text = run_agent(
                 query, API_KEY, messages=pending_messages
             )
-        else:
-            # Fresh query — discard any stale pending conversation
-            pending_messages, last_text = run_agent(query, API_KEY)
-
-        # Keep pending_messages alive as long as the last response still
-        # ends with an approval request (multi-step fix workflows).
-        if not any(t in last_text.lower() for t in APPROVAL_TRIGGERS):
-            pending_messages = None
