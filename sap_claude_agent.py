@@ -1,5 +1,5 @@
 """
-ARTILEGENZ SAP Claude Agent v11.0
+ARTILEGENZ SAP Claude Agent v12.0
 Authorization: SAP_ALL + SAP_NEW (full system access confirmed via SU01)
 User: S4ABAP24
 
@@ -2897,8 +2897,884 @@ def scan_incomplete_orders(date_from=None, date_to=None, sales_org=""):
         return {"error": str(e)}
 
 
+# ── FI/CO Posting Error Resolution ───────────────────────────────────────────
+
+FI_ERROR_FIX_MAP = {
+    "payment block":        ("release_fi_payment_block", "HIGH"),
+    "blocked for payment":  ("release_fi_payment_block", "HIGH"),
+    "posting period":       ("open_fi_posting_period",   "HIGH"),
+    "period not open":      ("open_fi_posting_period",   "HIGH"),
+    "account":              ("check_gl_account",          "MEDIUM"),
+    "gl account":           ("check_gl_account",          "MEDIUM"),
+    "cost center":          ("check_cost_center",         "MEDIUM"),
+    "profit center":        ("check_cost_center",         "LOW"),
+    "tax":                  ("check_tax_config",          "MEDIUM"),
+    "exchange rate":        ("check_exchange_rate",       "LOW"),
+    "reversal":             ("reverse_fi_document",       "HIGH"),
+    "duplicate":            ("reverse_fi_document",       "MEDIUM"),
+    "tolerance":            ("release_fi_payment_block",  "MEDIUM"),
+    "clearing":             ("clear_open_items",          "MEDIUM"),
+    "open item":            ("clear_open_items",          "LOW"),
+    "balance":              ("clear_open_items",          "MEDIUM"),
+}
+
+
+def scan_fi_errors(date_from=None, date_to=None, company_code="1000",
+                   account_type="K"):
+    """
+    Scan for FI document errors and blocked items via FBL1N/FBL5N.
+    account_type: K=vendor, D=customer, S=GL account.
+    Returns open/blocked items with fix_hints.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    # Choose transaction by account type
+    tcode_map = {"K": "FBL1N", "D": "FBL5N", "S": "FBL3N"}
+    go_to_transaction(tcode_map.get(account_type, "FBL3N"))
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtDD_BUKRS-LOW", "wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtDD_BUDAT-LOW", "wnd[0]/usr/ctxtBUDAT_LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtDD_BUDAT-HIGH", "wnd[0]/usr/ctxtBUDAT_HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        # Select "All items" radio
+        for fid in ("wnd[0]/usr/radX_AISEL", "wnd[0]/usr/radALLSEL"):
+            try: session.FindById(fid).Select(); break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        items = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 300)):
+                    row = {}
+                    for col in ["BELNR","GJAHR","BUKRS","BLDAT","BUDAT",
+                                "BLART","DMBTR","WAERS","ZLSPR","AUGBL",
+                                "SGTXT","LIFNR","KUNNR","HKONT"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if not row.get("BELNR"):
+                        continue
+                    issues = []
+                    if row.get("ZLSPR"):  issues.append("payment_blocked")
+                    if not row.get("AUGBL"): issues.append("open_item")
+                    row["issues"] = issues
+                    combined = " ".join(str(v) for v in row.values()).lower()
+                    row["fix_hints"] = [
+                        {"pattern": pat, "fix_action": fa, "risk": risk}
+                        for pat, (fa, risk) in FI_ERROR_FIX_MAP.items()
+                        if pat in combined
+                    ]
+                    if issues:
+                        items.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "company_code": company_code, "account_type": account_type,
+            "fi_errors": items, "count": len(items),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(items)} FI items with issues. "
+                     "Call get_fi_doc_detail for each to analyse."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_fi_doc_detail(doc_number, company_code="1000", fiscal_year=""):
+    """
+    Display a FI document in FB03 and extract all line items, posting keys,
+    accounts, amounts, and payment block status with fix_hints.
+    """
+    if not fiscal_year:
+        fiscal_year = datetime.now().strftime("%Y")
+    go_to_transaction("FB03")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRF05L-BELNR", "wnd[0]/usr/ctxtBELNR"):
+            try: session.FindById(fid).Text = str(doc_number); break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05L-BUKRS", "wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05L-GJAHR", "wnd[0]/usr/ctxtGJAHR"):
+            try: session.FindById(fid).Text = fiscal_year; break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        texts = []
+        def walk(comp, depth=0):
+            if depth > 8: return
+            try: n = comp.Children.Count
+            except Exception: return
+            for i in range(n):
+                try:
+                    ch = comp.Children(i)
+                    if ch.Type in ("GuiTextField","GuiCTextField","GuiLabel"):
+                        try:
+                            t = ch.Text.strip()
+                            if t and len(t) > 2: texts.append(t)
+                        except Exception: pass
+                    walk(ch, depth+1)
+                except Exception: pass
+        walk(session.FindById("wnd[0]"))
+        all_text = "\n".join(texts[:300])
+        combined = all_text.lower()
+
+        fix_hints = [
+            {"pattern": pat, "fix_action": fa, "risk": risk}
+            for pat, (fa, risk) in FI_ERROR_FIX_MAP.items()
+            if pat in combined
+        ]
+        return {
+            "doc_number": str(doc_number),
+            "company_code": company_code,
+            "fiscal_year": fiscal_year,
+            "all_screen_text": all_text,
+            "fix_hints": fix_hints,
+            "screen": get_screen_text(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def release_fi_payment_block(doc_number, company_code="1000",
+                              fiscal_year="", line_item="1"):
+    """
+    Remove payment block from a FI document line item via FB02.
+    Clears BSEG-ZLSPR so the item can be included in the next payment run.
+    """
+    if not fiscal_year:
+        fiscal_year = datetime.now().strftime("%Y")
+    go_to_transaction("FB02")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRF05L-BELNR", "wnd[0]/usr/ctxtBELNR"):
+            try: session.FindById(fid).Text = str(doc_number); break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05L-BUKRS", "wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05L-GJAHR", "wnd[0]/usr/ctxtGJAHR"):
+            try: session.FindById(fid).Text = fiscal_year; break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        elems = discover_elements()
+        for e in elems:
+            if "ZLSPR" in e.get("id","").upper():
+                set_field(e["id"], "")
+                break
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("FI_PAYMENT_BLOCK_RELEASE",
+                  {"doc": str(doc_number), "company_code": company_code},
+                  status="executed")
+        return {"ok": True, "doc_number": str(doc_number),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def reverse_fi_document(doc_number, company_code="1000", fiscal_year="",
+                         reversal_reason="01", reversal_date=None):
+    """
+    Reverse (storno) a FI document via FB08.
+    reversal_reason: 01=Reversal in current period, 02=Reversal in closed period.
+    """
+    if not fiscal_year:
+        fiscal_year = datetime.now().strftime("%Y")
+    rev_date = reversal_date or datetime.now().strftime("%d.%m.%Y")
+
+    go_to_transaction("FB08")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRF05L-BELNR", "wnd[0]/usr/ctxtBELNR"):
+            try: session.FindById(fid).Text = str(doc_number); break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05L-BUKRS", "wnd[0]/usr/ctxtBUKRS"):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05L-GJAHR", "wnd[0]/usr/ctxtGJAHR"):
+            try: session.FindById(fid).Text = fiscal_year; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05L-STGRD", "wnd[0]/usr/ctxtSTGRD"):
+            try: session.FindById(fid).Text = reversal_reason; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05L-NEWBS", "wnd[0]/usr/ctxtBUDAT"):
+            try: session.FindById(fid).Text = rev_date; break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(2)
+
+        audit_log("FI_DOCUMENT_REVERSAL",
+                  {"doc": str(doc_number), "company_code": company_code,
+                   "reason": reversal_reason, "date": rev_date},
+                  status="executed")
+        return {"ok": True, "doc_number": str(doc_number),
+                "reversal_reason": reversal_reason,
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def clear_open_items(account_number, company_code="1000",
+                      account_type="K", clearing_date=None):
+    """
+    Clear open FI items for a vendor/customer/GL account via F-44/F-32/F-03.
+    account_type: K=vendor (F-44), D=customer (F-32), S=GL account (F-03).
+    """
+    clr_date = clearing_date or datetime.now().strftime("%d.%m.%Y")
+    tcode_map = {"K": "F-44", "D": "F-32", "S": "F-03"}
+    go_to_transaction(tcode_map.get(account_type, "F-44"))
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRF05A-BUDAT",):
+            try: session.FindById(fid).Text = clr_date; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05A-BUKRS",):
+            try: session.FindById(fid).Text = company_code; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRF05A-LIFNR",
+                    "wnd[0]/usr/ctxtRF05A-KUNNR",
+                    "wnd[0]/usr/ctxtRF05A-HKONT"):
+            try: session.FindById(fid).Text = str(account_number); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        # Select all open items
+        session.FindById("wnd[0]").SendVKey(16)
+        time.sleep(0.5)
+
+        audit_log("FI_CLEAR_OPEN_ITEMS",
+                  {"account": str(account_number), "company_code": company_code,
+                   "account_type": account_type},
+                  status="executed")
+        return {"ok": True, "account": str(account_number),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Delivery / Shipping Error Resolution ──────────────────────────────────────
+
+DELIVERY_ERROR_FIX_MAP = {
+    "picking":          ("fix_delivery_picking",    "MEDIUM"),
+    "pick quantity":    ("fix_delivery_picking",    "MEDIUM"),
+    "goods issue":      ("post_goods_issue",         "HIGH"),
+    "gi not posted":    ("post_goods_issue",         "HIGH"),
+    "incomplete":       ("fix_delivery_incomplete",  "MEDIUM"),
+    "packing":          ("fix_delivery_incomplete",  "LOW"),
+    "route":            ("fix_delivery_incomplete",  "LOW"),
+    "shipping point":   ("fix_delivery_incomplete",  "MEDIUM"),
+    "output":           ("create_delivery_output",   "LOW"),
+    "transfer order":   ("create_transfer_order",    "MEDIUM"),
+    "stock":            ("check_stock",              "MEDIUM"),
+    "not available":    ("check_stock",              "HIGH"),
+}
+
+
+def scan_delivery_errors(date_from=None, date_to=None,
+                          shipping_point="", error_type="all"):
+    """
+    Scan for stuck/failed deliveries via VL06O (outbound delivery monitor).
+    error_type: 'gi'=GI not posted, 'pick'=picking incomplete,
+                'output'=output errors, 'all'=all open deliveries.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("VL06O")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtS_LFDAT-LOW", "wnd[0]/usr/ctxtLFDAT_LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtS_LFDAT-HIGH", "wnd[0]/usr/ctxtLFDAT_HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        if shipping_point:
+            for fid in ("wnd[0]/usr/ctxtS_VSTEL-LOW",):
+                try: session.FindById(fid).Text = shipping_point; break
+                except Exception: pass
+
+        # Select the correct list view based on error type
+        if error_type == "gi":
+            for fid in ("wnd[0]/usr/tabsTAB/tabpGI", "wnd[0]/tbar[1]/btn[18]"):
+                try: session.FindById(fid).Select(); break
+                except Exception: pass
+        elif error_type == "pick":
+            for fid in ("wnd[0]/usr/tabsTAB/tabpPICK", "wnd[0]/tbar[1]/btn[17]"):
+                try: session.FindById(fid).Select(); break
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        deliveries = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["VBELN","LFART","WADAT","KUNNR","VSTEL",
+                                "LGNUM","KOSTA","WBSTK","PKSTK","KOQUK"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if not row.get("VBELN"):
+                        continue
+                    combined = " ".join(str(v) for v in row.values()).lower()
+                    row["fix_hints"] = [
+                        {"pattern": pat, "fix_action": fa, "risk": risk}
+                        for pat, (fa, risk) in DELIVERY_ERROR_FIX_MAP.items()
+                        if pat in combined
+                    ]
+                    deliveries.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "delivery_errors": deliveries, "count": len(deliveries),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(deliveries)} deliveries. "
+                     "Call fix_delivery or post_goods_issue to resolve."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def post_goods_issue(delivery_number):
+    """
+    Post goods issue for a delivery via VL02N.
+    Completes the outbound delivery and reduces stock.
+    """
+    go_to_transaction("VL02N")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtLIKP-VBELN",):
+            try: session.FindById(fid).Text = str(delivery_number); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        # Post Goods Issue button (F6 or toolbar)
+        for fid in ("wnd[0]/tbar[1]/btn[8]",):
+            try: session.FindById(fid).Press(); time.sleep(1.5); break
+            except Exception: pass
+        # Try menu: Post Goods Issue
+        try:
+            session.FindById("wnd[0]/mbar/menu[1]/menu[1]").Select()
+            time.sleep(1.5)
+        except Exception:
+            pass
+
+        for fid in ("wnd[1]/usr/btnSPOP-OPTION1", "wnd[1]/tbar[0]/btn[0]"):
+            try: session.FindById(fid).Press(); time.sleep(1); break
+            except Exception: pass
+
+        audit_log("DELIVERY_GI_POST",
+                  {"delivery": str(delivery_number)},
+                  status="executed")
+        return {"ok": True, "delivery": str(delivery_number),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def fix_delivery_incomplete(delivery_number, field_name, new_value):
+    """
+    Fix an incomplete delivery by setting a missing field via VL02N.
+    Common: ROUTE=route, VSTEL=shipping point, LGNUM=warehouse number.
+    """
+    go_to_transaction("VL02N")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtLIKP-VBELN",):
+            try: session.FindById(fid).Text = str(delivery_number); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        elems = discover_elements()
+        changed = False
+        for e in elems:
+            if (field_name.upper() in e.get("id","").upper() or
+                    field_name.upper() in e.get("tooltip","").upper()):
+                set_field(e["id"], str(new_value))
+                changed = True
+                break
+
+        if not changed:
+            return {"ok": False,
+                    "note": f"Field {field_name} not found. "
+                            "Use discover_screen_elements to locate it.",
+                    "elements": [e["id"] for e in elems[:30]]}
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("DELIVERY_FIELD_FIX",
+                  {"delivery": str(delivery_number),
+                   "field": field_name, "value": str(new_value)},
+                  status="executed")
+        return {"ok": True, "delivery": str(delivery_number),
+                "field": field_name, "new_value": new_value,
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def create_delivery_output(delivery_number, output_type="LIEF", medium="1"):
+    """
+    Create/resend delivery output (delivery note etc.) via VL02N.
+    output_type: LIEF=delivery note, LADS=loading list.
+    """
+    go_to_transaction("VL02N")
+    time.sleep(1)
+    try:
+        for fid in ("wnd[0]/usr/ctxtLIKP-VBELN",):
+            try: session.FindById(fid).Text = str(delivery_number); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        # Extras → Output → Issue
+        try:
+            session.FindById("wnd[0]/mbar/menu[3]/menu[0]/menu[0]").Select()
+            time.sleep(1)
+        except Exception:
+            pass
+
+        session.FindById("wnd[0]").SendVKey(11)
+        time.sleep(1.5)
+
+        audit_log("DELIVERY_OUTPUT",
+                  {"delivery": str(delivery_number), "output_type": output_type},
+                  status="executed")
+        return {"ok": True, "delivery": str(delivery_number),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Background Job Error Resolution ───────────────────────────────────────────
+
+def scan_failed_jobs(date_from=None, date_to=None, job_name="",
+                      username=""):
+    """
+    Scan SM37 for cancelled/failed background jobs.
+    Returns job name, step, start time, user, error status.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("SM37")
+    time.sleep(1.5)
+    try:
+        # Job name (wildcard)
+        for fid in ("wnd[0]/usr/ctxtBTCH2170-JOBNAME",):
+            try: session.FindById(fid).Text = job_name or "*"; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtBTCH2170-USERNAME",):
+            try: session.FindById(fid).Text = username or "*"; break
+            except Exception: pass
+        # Date range
+        for fid in ("wnd[0]/usr/ctxtBTCH2170-FROM_DATE",):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtBTCH2170-TO_DATE",):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        # Select only cancelled/aborted jobs
+        for fid in ("wnd[0]/usr/chkBTCH2170-ABORTED",
+                    "wnd[0]/usr/chkABORTED"):
+            try: session.FindById(fid).Selected = True; break
+            except Exception: pass
+        # Deselect others
+        for fid_key in ("SCHEDULED","RELEASED","READY","ACTIVE","FINISHED"):
+            for fid in (f"wnd[0]/usr/chkBTCH2170-{fid_key}",
+                        f"wnd[0]/usr/chk{fid_key}"):
+                try: session.FindById(fid).Selected = False; break
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        jobs = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["JOBNAME","JOBCOUNT","SDLSTRTDT","SDLSTRTTM",
+                                "ENDDATE","ENDTIME","STATUS","AUTHCKNAM",
+                                "PRCTEXT","STEPCOUNT"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if row.get("JOBNAME"):
+                        row["fix_action"] = "restart_failed_job"
+                        jobs.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "failed_jobs": jobs, "count": len(jobs),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(jobs)} failed/cancelled jobs. "
+                     "Call restart_failed_job for each to reschedule."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def restart_failed_job(job_name, job_count):
+    """
+    Restart a failed background job via SM37.
+    Locates the job by name+count and triggers immediate re-execution.
+    """
+    go_to_transaction("SM37")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtBTCH2170-JOBNAME",):
+            try: session.FindById(fid).Text = job_name; break
+            except Exception: pass
+        # Select all statuses to find it
+        for fid_key in ("SCHEDULED","RELEASED","READY","ACTIVE",
+                        "FINISHED","ABORTED"):
+            for fid in (f"wnd[0]/usr/chkBTCH2170-{fid_key}",):
+                try: session.FindById(fid).Selected = True
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+
+        # Find and select the row matching job_count
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 100)):
+                    jc = shell.GetCellValue(i, "JOBCOUNT")
+                    if str(jc) == str(job_count):
+                        shell.SetCurrentCell(i, "JOBNAME")
+                        shell.ClickCurrentCell()
+                        break
+        except Exception:
+            pass
+
+        # Job → Repeat → Immediate
+        try:
+            session.FindById("wnd[0]/mbar/menu[0]/menu[6]").Select()
+            time.sleep(1)
+        except Exception:
+            try:
+                session.FindById("wnd[0]/tbar[1]/btn[8]").Press()
+                time.sleep(1)
+            except Exception:
+                pass
+
+        audit_log("JOB_RESTART",
+                  {"job_name": job_name, "job_count": str(job_count)},
+                  status="executed")
+        return {"ok": True, "job_name": job_name,
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Workflow Error Resolution ──────────────────────────────────────────────────
+
+def scan_workflow_errors(date_from=None, date_to=None, task_id=""):
+    """
+    Scan SWI1 for stuck or error workflow items.
+    Returns work items in error/suspended/cancelled status.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("SWI1")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtS_READT-LOW", "wnd[0]/usr/ctxtDATE_LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtS_READT-HIGH", "wnd[0]/usr/ctxtDATE_HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+        if task_id:
+            for fid in ("wnd[0]/usr/ctxtS_TASK-LOW",):
+                try: session.FindById(fid).Text = task_id; break
+                except Exception: pass
+        # Select error/cancelled status checkboxes
+        for cb in ("wnd[0]/usr/chkSWIRTYPE-FERR",
+                   "wnd[0]/usr/chkSWIRTYPE-CANC",
+                   "wnd[0]/usr/chkSTATUS_ERROR"):
+            try: session.FindById(cb).Selected = True
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        items = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["WI_ID","WI_TYPE","WI_STAT","WI_TEXT",
+                                "WI_ATEXT","CREATED_AT","UPDATED_AT",
+                                "WI_AGENT","TASK_ID"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if row.get("WI_ID"):
+                        row["fix_action"] = "restart_workflow_item"
+                        items.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "workflow_errors": items, "count": len(items),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(items)} workflow errors. "
+                     "Call restart_workflow_item for each."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def restart_workflow_item(workitem_id):
+    """
+    Restart a failed workflow work item via SWPR (workflow restart after error).
+    """
+    go_to_transaction("SWPR")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtSWPRARGS-WI_ID",
+                    "wnd[0]/usr/ctxtWI_ID"):
+            try: session.FindById(fid).Text = str(workitem_id); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+
+        for fid in ("wnd[1]/usr/btnSPOP-OPTION1", "wnd[1]/tbar[0]/btn[0]"):
+            try: session.FindById(fid).Press(); time.sleep(1); break
+            except Exception: pass
+
+        audit_log("WORKFLOW_RESTART",
+                  {"workitem_id": str(workitem_id)},
+                  status="executed")
+        return {"ok": True, "workitem_id": str(workitem_id),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Lock Entry & RFC/tRFC Error Resolution ────────────────────────────────────
+
+def scan_sm12_locks(client="", username="", table_name=""):
+    """
+    Scan SM12 for stuck lock entries that are blocking users or processes.
+    Returns lock owner, table, lock argument, and time locked.
+    """
+    go_to_transaction("SM12")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRM20M-MANDT",):
+            try: session.FindById(fid).Text = client or ""; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtRM20M-GNAME",):
+            try: session.FindById(fid).Text = username or "*"; break
+            except Exception: pass
+        if table_name:
+            for fid in ("wnd[0]/usr/ctxtRM20M-OBJNAME",):
+                try: session.FindById(fid).Text = table_name; break
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+
+        locks = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["GNAME","OBJNAME","LOCKARG","TABNAME",
+                                "MANDT","REPID","DATUM","UZEIT"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if row.get("OBJNAME") or row.get("GNAME"):
+                        row["fix_action"] = "release_lock_entry"
+                        locks.append(row)
+        except Exception:
+            pass
+
+        return {
+            "lock_entries": locks, "count": len(locks),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(locks)} lock entries. "
+                     "Call release_lock_entry to delete stale locks."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def release_lock_entry(username, table_name=""):
+    """
+    Delete stale lock entries in SM12 for a user and optionally a specific table.
+    WARNING: Only release locks for inactive/dead processes — active locks
+    protect data integrity.
+    """
+    go_to_transaction("SM12")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtRM20M-GNAME",):
+            try: session.FindById(fid).Text = username; break
+            except Exception: pass
+        if table_name:
+            for fid in ("wnd[0]/usr/ctxtRM20M-OBJNAME",):
+                try: session.FindById(fid).Text = table_name; break
+                except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+
+        session.FindById("wnd[0]").SendVKey(16)   # Select all
+        time.sleep(0.5)
+
+        # Delete locks
+        session.FindById("wnd[0]").SendVKey(65)   # Shift+F5 = Delete
+        time.sleep(1)
+        for fid in ("wnd[1]/usr/btnSPOP-OPTION1", "wnd[1]/tbar[0]/btn[0]"):
+            try: session.FindById(fid).Press(); time.sleep(1); break
+            except Exception: pass
+
+        audit_log("LOCK_ENTRY_RELEASE",
+                  {"username": username, "table": table_name or "ALL"},
+                  status="executed")
+        return {"ok": True, "username": username,
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def scan_sm58_errors(date_from=None, date_to=None):
+    """
+    Scan SM58 for failed tRFC (transactional RFC) calls.
+    Returns function module, destination, TID, error text, and retry status.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    df = date_from or today
+    dt = date_to   or today
+
+    go_to_transaction("SM58")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtDATE_LOW",
+                    "wnd[0]/usr/ctxtS_CRTDT-LOW"):
+            try: session.FindById(fid).Text = df; break
+            except Exception: pass
+        for fid in ("wnd[0]/usr/ctxtDATE_HIGH",
+                    "wnd[0]/usr/ctxtS_CRTDT-HIGH"):
+            try: session.FindById(fid).Text = dt; break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2.5)
+
+        errors = []
+        try:
+            shell = session.FindById(
+                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            if shell:
+                for i in range(min(shell.RowCount, 200)):
+                    row = {}
+                    for col in ["TID","FUNCNAME","DEST","MANDT","STATUS",
+                                "ERRTXT","CRTDT","CRTTM","USERNAME"]:
+                        try: row[col] = shell.GetCellValue(i, col)
+                        except Exception: pass
+                    if row.get("TID"):
+                        row["fix_action"] = "retry_sm58_entry"
+                        errors.append(row)
+        except Exception:
+            pass
+
+        return {
+            "date_from": df, "date_to": dt,
+            "sm58_errors": errors, "count": len(errors),
+            "screen": get_screen_text(),
+            "note": (f"Found {len(errors)} tRFC errors. "
+                     "Call retry_sm58_entry to re-execute each failed call."),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def retry_sm58_entry(tid, function_name=""):
+    """
+    Retry a failed tRFC entry in SM58 by TID (transaction ID).
+    Re-executes the remote function call that previously failed.
+    """
+    go_to_transaction("SM58")
+    time.sleep(1.5)
+    try:
+        for fid in ("wnd[0]/usr/ctxtTID",):
+            try: session.FindById(fid).Text = str(tid); break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+
+        session.FindById("wnd[0]").SendVKey(16)
+        time.sleep(0.5)
+
+        # Execute: LUW → Execute
+        for fid in ("wnd[0]/tbar[1]/btn[8]",):
+            try: session.FindById(fid).Press(); time.sleep(2); break
+            except Exception: pass
+        try:
+            session.FindById("wnd[0]/mbar/menu[0]/menu[1]").Select()
+            time.sleep(1.5)
+        except Exception:
+            pass
+
+        audit_log("SM58_RETRY",
+                  {"tid": str(tid), "function_name": function_name},
+                  status="executed")
+        return {"ok": True, "tid": str(tid),
+                "screen": get_screen_text()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def get_sales_orders(date_from, date_to):
-    go_to_transaction("VA05")
     time.sleep(1)
     try:
         session.FindById("wnd[0]/usr/ctxtSD_VBAK-AUDAT_LOW").Text  = date_from
@@ -3483,6 +4359,325 @@ TOOLS = [
                 "program_name": {"type": "string"},
             },
             "required": ["program_name"],
+        },
+    },
+
+    # ── FI/CO ERROR RESOLUTION ───────────────────────────────────────────────
+    {
+        "name": "scan_fi_errors",
+        "description": (
+            "Scan FBL1N/FBL5N/FBL3N for FI document errors and blocked items. "
+            "account_type: K=vendor (FBL1N), D=customer (FBL5N), S=GL (FBL3N). "
+            "Returns open/blocked items with payment block flags and fix_hints. "
+            "ALWAYS call this first for FI/CO issues."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from":    {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":      {"type": "string", "description": "DD.MM.YYYY"},
+                "company_code": {"type": "string", "description": "e.g. 1000"},
+                "account_type": {"type": "string",
+                                 "enum": ["K","D","S"],
+                                 "description": "K=vendor, D=customer, S=GL account"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_fi_doc_detail",
+        "description": (
+            "Display a FI document in FB03 and extract all line items, "
+            "posting keys, amounts, payment block (ZLSPR), and fix_hints."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "doc_number":   {"type": "string", "description": "FI document number (BELNR)"},
+                "company_code": {"type": "string", "description": "e.g. 1000"},
+                "fiscal_year":  {"type": "string", "description": "e.g. 2026"},
+            },
+            "required": ["doc_number"],
+        },
+    },
+    {
+        "name": "release_fi_payment_block",
+        "description": (
+            "Remove payment block (ZLSPR) from a FI document via FB02, "
+            "so the item is included in the next F110 payment run. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "doc_number":   {"type": "string"},
+                "company_code": {"type": "string"},
+                "fiscal_year":  {"type": "string"},
+                "line_item":    {"type": "string", "description": "Line item number (default 1)"},
+            },
+            "required": ["doc_number"],
+        },
+    },
+    {
+        "name": "reverse_fi_document",
+        "description": (
+            "Reverse (storno) a FI document via FB08. "
+            "reversal_reason: 01=current period, 02=closed period. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "doc_number":      {"type": "string"},
+                "company_code":    {"type": "string"},
+                "fiscal_year":     {"type": "string"},
+                "reversal_reason": {"type": "string",
+                                    "description": "01=current period, 02=closed period"},
+                "reversal_date":   {"type": "string", "description": "DD.MM.YYYY"},
+            },
+            "required": ["doc_number"],
+        },
+    },
+    {
+        "name": "clear_open_items",
+        "description": (
+            "Clear open FI items for a vendor/customer/GL account "
+            "via F-44 (vendor), F-32 (customer), or F-03 (GL). "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "account_number": {"type": "string",
+                                   "description": "Vendor/customer/GL account number"},
+                "company_code":   {"type": "string"},
+                "account_type":   {"type": "string",
+                                   "enum": ["K","D","S"],
+                                   "description": "K=vendor, D=customer, S=GL"},
+                "clearing_date":  {"type": "string", "description": "DD.MM.YYYY"},
+            },
+            "required": ["account_number"],
+        },
+    },
+
+    # ── DELIVERY / SHIPPING ERROR RESOLUTION ─────────────────────────────────
+    {
+        "name": "scan_delivery_errors",
+        "description": (
+            "Scan VL06O (outbound delivery monitor) for stuck deliveries. "
+            "error_type: 'gi'=GI not posted, 'pick'=picking incomplete, 'all'=everything. "
+            "Returns deliveries with status and fix_hints."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from":      {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":        {"type": "string", "description": "DD.MM.YYYY"},
+                "shipping_point": {"type": "string", "description": "e.g. 1000"},
+                "error_type":     {"type": "string",
+                                   "enum": ["gi","pick","output","all"]},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "post_goods_issue",
+        "description": (
+            "Post goods issue for a delivery via VL02N. "
+            "Completes the outbound delivery and reduces stock. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "delivery_number": {"type": "string",
+                                    "description": "Outbound delivery number"},
+            },
+            "required": ["delivery_number"],
+        },
+    },
+    {
+        "name": "fix_delivery_incomplete",
+        "description": (
+            "Fix an incomplete delivery by setting a missing field via VL02N. "
+            "Common: ROUTE=route, VSTEL=shipping point, LGNUM=warehouse. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "delivery_number": {"type": "string"},
+                "field_name":      {"type": "string",
+                                    "description": "SAP field name e.g. ROUTE, VSTEL"},
+                "new_value":       {"type": "string"},
+            },
+            "required": ["delivery_number", "field_name", "new_value"],
+        },
+    },
+    {
+        "name": "create_delivery_output",
+        "description": (
+            "Create/resend output for a delivery via VL02N. "
+            "output_type: LIEF=delivery note, LADS=loading list. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "delivery_number": {"type": "string"},
+                "output_type":     {"type": "string",
+                                    "description": "LIEF=delivery note, LADS=loading list"},
+                "medium":          {"type": "string",
+                                    "description": "1=print, 5=external, 6=EDI"},
+            },
+            "required": ["delivery_number"],
+        },
+    },
+
+    # ── BACKGROUND JOB ERROR RESOLUTION ──────────────────────────────────────
+    {
+        "name": "scan_failed_jobs",
+        "description": (
+            "Scan SM37 for cancelled/aborted background jobs. "
+            "Returns job name, count, scheduled time, user, and error status. "
+            "ALWAYS call this first for job failures."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":   {"type": "string", "description": "DD.MM.YYYY"},
+                "job_name":  {"type": "string",
+                              "description": "Job name filter (blank=all, * for wildcard)"},
+                "username":  {"type": "string", "description": "Owner user ID filter"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "restart_failed_job",
+        "description": (
+            "Restart a failed background job via SM37 by job name and count. "
+            "Re-triggers immediate execution of the cancelled job. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_name":  {"type": "string", "description": "Background job name"},
+                "job_count": {"type": "string",
+                              "description": "Job count (from scan_failed_jobs JOBCOUNT)"},
+            },
+            "required": ["job_name", "job_count"],
+        },
+    },
+
+    # ── WORKFLOW ERROR RESOLUTION ─────────────────────────────────────────────
+    {
+        "name": "scan_workflow_errors",
+        "description": (
+            "Scan SWI1 for workflow work items in error, suspended, or cancelled status. "
+            "Returns work item ID, type, task, text, and agent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":   {"type": "string", "description": "DD.MM.YYYY"},
+                "task_id":   {"type": "string",
+                              "description": "Workflow task ID filter (optional)"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "restart_workflow_item",
+        "description": (
+            "Restart a failed workflow work item via SWPR. "
+            "Re-executes the step that errored. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "workitem_id": {"type": "string",
+                                "description": "Work item ID from scan_workflow_errors"},
+            },
+            "required": ["workitem_id"],
+        },
+    },
+
+    # ── LOCK ENTRY RESOLUTION ─────────────────────────────────────────────────
+    {
+        "name": "scan_sm12_locks",
+        "description": (
+            "Scan SM12 for stuck lock entries that are blocking users or jobs. "
+            "Returns lock owner, table, lock argument, and creation time."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username":   {"type": "string", "description": "Lock owner user ID"},
+                "table_name": {"type": "string",
+                               "description": "Table name filter (optional)"},
+                "client":     {"type": "string", "description": "SAP client (optional)"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "release_lock_entry",
+        "description": (
+            "Delete stale lock entries in SM12 for a specific user. "
+            "WARNING: Only release locks for provably dead/inactive processes. "
+            "Active locks protect data integrity. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username":   {"type": "string",
+                               "description": "Lock owner whose locks to release"},
+                "table_name": {"type": "string",
+                               "description": "Restrict to locks on this table (optional)"},
+            },
+            "required": ["username"],
+        },
+    },
+
+    # ── tRFC / SM58 ERROR RESOLUTION ─────────────────────────────────────────
+    {
+        "name": "scan_sm58_errors",
+        "description": (
+            "Scan SM58 for failed tRFC (transactional RFC) calls. "
+            "Returns function module, destination, TID, error text. "
+            "Common source of ALE/IDoc and cross-system integration errors."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD.MM.YYYY"},
+                "date_to":   {"type": "string", "description": "DD.MM.YYYY"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "retry_sm58_entry",
+        "description": (
+            "Retry a failed tRFC entry in SM58 by TID. "
+            "Re-executes the remote function call. "
+            "REQUIRES human approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tid":           {"type": "string",
+                                  "description": "Transaction ID from scan_sm58_errors"},
+                "function_name": {"type": "string",
+                                  "description": "Function module name (informational)"},
+            },
+            "required": ["tid"],
         },
     },
 
@@ -4158,6 +5353,13 @@ WRITE_TOOLS = {
     "release_billing_block", "reprice_sales_order",
     "complete_sales_order", "fix_partner_determination",
     "create_sd_output", "check_atp", "remove_rejection_reason",
+    # FI/CO write tools
+    "release_fi_payment_block", "reverse_fi_document", "clear_open_items",
+    # Delivery write tools
+    "post_goods_issue", "fix_delivery_incomplete", "create_delivery_output",
+    # Job/Workflow/Lock/tRFC write tools
+    "restart_failed_job", "restart_workflow_item",
+    "release_lock_entry", "retry_sm58_entry",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
@@ -4334,6 +5536,115 @@ def dispatch(tool_name, tool_input):
             tool_input.get("message_type", ""),
             tool_input.get("date_from"),
             tool_input.get("date_to"),
+        )
+
+    # ── FI/CO error resolution tools ──────────────────────────────────────────
+    if tool_name == "scan_fi_errors":
+        return scan_fi_errors(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("company_code", "1000"),
+            tool_input.get("account_type", "K"),
+        )
+    if tool_name == "get_fi_doc_detail":
+        return get_fi_doc_detail(
+            tool_input["doc_number"],
+            tool_input.get("company_code", "1000"),
+            tool_input.get("fiscal_year", ""),
+        )
+    if tool_name == "release_fi_payment_block":
+        return release_fi_payment_block(
+            tool_input["doc_number"],
+            tool_input.get("company_code", "1000"),
+            tool_input.get("fiscal_year", ""),
+            tool_input.get("line_item", "1"),
+        )
+    if tool_name == "reverse_fi_document":
+        return reverse_fi_document(
+            tool_input["doc_number"],
+            tool_input.get("company_code", "1000"),
+            tool_input.get("fiscal_year", ""),
+            tool_input.get("reversal_reason", "01"),
+            tool_input.get("reversal_date"),
+        )
+    if tool_name == "clear_open_items":
+        return clear_open_items(
+            tool_input["account_number"],
+            tool_input.get("company_code", "1000"),
+            tool_input.get("account_type", "K"),
+            tool_input.get("clearing_date"),
+        )
+
+    # ── Delivery error resolution tools ───────────────────────────────────────
+    if tool_name == "scan_delivery_errors":
+        return scan_delivery_errors(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("shipping_point", ""),
+            tool_input.get("error_type", "all"),
+        )
+    if tool_name == "post_goods_issue":
+        return post_goods_issue(tool_input["delivery_number"])
+    if tool_name == "fix_delivery_incomplete":
+        return fix_delivery_incomplete(
+            tool_input["delivery_number"],
+            tool_input["field_name"],
+            tool_input["new_value"],
+        )
+    if tool_name == "create_delivery_output":
+        return create_delivery_output(
+            tool_input["delivery_number"],
+            tool_input.get("output_type", "LIEF"),
+            tool_input.get("medium", "1"),
+        )
+
+    # ── Background job error resolution tools ─────────────────────────────────
+    if tool_name == "scan_failed_jobs":
+        return scan_failed_jobs(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("job_name", ""),
+            tool_input.get("username", ""),
+        )
+    if tool_name == "restart_failed_job":
+        return restart_failed_job(
+            tool_input["job_name"],
+            tool_input["job_count"],
+        )
+
+    # ── Workflow error resolution tools ───────────────────────────────────────
+    if tool_name == "scan_workflow_errors":
+        return scan_workflow_errors(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+            tool_input.get("task_id", ""),
+        )
+    if tool_name == "restart_workflow_item":
+        return restart_workflow_item(tool_input["workitem_id"])
+
+    # ── Lock entry resolution tools ───────────────────────────────────────────
+    if tool_name == "scan_sm12_locks":
+        return scan_sm12_locks(
+            tool_input.get("client", ""),
+            tool_input.get("username", ""),
+            tool_input.get("table_name", ""),
+        )
+    if tool_name == "release_lock_entry":
+        return release_lock_entry(
+            tool_input["username"],
+            tool_input.get("table_name", ""),
+        )
+
+    # ── tRFC / SM58 error resolution tools ────────────────────────────────────
+    if tool_name == "scan_sm58_errors":
+        return scan_sm58_errors(
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
+        )
+    if tool_name == "retry_sm58_entry":
+        return retry_sm58_entry(
+            tool_input["tid"],
+            tool_input.get("function_name", ""),
         )
 
     # ── Sales Order error resolution tools ────────────────────────────────────
@@ -4752,6 +6063,89 @@ STEP 10 scan_abap_dumps(today, today)
         → Verify dump no longer appears
 
 ═══════════════════════════════════════════════════════════
+ FI/CO POSTING ERROR RESOLUTION WORKFLOW
+═══════════════════════════════════════════════════════════
+STEP 1  scan_fi_errors(date_from, date_to, company_code, account_type)
+        → account_type: K=vendor, D=customer, S=GL account
+        → Returns items with ZLSPR (payment block) and fix_hints
+
+STEP 2  get_fi_doc_detail(doc_number, company_code) for each item
+        → Returns all line items, amounts, and fix_hints
+
+STEP 3  PROPOSE FIX to user — wait for approval — then execute:
+        ─────────────────────────────────────────────────────────
+        ZLSPR set (payment block)   → release_fi_payment_block
+        Duplicate / wrong amount    → reverse_fi_document
+        Open items not cleared      → clear_open_items (F-44/F-32/F-03)
+        Period not open             → OB52: open_posting_period (maintain_table)
+        ─────────────────────────────────────────────────────────
+
+STEP 4  Verify with scan_fi_errors to confirm count drops to zero.
+
+FI PAYMENT BLOCK CODES (ZLSPR):
+  blank=no block  A=Payment block  B=Dunning block  Z=Manual hold
+
+═══════════════════════════════════════════════════════════
+ DELIVERY / SHIPPING ERROR RESOLUTION WORKFLOW
+═══════════════════════════════════════════════════════════
+STEP 1  scan_delivery_errors(date_from, date_to, error_type)
+        → error_type: 'gi'=GI not posted, 'pick'=picking open, 'all'=all
+
+STEP 2  PROPOSE FIX — wait for approval — then execute:
+        GI not posted              → post_goods_issue(delivery)
+        Missing field (route/point)→ fix_delivery_incomplete(delivery, field, value)
+        Output not sent            → create_delivery_output(delivery, output_type)
+
+═══════════════════════════════════════════════════════════
+ BACKGROUND JOB ERROR RESOLUTION WORKFLOW
+═══════════════════════════════════════════════════════════
+STEP 1  scan_failed_jobs(date_from, date_to, job_name)
+        → Returns cancelled/aborted jobs with name, count, schedule time
+
+STEP 2  Investigate: what program does the job run? Check spool for error msg.
+        PROPOSE FIX: "Job ZBATCH_INVOICES (count 12345678) failed.
+         Proposed fix: restart immediately. Approve? [A/R]"
+
+STEP 3  restart_failed_job(job_name, job_count)
+
+═══════════════════════════════════════════════════════════
+ WORKFLOW ERROR RESOLUTION WORKFLOW
+═══════════════════════════════════════════════════════════
+STEP 1  scan_workflow_errors(date_from, date_to, task_id)
+        → Returns work items in ERROR/CANCELLED/SUSPENDED status
+
+STEP 2  PROPOSE: "Work item 123456 (task TS12345678: Approve PO) failed.
+         Proposed fix: restart via SWPR. Approve? [A/R]"
+
+STEP 3  restart_workflow_item(workitem_id)
+
+═══════════════════════════════════════════════════════════
+ LOCK ENTRY RESOLUTION WORKFLOW
+═══════════════════════════════════════════════════════════
+STEP 1  scan_sm12_locks(username, table_name)
+        → Returns all active locks; identify stale ones (user logged off)
+
+STEP 2  PROPOSE: "User BATCH01 has 3 stale locks on VBAK from 2 hours ago.
+         The user session is no longer active.
+         Proposed fix: release_lock_entry. Approve? [A/R]"
+
+STEP 3  release_lock_entry(username, table_name)
+        WARNING: Never release locks for active, running processes.
+
+═══════════════════════════════════════════════════════════
+ tRFC / SM58 ERROR RESOLUTION WORKFLOW
+═══════════════════════════════════════════════════════════
+STEP 1  scan_sm58_errors(date_from, date_to)
+        → Returns failed tRFC calls with TID, function module, destination
+
+STEP 2  PROPOSE: "tRFC TID ABC123 calling IDOC_INBOUND_ASYNCHRONOUS
+         to destination DEST_ECC failed with: RFC_NO_AUTHORITY.
+         Proposed fix: retry_sm58_entry. Approve? [A/R]"
+
+STEP 3  retry_sm58_entry(tid)
+        Note: if the RFC destination itself is down, fix SM59 first.
+
+═══════════════════════════════════════════════════════════
  SALES ORDER ERROR RESOLUTION WORKFLOW
 ═══════════════════════════════════════════════════════════
 When asked to fix sales order errors, follow this sequence:
@@ -5033,11 +6427,19 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v11.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  ARTILEGENZ SAP Agent v12.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Authorization: FULL SYSTEM ACCESS")
     print("  All write operations require your approval first.")
     print("═" * 68)
     print("\nExample queries:")
+    print('  "Show all FI documents with payment blocks for company code 1000"')
+    print('  "Reverse FI document 1800001234 company code 1000"')
+    print('  "Scan all stuck deliveries from today and fix GI"')
+    print('  "Show all failed background jobs from this week"')
+    print('  "Restart failed job ZBATCH_INVOICES"')
+    print('  "Show all workflow errors from today and restart them"')
+    print('  "Check SM12 for stale locks by user BATCH01"')
+    print('  "Show all SM58 tRFC errors and retry them"')
     print('  "Scan all failed sales orders from today and propose fixes"')
     print('  "Show all credit-blocked orders from this week"')
     print('  "Release the delivery block on sales order 1000001234"')
