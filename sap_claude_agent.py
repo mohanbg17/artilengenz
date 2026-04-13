@@ -909,10 +909,17 @@ def _screen_texts():
 
 
 # ── GuiTree Reader (for WE02, BD87 result, etc.) ──────────────────────────────
+
+# All input field types that can hold text/numbers on SAP selection screens.
+_INPUT_TYPES = ("GuiTextField", "GuiCTextField", "GuiNumericTextField",
+                "GuiPasswordField")
+
+
 def _find_input_field_by_fragment(fragment: str):
     """
     Walk the FULL GUI tree (depth 9, not limited to 50 results) and return
-    the first GuiTextField / GuiCTextField whose SAP field ID contains 'fragment'.
+    the first input field (GuiTextField / GuiCTextField / GuiNumericTextField)
+    whose SAP field ID contains 'fragment'.
     More reliable than discover_elements when the field is deep in the tree
     or beyond the 50-element cap.
     Returns (sap_object, element_id) or (None, None).
@@ -933,7 +940,7 @@ def _find_input_field_by_fragment(fragment: str):
             try:
                 child = comp.Children(i)
                 t = child.Type
-                if t in ("GuiTextField", "GuiCTextField"):
+                if t in _INPUT_TYPES:
                     try:
                         cid = child.Id
                         if fragment.upper() in cid.upper():
@@ -943,6 +950,69 @@ def _find_input_field_by_fragment(fragment: str):
                     except Exception:
                         pass
                 if t not in SKIP_TYPES:
+                    _walk(child, depth + 1)
+                    if found_obj[0]:
+                        return
+            except Exception:
+                pass
+
+    _walk(session.FindById("wnd[0]"))
+    return found_obj[0], found_id[0]
+
+
+def _find_field_by_label(label_texts: list):
+    """
+    Walk the GUI tree and find a GuiLabel whose text matches any entry in
+    label_texts, then return the NEXT sibling input field at the same level.
+
+    This is the most robust fallback for SAP selection screens because it
+    uses the visible field label ("IDoc Number", "IDoc-Nummer") rather than
+    the internal ABAP parameter name, which varies across SAP releases.
+
+    Returns (sap_object, element_id) or (None, None).
+    """
+    upper_labels = [t.upper() for t in label_texts]
+    found_obj = [None]
+    found_id  = [None]
+
+    def _walk(parent, depth=0):
+        if found_obj[0] or depth > 9:
+            return
+        try:
+            n = parent.Children.Count
+        except Exception:
+            return
+
+        # Collect children first so we can look ahead at siblings
+        kids = []
+        for i in range(n):
+            try:
+                kids.append(parent.Children(i))
+            except Exception:
+                kids.append(None)
+
+        for i, child in enumerate(kids):
+            if child is None:
+                continue
+            try:
+                if child.Type == "GuiLabel":
+                    try:
+                        ltext = child.Text.strip().upper()
+                        if any(ul in ltext or ltext in ul for ul in upper_labels
+                               if ul):
+                            # Label matched — find the next input-field sibling
+                            for j in range(i + 1, min(i + 5, len(kids))):
+                                sib = kids[j]
+                                if sib and sib.Type in _INPUT_TYPES:
+                                    found_obj[0] = sib
+                                    found_id[0]  = sib.Id
+                                    return
+                    except Exception:
+                        pass
+                # Recurse (skip heavy containers)
+                if child.Type not in {"GuiShell", "GuiTree", "GuiGridView",
+                                      "GuiTableControl", "GuiContainerShell",
+                                      "GuiSplitterContainer"}:
                     _walk(child, depth + 1)
                     if found_obj[0]:
                         return
@@ -977,7 +1047,7 @@ def _clear_selection_screen():
             try:
                 child = comp.Children(i)
                 t = child.Type
-                if t in ("GuiTextField", "GuiCTextField"):
+                if t in _INPUT_TYPES:
                     try:
                         child.Text = ""
                     except Exception:
@@ -1011,27 +1081,32 @@ def _we02_navigate_to_idoc(docnum_padded: str) -> bool:
     _clear_selection_screen()
     time.sleep(0.3)
 
-    # ── Step 3 & 4: Find DOCNUM field and set it ──────────────────────────────
+    # ── Step 3 & 4: Find DOCNUM field and set it ─────────────────────────────
+    # Three-tier strategy:
+    #   Tier 1 — hardcoded IDs (both ctxt and txt prefixes for each variant)
+    #   Tier 2 — full GUI-tree fragment scan (catches any ID containing DOCNUM)
+    #   Tier 3 — label-based search (matches "IDoc Number" / "IDoc-Nummer" label)
     set_lo = False
 
-    # Try known IDs first (fastest path — no tree walk needed)
+    # Tier 1: both ctxt (GuiCTextField) and txt (GuiTextField/GuiNumericTextField)
     known_ids = [
-        "wnd[0]/usr/ctxtS_DOCNUM-LOW",
-        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
-        "wnd[0]/usr/ctxtDOCNUM-LOW",
-        "wnd[0]/usr/ctxtDOCNUM",
-        "wnd[0]/usr/ctxtS_DOCNUM",
-        "wnd[0]/usr/ctxtSEL_DOCNUM",
+        "wnd[0]/usr/ctxtS_DOCNUM-LOW",   "wnd[0]/usr/txtS_DOCNUM-LOW",
+        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW", "wnd[0]/usr/txtSEL_DOCNUM-LOW",
+        "wnd[0]/usr/ctxtDOCNUM-LOW",     "wnd[0]/usr/txtDOCNUM-LOW",
+        "wnd[0]/usr/ctxtDOCNUM",         "wnd[0]/usr/txtDOCNUM",
+        "wnd[0]/usr/ctxtS_DOCNUM",       "wnd[0]/usr/txtS_DOCNUM",
+        "wnd[0]/usr/ctxtSEL_DOCNUM",     "wnd[0]/usr/txtSEL_DOCNUM",
     ]
+    lo_id_used = None
     for fid in known_ids:
         try:
             obj = session.FindById(fid)
             obj.Text = docnum_padded
             obj.SetFocus()
-            set_lo = True
-            # Set matching HIGH field
-            hi_fid = (fid.replace("-LOW", "-HIGH")
-                         .replace("_LOW", "_HIGH"))
+            set_lo    = True
+            lo_id_used = fid
+            # Mirror value to the HIGH field
+            hi_fid = fid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
             try:
                 session.FindById(hi_fid).Text = docnum_padded
             except Exception:
@@ -1040,32 +1115,46 @@ def _we02_navigate_to_idoc(docnum_padded: str) -> bool:
         except Exception:
             pass
 
+    # Tier 2: full-tree fragment scan (handles any ABAP parameter name variant)
     if not set_lo:
-        # Full-tree scan — finds the field regardless of exact ID
-        lo_obj, lo_id = _find_input_field_by_fragment("DOCNUM")
+        for frag in ("S_DOCNUM-LOW", "DOCNUM-LOW", "DOCNUM"):
+            lo_obj, lo_id = _find_input_field_by_fragment(frag)
+            if lo_obj:
+                try:
+                    lo_obj.Text = docnum_padded
+                    lo_obj.SetFocus()
+                    set_lo     = True
+                    lo_id_used = lo_id
+                    hi_id = lo_id.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
+                    if hi_id != lo_id:
+                        try:
+                            session.FindById(hi_id).Text = docnum_padded
+                        except Exception:
+                            pass
+                    else:
+                        for hfrag in ("DOCNUM-HIGH", "DOCNUM_HIGH"):
+                            hi_obj, _ = _find_input_field_by_fragment(hfrag)
+                            if hi_obj:
+                                try:
+                                    hi_obj.Text = docnum_padded
+                                except Exception:
+                                    pass
+                                break
+                except Exception:
+                    pass
+                break
+
+    # Tier 3: label-based search — finds field next to "IDoc Number" label
+    if not set_lo:
+        lo_obj, lo_id = _find_field_by_label(
+            ["IDoc Number", "IDoc-Nummer", "IDoc Nummer", "IDOC Number",
+             "Doc.Number", "Document Number"])
         if lo_obj:
             try:
                 lo_obj.Text = docnum_padded
                 lo_obj.SetFocus()
-                set_lo = True
-                # Try to find and set the HIGH field
-                hi_id = (lo_id.replace("-LOW", "-HIGH")
-                              .replace("_LOW", "_HIGH"))
-                if hi_id != lo_id:
-                    try:
-                        session.FindById(hi_id).Text = docnum_padded
-                    except Exception:
-                        pass
-                else:
-                    # Try to find any sibling HIGH field
-                    hi_obj, _ = _find_input_field_by_fragment("DOCNUM-HIGH")
-                    if not hi_obj:
-                        hi_obj, _ = _find_input_field_by_fragment("DOCNUM_HIGH")
-                    if hi_obj:
-                        try:
-                            hi_obj.Text = docnum_padded
-                        except Exception:
-                            pass
+                set_lo     = True
+                lo_id_used = lo_id
             except Exception:
                 pass
 
@@ -1839,10 +1928,12 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
     """
     today = datetime.now().strftime("%d.%m.%Y")
 
-    # When a specific IDoc number is given, use a wide date range so the IDoc
-    # is never excluded by date filter regardless of when it was created.
+    # When a specific IDoc number is given, use Jan 1 of last year as the start
+    # date so IDocs created anytime in the past year are always included,
+    # regardless of when they were created.
+    last_year = datetime.now().year - 1
     if idoc_number:
-        df = date_from or "01.01.2020"
+        df = date_from or f"01.01.{last_year}"
         dt = date_to   or today
     else:
         df = date_from or today
@@ -1891,35 +1982,49 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
     # ── Set DOCNUM filter when a specific IDoc number is requested ────────────
     if docnum_padded:
         docnum_set = False
-        for fid in ("wnd[0]/usr/ctxtS_DOCNUM-LOW",
-                    "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
-                    "wnd[0]/usr/ctxtDOCNUM-LOW"):
+
+        # Tier 1: both ctxt and txt variants
+        for fid in (
+            "wnd[0]/usr/ctxtS_DOCNUM-LOW",   "wnd[0]/usr/txtS_DOCNUM-LOW",
+            "wnd[0]/usr/ctxtSEL_DOCNUM-LOW", "wnd[0]/usr/txtSEL_DOCNUM-LOW",
+            "wnd[0]/usr/ctxtDOCNUM-LOW",     "wnd[0]/usr/txtDOCNUM-LOW",
+            "wnd[0]/usr/ctxtDOCNUM",         "wnd[0]/usr/txtDOCNUM",
+        ):
             try:
                 session.FindById(fid).Text = docnum_padded
                 docnum_set = True
+                # Mirror to HIGH
+                hi = fid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
+                try: session.FindById(hi).Text = docnum_padded
+                except Exception: pass
                 break
             except Exception:
                 pass
+
+        # Tier 2: fragment scan
         if not docnum_set:
-            obj, oid = _find_input_field_by_fragment("S_DOCNUM-LOW")
-            if not obj:
-                obj, oid = _find_input_field_by_fragment("DOCNUM-LOW")
-            if not obj:
-                obj, oid = _find_input_field_by_fragment("DOCNUM")
+            for frag in ("S_DOCNUM-LOW", "DOCNUM-LOW", "DOCNUM"):
+                obj, oid = _find_input_field_by_fragment(frag)
+                if obj:
+                    try:
+                        obj.Text = docnum_padded
+                        docnum_set = True
+                        hi = oid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
+                        if hi != oid:
+                            try: session.FindById(hi).Text = docnum_padded
+                            except Exception: pass
+                    except Exception:
+                        pass
+                    break
+
+        # Tier 3: label-based search
+        if not docnum_set:
+            obj, _ = _find_field_by_label(
+                ["IDoc Number", "IDoc-Nummer", "IDoc Nummer", "Doc.Number"])
             if obj:
                 try:
                     obj.Text = docnum_padded
                     docnum_set = True
-                except Exception:
-                    pass
-        # Set HIGH field = same value so range == exactly this IDoc
-        if docnum_set:
-            for fid in ("wnd[0]/usr/ctxtS_DOCNUM-HIGH",
-                        "wnd[0]/usr/ctxtSEL_DOCNUM-HIGH",
-                        "wnd[0]/usr/ctxtDOCNUM-HIGH"):
-                try:
-                    session.FindById(fid).Text = docnum_padded
-                    break
                 except Exception:
                     pass
 
@@ -2765,44 +2870,51 @@ def _we09_navigate_to_idoc(idoc_number) -> dict:
     _clear_selection_screen()
     time.sleep(0.3)
 
-    # Set DOCNUM LOW field
+    # Set DOCNUM field — same three-tier strategy as WE02/WE05
     docnum_set = False
-    known_ids = [
-        "wnd[0]/usr/ctxtS_DOCNUM-LOW",
-        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
-        "wnd[0]/usr/ctxtDOCNUM-LOW",
-        "wnd[0]/usr/ctxtDOCNUM",
-        "wnd[0]/usr/ctxtS_DOCNUM",
-    ]
-    for fid in known_ids:
+
+    # Tier 1: ctxt + txt variants
+    for fid in (
+        "wnd[0]/usr/ctxtS_DOCNUM-LOW",   "wnd[0]/usr/txtS_DOCNUM-LOW",
+        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW", "wnd[0]/usr/txtSEL_DOCNUM-LOW",
+        "wnd[0]/usr/ctxtDOCNUM-LOW",     "wnd[0]/usr/txtDOCNUM-LOW",
+        "wnd[0]/usr/ctxtDOCNUM",         "wnd[0]/usr/txtDOCNUM",
+        "wnd[0]/usr/ctxtS_DOCNUM",       "wnd[0]/usr/txtS_DOCNUM",
+    ):
         try:
             session.FindById(fid).Text = docnum_padded
             docnum_set = True
-            hi_fid = fid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
-            try:
-                session.FindById(hi_fid).Text = docnum_padded
-            except Exception:
-                pass
+            hi = fid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
+            try: session.FindById(hi).Text = docnum_padded
+            except Exception: pass
             break
         except Exception:
             pass
 
+    # Tier 2: fragment scan
     if not docnum_set:
-        obj, oid = _find_input_field_by_fragment("S_DOCNUM-LOW")
-        if not obj:
-            obj, oid = _find_input_field_by_fragment("DOCNUM-LOW")
-        if not obj:
-            obj, oid = _find_input_field_by_fragment("DOCNUM")
+        for frag in ("S_DOCNUM-LOW", "DOCNUM-LOW", "DOCNUM"):
+            obj, oid = _find_input_field_by_fragment(frag)
+            if obj:
+                try:
+                    obj.Text = docnum_padded
+                    docnum_set = True
+                    hi = oid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
+                    if hi != oid:
+                        try: session.FindById(hi).Text = docnum_padded
+                        except Exception: pass
+                except Exception:
+                    pass
+                break
+
+    # Tier 3: label-based search
+    if not docnum_set:
+        obj, _ = _find_field_by_label(
+            ["IDoc Number", "IDoc-Nummer", "IDoc Nummer", "Doc.Number"])
         if obj:
             try:
                 obj.Text = docnum_padded
                 docnum_set = True
-                hi_id = oid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
-                if hi_id != oid:
-                    try:
-                        session.FindById(hi_id).Text = docnum_padded
-                    except Exception:
-                        pass
             except Exception:
                 pass
 
@@ -2848,12 +2960,13 @@ def bd87_select_and_reprocess(idoc_numbers=None, message_type="",
                   DOCNUM range (min to max).  Pass None to process all
                   IDocs matching date / message_type.
     """
-    today = datetime.now().strftime("%d.%m.%Y")
-    # When specific IDoc numbers are given, use a wide date range (01.01.2020→today)
-    # so IDocs created on any date are included. The DOCNUM filter makes the date
-    # range effectively irrelevant, but BD87 still requires non-empty date fields.
+    today     = datetime.now().strftime("%d.%m.%Y")
+    last_year = datetime.now().year - 1
+    # When specific IDoc numbers are given, use Jan 1 of last year as start date
+    # so IDocs created anytime in the past year are included. DOCNUM filter
+    # makes the date range irrelevant, but BD87 requires non-empty date fields.
     if idoc_numbers:
-        df = date_from or "01.01.2020"
+        df = date_from or f"01.01.{last_year}"
         dt = date_to   or today
     else:
         df = date_from or today
