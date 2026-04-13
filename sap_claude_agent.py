@@ -1548,105 +1548,175 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
 
 def get_idoc_detail(idoc_number):
     """
-    Display a specific IDoc in WE02 and extract:
-    - Control record (partner, message type, status, direction)
-    - ALL status records with timestamps and error text
-    - ALL segment data (key fields from each segment)
-    Returns structured dict for root cause analysis.
+    Get full detail for a specific IDoc.
+    Strategy:
+      1. Navigate WE02 and try all known container IDs + full UI walk.
+      2. Fall back to reading EDIDS (status records) + EDIDC (control record)
+         tables directly via SE16N — most reliable, always has error text.
+      3. Always return screen_texts so Claude can see the full picture.
     """
+    docnum = str(idoc_number).zfill(16)
+    detail = {
+        "idoc_number": str(idoc_number),
+        "status_records":  [],
+        "segments":        [],
+        "error_messages":  [],
+        "control_record":  {},
+        "fix_hints":       [],
+    }
+
+    # ── Strategy 1: Navigate WE02 and read the screen ─────────────────────────
     go_to_transaction("WE02")
-    time.sleep(1)
+    time.sleep(1.5)
+
+    for fid in ("wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
+                "wnd[0]/usr/ctxtDOCNUM",
+                "wnd[0]/usr/ctxtSEL_DOCNUM"):
+        try: session.FindById(fid).Text = docnum; break
+        except Exception: pass
+
+    session.FindById("wnd[0]").SendVKey(8)
+    time.sleep(2.5)
+    detail["screen"] = get_screen_text()
+
+    # Try ALV/tree shell
+    shell = _find_shell_anywhere([
+        "wnd[0]/usr/cntlWE02_CONTAINER/shellcont/shell",
+        "wnd[0]/usr/cntlGRID1/shellcont/shell",
+        "wnd[0]/usr/cntlGRID/shellcont/shell",
+        "wnd[0]/usr/cntlTREE/shellcont/shell",
+    ])
+    if shell:
+        rows_data = _read_shell_rows(
+            shell,
+            ["DOCNUM","STATUS","LOGDAT","LOGTIM","STAMQU","STATXT","SEGNAM"],
+            max_rows=300
+        )
+        for row in rows_data:
+            if row.get("STATXT"):
+                detail["status_records"].append(row)
+                txt = row.get("STATXT","").lower()
+                if any(e in txt for e in ["error","fehler","not found",
+                                           "nicht","invalid","missing"]):
+                    detail["error_messages"].append(row["STATXT"])
+            if row.get("SEGNAM"):
+                detail["segments"].append(row)
+
+    # Screen text walk (catches classic list / tree labels)
+    screen_txts = _screen_texts()
+    detail["all_screen_text"] = "\n".join(screen_txts[:200])
+
+    # ── Strategy 2: Read EDIDS table (IDoc status records) via SE16N ──────────
+    # Always do this — EDIDS has the exact error text regardless of GUI state
     try:
-        # Enter IDoc number
-        for fid in ("wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
-                    "wnd[0]/usr/ctxtDOCNUM"):
-            try:
-                session.FindById(fid).Text = str(idoc_number).zfill(16)
-                break
-            except Exception:
-                pass
-        session.FindById("wnd[0]").SendVKey(8)   # Execute
+        go_to_transaction("SE16N")
+        time.sleep(1)
+        for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
+            try: session.FindById(fid).Text = "EDIDS"; break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+
+        elems = discover_elements()
+        for e in elems:
+            eid = e.get("id","").upper()
+            if "DOCNUM" in eid and "LOW" in eid:
+                try: session.FindById(e["id"]).Text = docnum; break
+                except Exception: pass
+        for e in elems:
+            eid = e.get("id","").upper()
+            if "DOCNUM" in eid and "HIGH" in eid:
+                try: session.FindById(e["id"]).Text = docnum; break
+                except Exception: pass
+
+        for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
+            try: session.FindById(fid).Text = "500"; break
+            except Exception: pass
+
+        session.FindById("wnd[0]").SendVKey(8)
         time.sleep(2)
 
-        detail = {
-            "idoc_number": str(idoc_number),
-            "status_records": [],
-            "segments": [],
-            "error_messages": [],
-            "screen": get_screen_text(),
-        }
-
-        # Try to read tree/ALV structure
-        try:
-            shell = _find_shell_anywhere([
-                "wnd[0]/usr/cntlWE02_CONTAINER/shellcont/shell",
-                "wnd[0]/usr/cntlGRID1/shellcont/shell",
-                "wnd[0]/usr/cntlGRID/shellcont/shell",
-            ])
-            if shell:
-                rows = shell.RowCount
-                for i in range(min(rows, 300)):
-                    row = {}
-                    for col in ["DOCNUM","STATUS","LOGDAT","LOGTIM",
-                                "STAMQU","STATXT","SEGNAM","HLEVEL",
-                                "DTINT2"]:
-                        try:
-                            row[col] = shell.GetCellValue(i, col)
-                        except Exception:
-                            pass
-                    if row.get("STATXT"):
-                        detail["status_records"].append(row)
-                        txt = row.get("STATXT","").lower()
-                        if any(e in txt for e in ["error","fehler","not found",
-                                                   "nicht","invalid","missing"]):
+        edids_shell = _find_shell_anywhere([
+            "wnd[0]/usr/cntlGRID1/shellcont/shell",
+            "wnd[0]/usr/cntlGRID/shellcont/shell",
+        ])
+        if edids_shell:
+            edids_rows = _read_shell_rows(
+                edids_shell,
+                ["DOCNUM","STATUS","LOGDAT","LOGTIM","STAMQU","STATXT",
+                 "UNAME","REPID","STAPA1","STAPA2"],
+                max_rows=300
+            )
+            for row in edids_rows:
+                if row.get("STATXT"):
+                    detail["status_records"].append(row)
+                    txt = row.get("STATXT","").lower()
+                    if any(e in txt for e in ["error","fehler","not found",
+                                               "nicht","invalid","missing",
+                                               "exception","fail","cannot"]):
+                        if row["STATXT"] not in detail["error_messages"]:
                             detail["error_messages"].append(row["STATXT"])
-                    if row.get("SEGNAM"):
-                        detail["segments"].append(row)
-        except Exception:
-            pass
+            detail["edids_source"] = f"{len(edids_rows)} status records from EDIDS table"
+    except Exception as edids_err:
+        detail["edids_error"] = str(edids_err)
 
-        # Also walk all text elements for any missed error text
-        texts = []
-        def walk_t(comp, depth=0):
-            if depth > 8:
-                return
-            try:
-                n = comp.Children.Count
-            except Exception:
-                return
-            for i in range(n):
-                try:
-                    child = comp.Children(i)
-                    if child.Type in ("GuiTextField","GuiCTextField","GuiLabel"):
-                        try:
-                            t = child.Text.strip()
-                            if t and len(t) > 5:
-                                texts.append(t)
-                        except Exception:
-                            pass
-                    walk_t(child, depth + 1)
-                except Exception:
-                    pass
-        walk_t(session.FindById("wnd[0]"))
-        detail["all_screen_text"] = "\n".join(texts[:200])
+    # ── Strategy 3: Read EDIDC (control record) ───────────────────────────────
+    try:
+        go_to_transaction("SE16N")
+        time.sleep(1)
+        for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
+            try: session.FindById(fid).Text = "EDIDC"; break
+            except Exception: pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
 
-        # Determine fix hint from error messages
-        fix_hints = []
-        combined_error = " ".join(detail["error_messages"]).lower()
-        combined_error += " " + detail["all_screen_text"].lower()
-        for pattern, (fix_action, risk) in IDOC_FIX_MAP.items():
-            if pattern in combined_error:
-                fix_hints.append({
-                    "pattern":    pattern,
-                    "fix_action": fix_action,
-                    "risk":       risk,
-                })
-        detail["fix_hints"] = fix_hints
+        elems = discover_elements()
+        for e in elems:
+            eid = e.get("id","").upper()
+            if "DOCNUM" in eid and "LOW" in eid:
+                try: session.FindById(e["id"]).Text = docnum; break
+                except Exception: pass
+        for e in elems:
+            eid = e.get("id","").upper()
+            if "DOCNUM" in eid and "HIGH" in eid:
+                try: session.FindById(e["id"]).Text = docnum; break
+                except Exception: pass
 
-        return detail
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
 
-    except Exception as e:
-        return {"error": str(e), "idoc_number": str(idoc_number)}
+        edidc_shell = _find_shell_anywhere([
+            "wnd[0]/usr/cntlGRID1/shellcont/shell",
+            "wnd[0]/usr/cntlGRID/shellcont/shell",
+        ])
+        if edidc_shell:
+            ctrl_rows = _read_shell_rows(
+                edidc_shell,
+                ["DOCNUM","STATUS","DIRECT","MESTYP","MESCOD","MESFCT",
+                 "SNDPRT","SNDPRN","RCVPRT","RCVPRN","CREDAT","CRETIM",
+                 "UPDDAT","UPDTIM","REFMES","ARCKEY"],
+                max_rows=5
+            )
+            if ctrl_rows:
+                detail["control_record"] = ctrl_rows[0]
+                detail["status_desc"] = IDOC_STATUS.get(
+                    ctrl_rows[0].get("STATUS",""), "Unknown")
+    except Exception:
+        pass
+
+    # ── Build fix_hints from all collected error text ─────────────────────────
+    combined = (" ".join(detail["error_messages"]) + " " +
+                detail["all_screen_text"]).lower()
+    detail["fix_hints"] = [
+        {"pattern": pat, "fix_action": fa, "risk": risk}
+        for pat, (fa, risk) in IDOC_FIX_MAP.items()
+        if pat in combined
+    ]
+    if not detail["fix_hints"] and detail["status_records"]:
+        detail["fix_hints"] = [{"note": "No known pattern matched. "
+                                         "Review status_records for manual diagnosis."}]
+
+    return detail
 
 
 def get_idoc_segments(idoc_number):
@@ -1773,19 +1843,65 @@ def check_partner_profile(partner_number, direction="1", message_type=""):
     go_to_transaction("WE20")
     time.sleep(1.5)
     try:
-        # Try to search for the partner
-        for fid in ("wnd[0]/usr/ctxtWE20-PARNR",
-                    "wnd[0]/usr/ctxtPARTNER_NO"):
+        elems = discover_elements()
+
+        # Fill the partner number field using whatever ID is on screen
+        parnr_ids = [
+            "wnd[0]/usr/ctxtWE20-PARNR",
+            "wnd[0]/usr/ctxtPARTNER_NO",
+        ]
+        filled = False
+        for fid in parnr_ids:
             try:
                 session.FindById(fid).Text = str(partner_number)
+                filled = True
                 break
             except Exception:
                 pass
-        session.FindById("wnd[0]").SendVKey(8)
-        time.sleep(1.5)
-        return {"partner": str(partner_number),
-                "screen":  get_screen_text(),
-                "elements": discover_elements()[:40]}
+
+        if not filled:
+            # Fallback: find any ctxt/txt field whose ID contains PARNR or PARTNER
+            for e in elems:
+                eid = e.get("id", "").upper()
+                if any(k in eid for k in ("PARNR", "PARTNER")) and e.get("type") in ("GuiCTextField", "GuiTextField"):
+                    try:
+                        session.FindById(e["id"]).Text = str(partner_number)
+                        filled = True
+                        break
+                    except Exception:
+                        pass
+
+        # Execute the search — try F8, then Enter, then toolbar Execute button
+        executed = False
+        for vkey in (8, 0):
+            try:
+                session.FindById("wnd[0]").SendVKey(vkey)
+                time.sleep(1.5)
+                executed = True
+                break
+            except Exception:
+                pass
+        if not executed:
+            # Try toolbar execute button
+            for btn in ("wnd[0]/tbar[1]/btn[8]", "wnd[0]/tbar[0]/btn[0]"):
+                try:
+                    session.FindById(btn).Press()
+                    time.sleep(1.5)
+                    break
+                except Exception:
+                    pass
+
+        screen = get_screen_text()
+        exists = (str(partner_number) in screen or
+                  "partner" in screen.lower())
+
+        return {
+            "partner":  str(partner_number),
+            "exists":   exists,
+            "direction": direction,
+            "screen":   screen,
+            "elements": discover_elements()[:40],
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -6620,6 +6736,62 @@ IDOC STATUS CODE QUICK REFERENCE:
   64=Ready      65=ALE error   68=No further   71=Edited copy
 
 ═══════════════════════════════════════════════════════════
+ AUTONOMY — LOOK IT UP, NEVER ASK THE USER
+═══════════════════════════════════════════════════════════
+You have FULL READ access to all SAP tables. USE IT.
+The ONLY question you may ask the user is approval [A/R] before
+writing or changing data. For all other information, look it up:
+
+PARTNER TYPE (when creating a partner profile):
+  1. read_sap_table("LFB1", where="LIFNR EQ 'SP810'") → rows exist → type=LI (Vendor)
+  2. read_sap_table("KNB1", where="KUNNR EQ 'SP810'") → rows exist → type=KU (Customer)
+  3. read_sap_table("TBDLS", where="LOGSYS EQ 'SP810'") → rows → type=LS (Logical System)
+  4. Fallback: check the partner number prefix/format and assume LS if none found.
+
+MESSAGE TYPE (for IDocs):
+  Already in scan_idoc_errors results (MESTYP column).
+  Or: read_sap_table("EDIDC", where="DOCNUM EQ '0000000000198021'") → MESTYP field.
+
+DIRECTION (1=Inbound, 2=Outbound):
+  Already in scan_idoc_errors results (DIRECT column).
+  1 = SAP is the RECEIVER (inbound)
+  2 = SAP is the SENDER (outbound)
+  If IDoc has status 51/56/26 it is always INBOUND (direction=1).
+
+PROCESS CODE — standard mappings (use these automatically):
+  ORDERS / ORDERS05    → ORDE
+  DESADV / DELVRY      → DELS
+  INVOIC / INVOIC01    → INVL
+  MATMAS               → MATM
+  DEBMAS               → DEBM
+  CREMAS               → CREM
+  PORDCR / PORDCH      → PORD
+  SHPORD               → SHPORD
+  WMMBID               → WMMBID
+  Unknown              → use same name as message type (uppercase)
+
+DATE DEFAULTS (never ask, use these):
+  "today"     → datetime.now() in DD.MM.YYYY format
+  "this week" → Monday of current week to today
+  "this month"→ first of current month to today
+  "recent"    → last 7 days
+
+OTHER LOOKUPS (use read_sap_table):
+  Vendor exists?      → LFA1 where LIFNR EQ 'x'
+  Customer exists?    → KNA1 where KUNNR EQ 'x'
+  Material exists?    → MARA where MATNR EQ 'x'
+  Company code valid? → T001 where BUKRS EQ 'x'
+  GL account exists?  → SKA1 where KTOPL EQ 'CAUS' AND SAKNR EQ 'x'
+  Posting period open?→ T001B where BUKRS EQ 'x'
+
+WHEN A TOOL RETURNS AN ERROR:
+  • Analyse the error text — do NOT ask the user what to do.
+  • Try an alternative approach (different field ID, different tcode).
+  • If the virtual key error occurs, try SendVKey(0) instead of (8), or use
+    go_to_transaction to re-navigate, then discover_screen_elements.
+  • Only escalate to the user if you have exhausted all alternatives.
+
+═══════════════════════════════════════════════════════════
  RULES
 ═══════════════════════════════════════════════════════════
 • ALWAYS discover_screen_elements after every navigation.
@@ -6638,9 +6810,22 @@ IDOC STATUS CODE QUICK REFERENCE:
 """
 
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
-def run_agent(user_query, api_key):
-    client   = anthropic.Anthropic(api_key=api_key)
-    messages = [{"role": "user", "content": user_query}]
+def run_agent(user_query, api_key, messages=None):
+    """
+    Run the ARTILEGENZ agent.
+
+    Pass messages=None to start a fresh conversation.
+    Pass an existing messages list to continue (e.g. after user approves [A/R]).
+    Returns (messages, last_text) so the caller can resume the conversation.
+    """
+    client    = anthropic.Anthropic(api_key=api_key)
+    last_text = ""
+
+    if messages is None:
+        messages = [{"role": "user", "content": user_query}]
+    else:
+        # Append the user's reply (approval / follow-up) to the existing thread
+        messages = list(messages) + [{"role": "user", "content": user_query}]
 
     print("\nARTILEGENZ agent running...\n")
 
@@ -6653,9 +6838,10 @@ def run_agent(user_query, api_key):
             messages=messages,
         )
 
-        # Show narrative text
+        # Show narrative text and capture last assistant text for continuity detection
         for block in response.content:
             if hasattr(block, "text") and block.text.strip():
+                last_text = block.text
                 print(f"\n[Claude]\n{block.text}")
 
         if response.stop_reason == "end_turn":
@@ -6690,9 +6876,14 @@ def run_agent(user_query, api_key):
         else:
             break
 
+    # Append the final assistant turn to messages so the caller has full context
+    if response.stop_reason == "end_turn":
+        messages.append({"role": "assistant", "content": response.content})
+
     # ── Save session report ────────────────────────────────────────────────────
-    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
-    slug  = user_query[:40].replace(" ", "_").replace("/", "-")
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = (user_query if isinstance(user_query, str) else "continuation")
+    slug = slug[:40].replace(" ", "_").replace("/", "-")
     rpath = os.path.join(LOG_DIR, f"SAP_Session_{slug}_{ts}.txt")
     with open(rpath, "w", encoding="utf-8") as f:
         f.write(f"Query : {user_query}\n")
@@ -6712,6 +6903,7 @@ def run_agent(user_query, api_key):
 
     print(f"\nSession saved  → {rpath}")
     print(f"Audit log      → {LOG_DIR}")
+    return messages, last_text
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -6764,8 +6956,40 @@ if __name__ == "__main__":
     print('  "Create the full IDES org structure with transports"')
     print('  "Show all sales orders from January 2025"')
 
+    # ── Conversation continuity state ─────────────────────────────────────────
+    # When Claude ends a turn with an [A/R] approval prompt we save the current
+    # messages and resume the SAME conversation when the user types A/R/yes/no.
+    APPROVAL_TRIGGERS = ["[a/r]", "approve?", "a/r", "approve or reject",
+                         "do you approve", "shall i proceed", "confirm?"]
+    APPROVAL_TOKENS   = {"A", "R", "YES", "NO", "Y", "N",
+                         "APPROVE", "REJECT", "APPROVED", "REJECTED"}
+
+    pending_messages = None   # holds thread when waiting for approval
+    last_text        = ""     # last assistant message text
+
     while True:
         query = input("\nQuery (or exit): ").strip()
         if query.lower() in ("exit", "quit", "q", ""):
             break
-        run_agent(query, API_KEY)
+
+        # Detect approval response: pending conversation + last msg had [A/R] +
+        # user typed an approval token (optionally with trailing punctuation)
+        is_approval = (
+            pending_messages is not None
+            and any(t in last_text.lower() for t in APPROVAL_TRIGGERS)
+            and query.upper().rstrip(".,!") in APPROVAL_TOKENS
+        )
+
+        if is_approval:
+            print(f"\n[Resuming conversation — user response: {query}]")
+            pending_messages, last_text = run_agent(
+                query, API_KEY, messages=pending_messages
+            )
+        else:
+            # Fresh query — discard any stale pending conversation
+            pending_messages, last_text = run_agent(query, API_KEY)
+
+        # Keep pending_messages alive as long as the last response still
+        # ends with an approval request (multi-step fix workflows).
+        if not any(t in last_text.lower() for t in APPROVAL_TRIGGERS):
+            pending_messages = None
