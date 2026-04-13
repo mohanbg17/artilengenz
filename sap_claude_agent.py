@@ -1,5 +1,5 @@
 """
-ARTILEGENZ SAP Claude Agent v12.0
+ARTILEGENZ SAP Claude Agent v14.0
 Authorization: SAP_ALL + SAP_NEW (full system access confirmed via SU01)
 User: S4ABAP24
 
@@ -4936,6 +4936,72 @@ def get_document_flow(sales_order):
         return {"error": str(e)}
     return {"order": sales_order, "screen": get_screen_text()}
 
+
+def wait_for_user_input(screen_name, instructions, fields=None):
+    """
+    Pause automation and hand off to the user for manual SAP screen input.
+    Prints the screen name, what fields to fill, and their values.
+    Waits for the user to type 'done' (or similar) before continuing.
+    Returns the current SAP screen state so the agent can continue.
+    """
+    print("\n" + "═" * 68)
+    print("  MANUAL INPUT REQUIRED")
+    print("═" * 68)
+    print(f"  Screen : {screen_name}")
+    print(f"  Action : {instructions}")
+    if fields:
+        print("\n  Fields to fill:")
+        for fld in (fields if isinstance(fields, list) else []):
+            name  = fld.get("name", "")  if isinstance(fld, dict) else str(fld)
+            value = fld.get("value", "") if isinstance(fld, dict) else ""
+            note  = fld.get("note", "")  if isinstance(fld, dict) else ""
+            suffix = f"  ({note})" if note else ""
+            print(f"    • {name}: {value}{suffix}")
+    print("\n  Fill these fields in SAP now, then type 'done' to continue.")
+    print("  Type 'skip' to skip this step, 'abort' to stop the agent.")
+    print("─" * 68)
+
+    while True:
+        try:
+            response = input("  [done / skip / abort]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  [Interrupted — aborting manual input step]")
+            return {"status": "aborted", "screen": get_screen_text(),
+                    "note": "User interrupted manual input."}
+
+        if response in ("done", "ok", "yes", "continue", "proceed",
+                        "d", "y", "go", ""):
+            screen = get_screen_text()
+            texts  = _screen_texts()
+            audit_log("MANUAL_INPUT",
+                      {"screen": screen_name, "instructions": instructions},
+                      status="completed", approved_by=CURRENT_USER)
+            return {
+                "status":       "user_completed",
+                "screen":       screen,
+                "screen_texts": texts[:30],
+                "note": "User confirmed manual input complete — agent continuing.",
+            }
+
+        elif response in ("skip", "s"):
+            audit_log("MANUAL_INPUT",
+                      {"screen": screen_name, "instructions": instructions},
+                      status="skipped", approved_by=CURRENT_USER)
+            return {"status": "skipped",
+                    "note": "User chose to skip this step."}
+
+        elif response in ("abort", "stop", "exit", "quit"):
+            audit_log("MANUAL_INPUT",
+                      {"screen": screen_name, "instructions": instructions},
+                      status="aborted", approved_by=CURRENT_USER)
+            return {"status": "aborted",
+                    "note": "User aborted the manual input step."}
+
+        else:
+            print("  Type 'done' when fields are filled, 'skip' to skip, "
+                  "'abort' to stop.")
+
+
 # ── Tool Definitions for Claude ────────────────────────────────────────────────
 TOOLS = [
     # ── READ ────────────────────────────────────────────────────────────────────
@@ -6490,6 +6556,58 @@ TOOLS = [
             "required": [],
         },
     },
+
+    # ── MANUAL INPUT HANDOFF ──────────────────────────────────────────────────
+    {
+        "name": "wait_for_user_input",
+        "description": (
+            "PAUSE automation and hand off to the user for manual SAP screen input. "
+            "Call this when you reach a SAP screen you CANNOT fill automatically after "
+            "2 failed attempts (e.g. OX02/OX10 New Entries, SPRO config screens, "
+            "complex F4 search dialogs). "
+            "Prints the screen name and field instructions on the console. "
+            "Waits for user to type 'done'. Then reads and returns the current screen state "
+            "so the agent can continue. "
+            "DO NOT loop endlessly trying the same field IDs — call this tool instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "screen_name": {
+                    "type": "string",
+                    "description": (
+                        "Name of the SAP screen / transaction currently open, "
+                        "e.g. 'OX02 New Entries: Company Code Detail'"
+                    ),
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": (
+                        "Plain-language instructions for the user. "
+                        "State which fields to fill and with what values, "
+                        "e.g. 'Enter Company Code=1000, Name=SAP IDES DE, "
+                        "Country=DE, Currency=EUR, then press Save (Ctrl+S).'"
+                    ),
+                },
+                "fields": {
+                    "type": "array",
+                    "description": "Optional structured list of fields to fill.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name":  {"type": "string",
+                                      "description": "SAP field label or name"},
+                            "value": {"type": "string",
+                                      "description": "Value to enter"},
+                            "note":  {"type": "string",
+                                      "description": "Optional hint or explanation"},
+                        },
+                    },
+                },
+            },
+            "required": ["screen_name", "instructions"],
+        },
+    },
 ]
 
 # ── IRREVERSIBLE operations — the ONLY ones that still confirm ────────────────
@@ -6936,6 +7054,14 @@ def dispatch(tool_name, tool_input):
             tool_input.get("company_code", "1000"),
             tool_input.get("date_from"),
             tool_input.get("date_to"),
+        )
+
+    # ── Manual input handoff ───────────────────────────────────────────────────
+    if tool_name == "wait_for_user_input":
+        return wait_for_user_input(
+            tool_input["screen_name"],
+            tool_input["instructions"],
+            tool_input.get("fields"),
         )
 
     return {"error": f"Unknown tool: {tool_name}"}
@@ -7610,13 +7736,71 @@ for operations that do NOT have a dedicated high-level tool.
 • Always show the user what changed in the code before uploading.
 • If source download fails, tell the user the program name so
   they can paste it manually.
+
+═══════════════════════════════════════════════════════════
+ MANUAL INPUT MODE — when to hand off to the user
+═══════════════════════════════════════════════════════════
+Some SAP configuration screens cannot be automated reliably
+(complex New Entries dialogs, SPRO IMG screens, etc.).
+When you are stuck on such a screen, hand off to the user
+instead of looping:
+
+TRIGGER: call wait_for_user_input when ANY of these occur:
+  1. set_field_value fails with "control not found" TWICE for the same screen.
+  2. discover_screen_elements returns fields but none match the needed field name.
+  3. You are on a config New-Entries screen (OX02, OX10, OX15, OKKP, etc.)
+     and cannot identify the correct field IDs after 2 attempts.
+  4. A screen requires a complex F4 search/popup that cannot be scripted.
+
+HOW TO USE wait_for_user_input:
+  1. Call wait_for_user_input(screen_name, instructions, fields=[...])
+     • screen_name: current TCode + screen title, e.g. "OX02 New Entries"
+     • instructions: exactly what the user must enter, e.g.
+       "Enter: Company Code=1000, Name=SAP IDES DE, Country=DE, Currency=EUR.
+        Then press Save (Ctrl+S) and click Local Object if a transport popup appears."
+     • fields: list of {name, value, note} for clear field-by-field guidance
+  2. The tool pauses and prompts the user in the console.
+  3. User fills the screen in SAP, then types 'done'.
+  4. Tool returns screen state — continue with the next step.
+
+AFTER wait_for_user_input returns:
+  • Call discover_screen_elements or read_screen to confirm the screen state.
+  • Continue to the next automation step (next object to create, etc.).
+  • Do NOT re-attempt what the user just did manually.
+
+NEVER loop more than 2 times on the same failed screen. Hand off to user.
+
+═══════════════════════════════════════════════════════════
+ CONCISE OUTPUT — keep responses brief
+═══════════════════════════════════════════════════════════
+Write SHORT responses. No verbose narration or multi-paragraph explanations.
+Format:
+  • One line per action: what you are doing and why (7-10 words max).
+  • One line per result: key outcome only.
+  • At the end: a brief summary table or bullet list.
+
+Good example:
+  Scanning IDoc errors (today)...
+  → 3 errors: IDocs 198021, 198022, 198025 (status 51)
+  Getting detail for 198021...
+  → Missing partner profile SP810 (type LI)
+  Creating partner profile...
+  → Created. Reprocessing IDoc...
+  → Status: 53 (Posted OK)
+  [repeat for next IDoc]
+  Summary: 3/3 IDocs fixed.
+
+BAD (do not do this):
+  "I will now proceed to investigate the first IDoc by calling get_idoc_detail
+   to understand the root cause of the error, after which I will determine the
+   appropriate fix strategy based on the error message returned..."
 """
 
 # ── Token / Rate-Limit Management ──────────────────────────────────────────────
 
 # Maximum chars stored per tool result in the messages list.
 # Full output is still printed to console; only the stored copy is capped.
-_TOOL_RESULT_CAP = 1500
+_TOOL_RESULT_CAP = 800
 
 # When the messages list grows past this many entries, compress older exchanges.
 # Each tool call = 2 entries (assistant + user/tool_result), so 40 = ~20 calls.
@@ -7943,7 +8127,7 @@ if __name__ == "__main__":
         API_KEY = input("Anthropic API key: ").strip()
 
     print("\n" + "═" * 68)
-    print("  ARTILEGENZ SAP Agent v13.0  —  User: S4ABAP24  [SAP_ALL]")
+    print("  ARTILEGENZ SAP Agent v14.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Mode: AUTONOMOUS AUTO-FIX  —  Full System Access")
     print("  NLP input parsing active — type naturally.")
     print("═" * 68)
