@@ -934,49 +934,94 @@ def _find_gui_tree_anywhere():
     return found[0]
 
 
-def _read_gui_tree_texts(tree_obj, max_nodes=300):
+def _read_gui_tree_texts(tree_obj, max_nodes=400):
     """
-    Read all visible node texts from a GuiTree control.
-    Expands the full sub-tree first so all children are accessible.
-    Returns a flat list of text strings (preserving order top-to-bottom).
+    Read ALL node texts from a WE02-style GuiTree.
+    Handles both single-column and multi-column trees.
+    Returns flat list of non-empty text strings.
     """
     texts = []
     if tree_obj is None:
         return texts
     try:
-        # Expand the whole tree so all nodes are present
+        # Get initial keys, expand the full tree, then get all keys again
         try:
-            root_keys = tree_obj.GetAllNodeKeys()
-            if root_keys:
-                tree_obj.ExpandSubTree(root_keys[0])
-        except Exception:
-            pass
-
-        keys = tree_obj.GetAllNodeKeys() or []
-        for k in keys:
-            if len(texts) >= max_nodes:
-                break
-            try:
-                txt = tree_obj.GetNodeTextByKey(k)
-                if txt:
-                    txt = txt.strip()
-                    if txt:
-                        texts.append(txt)
-            except Exception:
-                pass
-    except Exception:
-        # Last resort: try iterating visible rows if available
-        try:
-            for i in range(min(tree_obj.RowCount, max_nodes)):
+            initial_keys = tree_obj.GetAllNodeKeys() or []
+            for k in initial_keys:
                 try:
-                    k = tree_obj.GetNodeKeyByIndex(i)
-                    txt = tree_obj.GetNodeTextByKey(k).strip()
-                    if txt:
-                        texts.append(txt)
+                    tree_obj.ExpandSubTree(k)
                 except Exception:
                     pass
         except Exception:
             pass
+
+        keys = tree_obj.GetAllNodeKeys() or []
+
+        # Try to get column names for multi-column trees
+        col_names = []
+        try:
+            col_names = list(tree_obj.GetColumnNames()) or []
+        except Exception:
+            pass
+
+        for k in keys:
+            if len(texts) >= max_nodes:
+                break
+            node_texts = []
+
+            # 1. Primary node text
+            try:
+                t = tree_obj.GetNodeTextByKey(k)
+                if t and t.strip():
+                    node_texts.append(t.strip())
+            except Exception:
+                pass
+
+            # 2. Tooltip (often has the full untruncated text)
+            try:
+                tip = tree_obj.GetNodeTooltipByKey(k)
+                if tip and tip.strip() and tip.strip() not in node_texts:
+                    node_texts.append(tip.strip())
+            except Exception:
+                pass
+
+            # 3. All column item texts (for multi-column trees like WE02)
+            for col in col_names:
+                try:
+                    t = tree_obj.GetItemText(k, col)
+                    if t and t.strip() and t.strip() not in node_texts:
+                        node_texts.append(t.strip())
+                except Exception:
+                    pass
+
+            # 4. Fallback: iterate up to 5 unnamed columns by index
+            if not col_names:
+                for ci in range(5):
+                    try:
+                        t = tree_obj.GetItemText(k, str(ci))
+                        if t and t.strip() and t.strip() not in node_texts:
+                            node_texts.append(t.strip())
+                    except Exception:
+                        pass
+
+            for t in node_texts:
+                if t not in texts:
+                    texts.append(t)
+
+    except Exception:
+        # Last resort: row-by-row access
+        try:
+            for i in range(min(tree_obj.RowCount, max_nodes)):
+                try:
+                    k = tree_obj.GetNodeKeyByIndex(i)
+                    t = tree_obj.GetNodeTextByKey(k).strip()
+                    if t and t not in texts:
+                        texts.append(t)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     return texts
 
 
@@ -1751,158 +1796,340 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
     return result
 
 
+def _we02_set_docnum(docnum: str) -> bool:
+    """
+    Set the IDoc number filter on the WE02 selection screen.
+    Tries hardcoded IDs first, then discovers fields dynamically.
+    Returns True if the field was set.
+    """
+    # Known IDs across SAP versions
+    known_lo = [
+        "wnd[0]/usr/ctxtS_DOCNUM-LOW",     # ECC 6.0
+        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",   # S/4 variant 1
+        "wnd[0]/usr/ctxtDOCNUM",           # S/4 variant 2
+        "wnd[0]/usr/ctxtSEL_DOCNUM",       # S/4 variant 3
+        "wnd[0]/usr/ctxtDOCNUM-LOW",
+    ]
+    known_hi = [
+        "wnd[0]/usr/ctxtS_DOCNUM-HIGH",
+        "wnd[0]/usr/ctxtSEL_DOCNUM-HIGH",
+        "wnd[0]/usr/ctxtDOCNUM-HIGH",
+    ]
+    set_lo = False
+    for fid in known_lo:
+        try:
+            session.FindById(fid).Text = docnum
+            set_lo = True
+            break
+        except Exception:
+            pass
+    for fid in known_hi:
+        try:
+            session.FindById(fid).Text = docnum
+            break
+        except Exception:
+            pass
+
+    if set_lo:
+        return True
+
+    # Dynamic fallback: discover all ctxt/txt fields and look for DOCNUM
+    elems = discover_elements()
+    for e in elems:
+        eid = e.get("id", "").upper()
+        if "DOCNUM" in eid and e.get("type") in ("GuiCTextField", "GuiTextField"):
+            try:
+                obj = session.FindById(e["id"])
+                obj.Text = docnum
+                set_lo = True
+                # Also try to find the matching HIGH field
+                hi_id = e["id"].replace("-LOW", "-HIGH").replace("LOW", "HIGH")
+                try:
+                    session.FindById(hi_id).Text = docnum
+                except Exception:
+                    pass
+                break
+            except Exception:
+                pass
+    return set_lo
+
+
 def get_idoc_detail(idoc_number):
     """
-    Get full detail for a specific IDoc.
+    Get full detail for a specific IDoc — error text, control record, fix hints.
+
     Strategy:
-      1. Navigate WE02 and try all known container IDs + full UI walk.
-      2. Fall back to reading EDIDS (status records) + EDIDC (control record)
-         tables directly via SE16N — most reliable, always has error text.
-      3. Always return screen_texts so Claude can see the full picture.
+      1. EDIDS table via SE16N WHERE clause — most reliable, always has exact
+         error text regardless of GUI issues.  This is tried FIRST.
+      2. Navigate WE02, set DOCNUM filter, read GuiTree (status text) and
+         right panel (technical info).
+      3. EDIDC control record via SE16N WHERE clause.
+      4. Merge all data and compute fix_hints.
     """
     docnum = str(idoc_number).zfill(16)
     detail = {
-        "idoc_number": str(idoc_number),
-        "status_records":  [],
-        "segments":        [],
-        "error_messages":  [],
-        "control_record":  {},
-        "fix_hints":       [],
+        "idoc_number":    str(idoc_number),
+        "status_records": [],
+        "segments":       [],
+        "error_messages": [],
+        "control_record": {},
+        "fix_hints":      [],
+        "all_screen_text": "",
     }
 
-    # ── Strategy 1: Navigate WE02 and read the GuiTree + right panel ──────────
+    # ── Strategy 1 (PRIMARY): Read EDIDS via SE16N with WHERE clause ──────────
+    # EDIDS contains the complete status history with STATXT (status text).
+    # The WHERE clause approach is more reliable than the condition-table approach.
+    for _attempt_where in (True, False):
+        try:
+            go_to_transaction("SE16N")
+            time.sleep(1)
+            for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
+                try:
+                    session.FindById(fid).Text = "EDIDS"
+                    break
+                except Exception:
+                    pass
+            session.FindById("wnd[0]").SendVKey(0)  # Enter → load fields
+            time.sleep(1.5)
+
+            if _attempt_where:
+                # Try the WHERE clause / Expert button
+                for btn in ("wnd[0]/tbar[1]/btn[14]",    # "Expert" in some versions
+                            "wnd[0]/mbar/menu[3]/menu[7]", # Settings → Free Criteria
+                            "wnd[0]/tbar[1]/btn[6]"):
+                    try:
+                        session.FindById(btn).Press()
+                        time.sleep(0.8)
+                        break
+                    except Exception:
+                        pass
+                # Set a WHERE clause field if one appeared
+                for wfid in ("wnd[0]/usr/txtGD-WHERE", "wnd[0]/usr/txtWHERE",
+                             "wnd[0]/usr/ctxtGD-WHERE"):
+                    try:
+                        session.FindById(wfid).Text = f"DOCNUM = '{docnum}'"
+                        break
+                    except Exception:
+                        pass
+            else:
+                # Standard condition table approach
+                for tbl_id in ("wnd[0]/usr/tblSAPLSE16NSELFIELD_TC",
+                               "wnd[0]/usr/tblSELFIELD_TC"):
+                    try:
+                        tbl = session.FindById(tbl_id, False)
+                        if not tbl:
+                            continue
+                        for row in range(min(tbl.RowCount, 30)):
+                            try:
+                                fn = tbl.GetCell(row, 0).Text.strip().upper()
+                                if fn == "DOCNUM":
+                                    tbl.GetCell(row, 4).Text = docnum   # LOW
+                                    try:
+                                        tbl.GetCell(row, 5).Text = docnum  # HIGH
+                                    except Exception:
+                                        pass
+                                    break
+                            except Exception:
+                                pass
+                        break
+                    except Exception:
+                        pass
+
+            # Set max rows and execute
+            for mfid in ("wnd[0]/usr/txtGD-MAX_LINES",):
+                try:
+                    session.FindById(mfid).Text = "200"
+                except Exception:
+                    pass
+            session.FindById("wnd[0]").SendVKey(8)
+            time.sleep(2.5)
+
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlRESULT_LIST/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
+            if shell and shell.RowCount > 0:
+                rows = _read_shell_rows(
+                    shell,
+                    ["DOCNUM","STATUS","LOGDAT","LOGTIM","STAMQU",
+                     "STATXT","UNAME","REPID","STAPA1","STAPA2"],
+                    max_rows=200,
+                )
+                # Only keep rows that match our IDoc number
+                matching = [r for r in rows
+                            if r.get("DOCNUM","").strip().lstrip("0") ==
+                               str(idoc_number).lstrip("0")]
+                if not matching:
+                    matching = rows  # accept all if filter is unclear
+
+                for row in matching:
+                    statxt = row.get("STATXT","").strip()
+                    if statxt and statxt != "&, &, &, &":
+                        detail["status_records"].append(row)
+                        if any(kw in statxt.lower() for kw in [
+                            "error","fehler","not found","nicht","invalid",
+                            "missing","exception","fail","partner","profile",
+                            "function module","posting period","cannot"
+                        ]):
+                            if statxt not in detail["error_messages"]:
+                                detail["error_messages"].append(statxt)
+                detail["edids_source"] = (
+                    f"EDIDS WHERE clause: {len(matching)} rows (total {len(rows)})")
+                if detail["status_records"]:
+                    break   # success — skip fallback attempt
+        except Exception as e:
+            detail["edids_error"] = str(e)
+
+    # ── Strategy 2: Navigate WE02 → read GuiTree + right panel ───────────────
     go_to_transaction("WE02")
     time.sleep(1.5)
 
-    # Enter IDoc number in both LOW and HIGH so exactly one IDoc is selected
-    for fid in ("wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
-                "wnd[0]/usr/ctxtDOCNUM",
-                "wnd[0]/usr/ctxtSEL_DOCNUM"):
-        try: session.FindById(fid).Text = docnum; break
-        except Exception: pass
-    for fid in ("wnd[0]/usr/ctxtSEL_DOCNUM-HIGH",):
-        try: session.FindById(fid).Text = docnum
-        except Exception: pass
+    docnum_set = _we02_set_docnum(docnum)
+    detail["we02_docnum_set"] = docnum_set
 
     session.FindById("wnd[0]").SendVKey(8)   # Execute
     time.sleep(2.5)
     detail["screen"] = get_screen_text()
 
-    # WE02 shows a list screen first; if only one IDoc selected it may open
-    # the detail directly.  If the title still says "Display IDocs" we need
-    # to navigate into the first result row.
-    title_text = detail["screen"]
-    if "IDoc Display:" not in title_text and "IDoc-Anzeige:" not in title_text:
-        # Try double-clicking the first row (Enter on list selects first row)
-        session.FindById("wnd[0]").SendVKey(2)   # F2 = double-click / choose
+    # WE02 shows a list screen first — enter the first (and only) result
+    title = detail["screen"]
+    if "IDoc Display:" not in title and "IDoc-Anzeige:" not in title:
+        session.FindById("wnd[0]").SendVKey(2)   # F2 = choose
         time.sleep(2)
         detail["screen"] = get_screen_text()
 
-    # ── 1a. Read the GuiTree (left panel: Control Record / Data records / Status) ──
+    # ── Strategy 2a: WE02 GuiTree — left panel (status record text) ─────────────
     tree = _find_gui_tree_anywhere()
     if tree:
         node_texts = _read_gui_tree_texts(tree, max_nodes=400)
         detail["tree_nodes"] = node_texts
-        # Combine for full-text search
-        combined_tree = "\n".join(node_texts)
-        # Error keywords: SAP returns status text as tree node children of status node
         for txt in node_texts:
             tl = txt.lower()
             if any(kw in tl for kw in [
-                "error", "fehler", "not found", "nicht gefunden",
-                "exception", "invalid", "missing", "edi:", "failed",
-                "cannot", "not exist", "no match", "application error",
-                "partner", "profile", "function module", "posting period",
-                "syntax", "segment"
+                "error","fehler","not found","nicht gefunden","exception",
+                "invalid","missing","edi:","failed","cannot","not exist",
+                "no match","application error","partner","profile",
+                "function module","posting period","syntax","segment",
+                "idoc with","inbound partner",
             ]):
                 if txt not in detail["error_messages"]:
                     detail["error_messages"].append(txt)
-            # Status record lines: numeric code + text or "IDoc with errors"
-            if (txt[:2].isdigit() and len(txt) > 3) or "idoc with" in tl:
-                detail["status_records"].append({"STATXT": txt, "source": "WE02_tree"})
+            if (len(txt) > 2 and txt[:2].isdigit()) or "idoc with" in tl:
+                detail["status_records"].append(
+                    {"STATXT": txt, "source": "WE02_tree"})
         detail["tree_source"] = f"WE02 GuiTree: {len(node_texts)} nodes"
 
-    # ── 1b. Read the right panel (Short Technical Information + all labels) ──
+    # ── Strategy 2b: Right panel — Short Technical Information ───────────────
     screen_txts = _screen_texts()
     detail["all_screen_text"] = "\n".join(screen_txts[:300])
-
-    # Parse the right panel for control record fields
     import re as _re
-    full = detail["all_screen_text"]
+    full  = detail["all_screen_text"]
     _ctrl = detail["control_record"]
     for pat, fld in [
-        (r'MATMAS\d*|ORDERS\d*|INVOIC\d*|DESADV\d*|DEBMAS|CREMAS|WMMBID|PORDCR|SHPORD', 'MESTYP'),
-        (r'(?:Message Type|Nachrichtentyp)[^\n]*?([A-Z][A-Z0-9]+)', 'MESTYP'),
-        (r'(?:Basic type|Basistyp)[^\n]*?([A-Z][A-Z0-9]+)', 'IDOCTP'),
-        (r'(?:Partner No\.|Partnernummer)[^\n]*?([A-Z0-9_]+)', 'SNDPRN'),
-        (r'(?:Partn\.Type|Partnertyp)[^\n]*?(LS|KU|LI|KD|VN)',  'SNDPRT'),
-        (r'(?:Port)[^\n]*?([A-Z0-9]+)', 'RCVPOR'),
-        (r'(?:Direction|Richtung)[^\n]*?(\d)', 'DIRECT'),
-        (r'(?:Current Status|Status)[^\n]*?(\d{2})', 'STATUS'),
+        (r'(MATMAS\d*|ORDERS\d*|INVOIC\d*|DESADV\d*|DEBMAS|CREMAS|WMMBID|PORDCR|SHPORD)', 'MESTYP'),
+        (r'(?:Message Type|Nachrichtentyp)[^\S\n]*([A-Z][A-Z0-9]+)', 'MESTYP'),
+        (r'(?:Basic type|Basistyp)[^\S\n]*([A-Z][A-Z0-9]+)',         'IDOCTP'),
+        (r'(?:Partner No\.|Partnernummer)[^\S\n]*([A-Z0-9_]+)',       'SNDPRN'),
+        (r'(?:Partn\.?Type|Partnertyp)[^\S\n]*(LS|KU|LI|KD|VN)',     'SNDPRT'),
+        (r'(?:Port)[^\S\n]*([A-Z][A-Z0-9]+)',                         'RCVPOR'),
+        (r'(?:Direction|Richtung)[^\S\n]*(\d)',                       'DIRECT'),
+        (r'(?:Current Status|Aktueller Status)[^\S\n]*(\d{2})',       'STATUS'),
     ]:
         m = _re.search(pat, full, _re.IGNORECASE)
-        if m and m.group(1) and fld not in _ctrl:
+        if m and fld not in _ctrl:
             _ctrl[fld] = m.group(1).strip()
 
-    # ── Strategy 2: Read EDIDS table via SE16N (always has exact error text) ───
+    # ── Strategy 3: EDIDC control record via SE16N WHERE clause ─────────────
     try:
-        edids_shell, _ = _se16n_set_filter("EDIDS", "DOCNUM", docnum, docnum)
-        if edids_shell:
-            edids_rows = _read_shell_rows(
-                edids_shell,
-                ["DOCNUM","STATUS","LOGDAT","LOGTIM","STAMQU","STATXT",
-                 "UNAME","REPID","STAPA1","STAPA2"],
-                max_rows=300
-            )
-            for row in edids_rows:
-                if row.get("STATXT"):
-                    detail["status_records"].append(row)
-                    txt = row.get("STATXT","").lower()
-                    if any(kw in txt for kw in [
-                        "error","fehler","not found","nicht","invalid",
-                        "missing","exception","fail","cannot","partner",
-                        "profile","function module","posting period"
-                    ]):
-                        if row["STATXT"] not in detail["error_messages"]:
-                            detail["error_messages"].append(row["STATXT"])
-            detail["edids_source"] = f"{len(edids_rows)} rows from EDIDS"
-        else:
-            detail["edids_note"] = "EDIDS shell not found after filter"
-    except Exception as edids_err:
-        detail["edids_error"] = str(edids_err)
-
-    # ── Strategy 3: Read EDIDC control record via SE16N ───────────────────────
-    try:
-        edidc_shell, _ = _se16n_set_filter("EDIDC", "DOCNUM", docnum, docnum)
-        if edidc_shell:
+        go_to_transaction("SE16N")
+        time.sleep(1)
+        for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
+            try:
+                session.FindById(fid).Text = "EDIDC"
+                break
+            except Exception:
+                pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
+        for tbl_id in ("wnd[0]/usr/tblSAPLSE16NSELFIELD_TC",
+                       "wnd[0]/usr/tblSELFIELD_TC"):
+            try:
+                tbl = session.FindById(tbl_id, False)
+                if not tbl:
+                    continue
+                for row in range(min(tbl.RowCount, 30)):
+                    try:
+                        if tbl.GetCell(row, 0).Text.strip().upper() == "DOCNUM":
+                            tbl.GetCell(row, 4).Text = docnum
+                            try:
+                                tbl.GetCell(row, 5).Text = docnum
+                            except Exception:
+                                pass
+                            break
+                    except Exception:
+                        pass
+                break
+            except Exception:
+                pass
+        for mfid in ("wnd[0]/usr/txtGD-MAX_LINES",):
+            try:
+                session.FindById(mfid).Text = "5"
+            except Exception:
+                pass
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+        edidc_shell = _find_shell_anywhere([
+            "wnd[0]/usr/cntlRESULT_LIST/shellcont/shell",
+            "wnd[0]/usr/cntlGRID1/shellcont/shell",
+        ])
+        if edidc_shell and edidc_shell.RowCount > 0:
             ctrl_rows = _read_shell_rows(
                 edidc_shell,
                 ["DOCNUM","STATUS","DIRECT","MESTYP","MESCOD","MESFCT",
-                 "SNDPRT","SNDPRN","RCVPRT","RCVPRN","CREDAT","CRETIM",
-                 "UPDDAT","UPDTIM","REFMES","ARCKEY"],
-                max_rows=5
+                 "SNDPRT","SNDPRN","RCVPRT","RCVPRN","CREDAT","CRETIM"],
+                max_rows=5,
             )
-            if ctrl_rows:
-                # Merge with what was already parsed from the screen
-                for k, v in ctrl_rows[0].items():
-                    if v and k not in detail["control_record"]:
-                        detail["control_record"][k] = v
-                detail["status_desc"] = IDOC_STATUS.get(
-                    detail["control_record"].get("STATUS", ""), "Unknown")
+            for r in ctrl_rows:
+                if r.get("DOCNUM","").strip().lstrip("0") == str(idoc_number).lstrip("0"):
+                    for k, v in r.items():
+                        if v and k not in _ctrl:
+                            _ctrl[k] = v
+                    break
+            if _ctrl.get("STATUS"):
+                detail["status_desc"] = IDOC_STATUS.get(_ctrl["STATUS"], "Unknown")
     except Exception:
         pass
 
-    # ── Build fix_hints from all collected error text ─────────────────────────
-    combined = (" ".join(detail["error_messages"]) + " " +
-                detail["all_screen_text"]).lower()
+    # ── Build fix_hints from all collected data ───────────────────────────────
+    combined = (
+        " ".join(detail["error_messages"]) + " " +
+        detail["all_screen_text"] + " " +
+        " ".join(r.get("STATXT","") for r in detail["status_records"])
+    ).lower()
+
     detail["fix_hints"] = [
         {"pattern": pat, "fix_action": fa, "risk": risk}
         for pat, (fa, risk) in IDOC_FIX_MAP.items()
         if pat in combined
     ]
     if not detail["fix_hints"] and detail["status_records"]:
-        detail["fix_hints"] = [{"note": "No known pattern matched. "
-                                         "Review status_records for manual diagnosis."}]
+        detail["fix_hints"] = [{"note": "No known IDOC_FIX_MAP pattern matched. "
+                                         "Review status_records / error_messages."}]
+
+    # Summary for easy reading
+    detail["summary"] = {
+        "idoc":          str(idoc_number),
+        "status":        _ctrl.get("STATUS","?"),
+        "status_desc":   detail.get("status_desc",""),
+        "message_type":  _ctrl.get("MESTYP",""),
+        "partner":       _ctrl.get("SNDPRN",""),
+        "partner_type":  _ctrl.get("SNDPRT",""),
+        "direction":     _ctrl.get("DIRECT",""),
+        "error_count":   len(detail["error_messages"]),
+        "errors":        detail["error_messages"][:5],
+    }
 
     return detail
 
