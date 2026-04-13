@@ -6142,49 +6142,28 @@ TOOLS = [
     },
 ]
 
-# ── Write operations that need approval ───────────────────────────────────────
-WRITE_TOOLS = {
-    "set_field_value", "press_button", "send_vkey",
-    "handle_popup", "handle_transport_request",
-    "maintain_table", "execute_abap_program",
-    "create_transport_request", "release_transport_request",
-    "upload_abap_source", "check_abap_syntax", "activate_abap_object",
-    "create_abap_program", "create_function_module", "create_function_group",
-    "create_data_element", "create_database_table",
-    "load_data_to_table", "load_csv_to_table", "sm30_load_entries",
-    # IDoc write tools
-    "reprocess_idoc", "edit_idoc_field",
-    "create_partner_profile", "bd87_reprocess_all",
-    # PO write tools
-    "release_po", "change_po_field", "cancel_po_item",
-    "release_blocked_invoice", "unblock_vendor",
-    "create_po_output", "convert_pr_to_po",
-    # SD write tools
-    "release_credit_block", "release_sd_delivery_block",
-    "release_billing_block", "reprice_sales_order",
-    "complete_sales_order", "fix_partner_determination",
-    "create_sd_output", "check_atp", "remove_rejection_reason",
-    # FI/CO write tools
-    "release_fi_payment_block", "reverse_fi_document", "clear_open_items",
-    # Delivery write tools
-    "post_goods_issue", "fix_delivery_incomplete", "create_delivery_output",
-    # Job/Workflow/Lock/tRFC write tools
-    "restart_failed_job", "restart_workflow_item",
-    "release_lock_entry", "retry_sm58_entry",
+# ── IRREVERSIBLE operations — the ONLY ones that still confirm ────────────────
+# Everything else is auto-executed (autonomous mode).
+CONFIRM_BEFORE = {
+    "reverse_fi_document",   # posts a reversal accounting document
+    "sm30_load_entries",      # bulk direct table writes
+    "load_data_to_table",
+    "load_csv_to_table",
 }
 
 # ── Tool Dispatcher ────────────────────────────────────────────────────────────
 def dispatch(tool_name, tool_input):
 
-    # Gate all write operations behind human approval
-    if tool_name in WRITE_TOOLS:
+    # Only the truly irreversible operations still require a confirmation.
+    # All other write operations execute autonomously (see OPERATING MODE).
+    if tool_name in CONFIRM_BEFORE:
         approved = ask_approval(
-            action=f"SAP Write: {tool_name}",
+            action=f"IRREVERSIBLE: {tool_name}",
             details=tool_input,
-            risk="high" if tool_name == "handle_transport_request" else "medium",
+            risk="high",
         )
         if not approved:
-            return {"status": "rejected", "message": "Rejected by operator."}
+            return {"status": "skipped", "message": "Skipped by operator."}
 
     if tool_name == "get_sales_orders":
         return get_sales_orders(
@@ -7248,9 +7227,27 @@ WHEN A TOOL RETURNS AN ERROR:
   • Only escalate to the user if you have exhausted all alternatives.
 
 ═══════════════════════════════════════════════════════════
+ TOOL USAGE RULES — use the high-level tools, not manual navigation
+═══════════════════════════════════════════════════════════
+• To get IDoc detail / root cause → get_idoc_detail(idoc_number)
+  NEVER manually navigate WE02 with go_to_transaction + set_field_value.
+  get_idoc_detail reads the GuiTree, right panel, EDIDS and EDIDC tables.
+
+• To scan IDoc errors             → scan_idoc_errors(...)
+• To reprocess specific IDocs     → bd87_select_and_reprocess(idoc_numbers=[...])
+• To reprocess all of a type      → bd87_reprocess_all(message_type, ...)
+• To get PO detail                → get_po_detail(po_number)
+• To get SD order detail          → get_sd_order_detail(order_number)
+• To get FI doc detail            → get_fi_doc_detail(doc_number, company_code)
+• To scan ABAP dumps              → scan_st22_dumps(date_from, date_to)
+
+Only use go_to_transaction + discover_screen_elements + set_field_value
+for operations that do NOT have a dedicated high-level tool.
+
+═══════════════════════════════════════════════════════════
  RULES
 ═══════════════════════════════════════════════════════════
-• ALWAYS discover_screen_elements after every navigation.
+• ALWAYS use the high-level tool first; only fall back to manual navigation.
 • NEVER guess field IDs — discover first, then fill.
 • Before creating any config object, read its table first
   (e.g. read T001 before OX02) to avoid duplicate key errors.
@@ -7324,25 +7321,74 @@ def _compress_messages(messages: list) -> list:
     return compressed
 
 
-def _api_call_with_retry(client, max_retries=4, **kwargs):
+def _make_cached_system(system_text: str) -> list:
     """
-    Call client.messages.create with exponential back-off on 429 rate-limit
-    errors.  Also compresses messages on the second and later attempts.
+    Wrap the system prompt in a list with cache_control so the Anthropic API
+    serves it from the prompt cache on repeat calls.  Cached input tokens are
+    NOT counted against the standard input-TPM bucket — this is the primary
+    fix for the 30,000 TPM rate limit.
     """
-    import anthropic as _anthropic
-    wait = 5  # seconds before first retry
+    return [{"type": "text", "text": system_text,
+             "cache_control": {"type": "ephemeral"}}]
+
+
+def _make_cached_tools(tools: list) -> list:
+    """
+    Add cache_control to the LAST tool in the list, which causes the Anthropic
+    API to cache all tools up to and including it.  Avoids re-tokenising the
+    large TOOLS list on every call.
+    """
+    if not tools:
+        return tools
+    result = list(tools)
+    last   = dict(result[-1])
+    last["cache_control"] = {"type": "ephemeral"}
+    result[-1] = last
+    return result
+
+
+# Build cached versions once at module load — reused on every API call
+_CACHED_SYSTEM = None   # populated lazily after SYSTEM_PROMPT is defined
+_CACHED_TOOLS  = None   # populated lazily after TOOLS is defined
+
+
+def _api_call_with_retry(client, model, max_tokens, system, tools, messages,
+                          max_retries=4):
+    """
+    Call client.messages.create with:
+    - Prompt caching on system prompt and tools (avoids re-tokenising ~20k
+      tokens every call → fixes the 30,000 TPM rate limit)
+    - Exponential back-off starting at 65 s on 429 (TPM resets every 60 s)
+    - Message compression before each retry to further reduce token count
+    - SDK-level retries disabled (max_retries=0) to avoid double-retry
+    """
+    global _CACHED_SYSTEM, _CACHED_TOOLS
+    if _CACHED_SYSTEM is None:
+        _CACHED_SYSTEM = _make_cached_system(system)
+    if _CACHED_TOOLS is None:
+        _CACHED_TOOLS = _make_cached_tools(tools)
+
+    current_messages = messages
+    wait = 65  # start above 60 s so the TPM window fully resets
+
     for attempt in range(max_retries + 1):
         try:
-            return client.messages.create(**kwargs)
-        except _anthropic.RateLimitError as exc:
+            return client.messages.create(
+                model      = model,
+                max_tokens = max_tokens,
+                system     = _CACHED_SYSTEM,
+                tools      = _CACHED_TOOLS,
+                messages   = current_messages,
+            )
+        except anthropic.RateLimitError:
             if attempt == max_retries:
                 raise
-            print(f"\n  [Rate limit (429) — waiting {wait}s, retry {attempt + 1}/{max_retries}...]")
+            print(f"\n  [429 rate limit — waiting {wait}s "
+                  f"(TPM window reset), retry {attempt + 1}/{max_retries}...]")
             time.sleep(wait)
-            wait = min(wait * 2, 60)   # cap at 60 s
-            # On retry, compress the messages to reduce token count
-            if "messages" in kwargs:
-                kwargs["messages"] = _compress_messages(kwargs["messages"])
+            wait = min(wait * 2, 300)   # cap at 5 min
+            # Compress aggressively before retrying
+            current_messages = _compress_messages(current_messages)
         except Exception:
             raise
 
@@ -7356,28 +7402,28 @@ def run_agent(user_query, api_key, messages=None):
     Pass an existing messages list to continue (e.g. after user approves [A/R]).
     Returns (messages, last_text) so the caller can resume the conversation.
     """
-    client    = anthropic.Anthropic(api_key=api_key)
+    # max_retries=0 disables the Anthropic SDK's own retry logic so our
+    # _api_call_with_retry handler controls all retry/backoff behaviour.
+    client    = anthropic.Anthropic(api_key=api_key, max_retries=0)
     last_text = ""
 
     if messages is None:
         messages = [{"role": "user", "content": user_query}]
     else:
-        # Append the user's reply (approval / follow-up) to the existing thread
         messages = list(messages) + [{"role": "user", "content": user_query}]
 
     print("\nARTILEGENZ agent running...\n")
 
     while True:
-        # Compress if thread is very long before sending
         messages = _compress_messages(messages)
 
         response = _api_call_with_retry(
             client,
-            model="claude-opus-4-6",
-            max_tokens=8192,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
+            model      = "claude-opus-4-6",
+            max_tokens = 8192,
+            system     = SYSTEM_PROMPT,
+            tools      = TOOLS,
+            messages   = messages,
         )
 
         # Show narrative text and capture last assistant text for continuity detection
