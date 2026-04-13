@@ -110,8 +110,13 @@ def discover_elements():
     results = []
     # These types are data-display containers — do NOT recurse into them
     SKIP_RECURSE = {
-        "GuiShell", "GuiTree", "GuiGridView", "GuiTableControl",
-        "GuiContainerShell", "GuiSplitterContainer", "GuiCustomControl",
+        "GuiShell",              # ALV grids — can have thousands of children
+        "GuiTree",               # Tree controls — same problem
+        "GuiGridView",           # Grid view variant
+        "GuiContainerShell",
+        "GuiSplitterContainer",
+        "GuiCustomControl",
+        # NOTE: GuiTableControl is NOT skipped — SE16N filter rows live there
     }
     def walk(comp, depth=0):
         if depth > 5 or len(results) >= 50:
@@ -903,6 +908,194 @@ def _screen_texts():
     return texts
 
 
+# ── GuiTree Reader (for WE02, BD87 result, etc.) ──────────────────────────────
+def _find_gui_tree_anywhere():
+    """Walk the current screen and return the first GuiTree object found."""
+    found = [None]
+    def _walk(comp, depth=0):
+        if found[0] or depth > 7:
+            return
+        try:
+            n = comp.Children.Count
+        except Exception:
+            return
+        for i in range(n):
+            try:
+                child = comp.Children(i)
+                if child.Type == "GuiTree":
+                    found[0] = child
+                    return
+                _walk(child, depth + 1)
+                if found[0]:
+                    return
+            except Exception:
+                pass
+    _walk(session.FindById("wnd[0]"))
+    return found[0]
+
+
+def _read_gui_tree_texts(tree_obj, max_nodes=300):
+    """
+    Read all visible node texts from a GuiTree control.
+    Expands the full sub-tree first so all children are accessible.
+    Returns a flat list of text strings (preserving order top-to-bottom).
+    """
+    texts = []
+    if tree_obj is None:
+        return texts
+    try:
+        # Expand the whole tree so all nodes are present
+        try:
+            root_keys = tree_obj.GetAllNodeKeys()
+            if root_keys:
+                tree_obj.ExpandSubTree(root_keys[0])
+        except Exception:
+            pass
+
+        keys = tree_obj.GetAllNodeKeys() or []
+        for k in keys:
+            if len(texts) >= max_nodes:
+                break
+            try:
+                txt = tree_obj.GetNodeTextByKey(k)
+                if txt:
+                    txt = txt.strip()
+                    if txt:
+                        texts.append(txt)
+            except Exception:
+                pass
+    except Exception:
+        # Last resort: try iterating visible rows if available
+        try:
+            for i in range(min(tree_obj.RowCount, max_nodes)):
+                try:
+                    k = tree_obj.GetNodeKeyByIndex(i)
+                    txt = tree_obj.GetNodeTextByKey(k).strip()
+                    if txt:
+                        texts.append(txt)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return texts
+
+
+def _se16n_set_filter(table_name, field_name, low_value, high_value=None):
+    """
+    Navigate SE16N for a table, set LOW (and optionally HIGH) for a named
+    field, and execute.  Returns the result shell or None.
+
+    Works by iterating the SE16N condition table control rows to find the
+    matching field name, then setting its Low/High cells.
+    """
+    go_to_transaction("SE16N")
+    time.sleep(1)
+    for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
+        try:
+            session.FindById(fid).Text = table_name
+            break
+        except Exception:
+            pass
+    session.FindById("wnd[0]").SendVKey(0)  # Enter → load selection fields
+    time.sleep(1.5)
+
+    # Set max rows
+    for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
+        try:
+            session.FindById(fid).Text = "500"
+        except Exception:
+            pass
+
+    # Locate the condition row for field_name and set Low / High
+    # SE16N uses a GuiTableControl with rows that have FIELDNAME, SIGN, OPTION,
+    # LOW, HIGH cells.  Try common ID patterns.
+    field_set = False
+
+    # Pattern 1: direct cell IDs  wnd[0]/usr/tbl.../ctxtSELFIELD-LOW[col,row]
+    # The column index for LOW is usually 4, row is variable.
+    for tbl_id in (
+        "wnd[0]/usr/tblSAPLSE16NSELFIELD_TC",
+        "wnd[0]/usr/tblSELFIELD_TC",
+    ):
+        try:
+            tbl = session.FindById(tbl_id, False)
+            if not tbl:
+                continue
+            for row in range(tbl.RowCount):
+                try:
+                    # Get the field name cell
+                    fn_cell = tbl.GetCell(row, 0)  # column 0 = field name
+                    if not fn_cell:
+                        continue
+                    try:
+                        cell_text = fn_cell.Text.strip().upper()
+                    except Exception:
+                        cell_text = ""
+                    if cell_text == field_name.upper():
+                        # Set LOW (column 4)
+                        try:
+                            tbl.GetCell(row, 4).Text = str(low_value)
+                        except Exception:
+                            pass
+                        # Set HIGH (column 5)
+                        if high_value is not None:
+                            try:
+                                tbl.GetCell(row, 5).Text = str(high_value)
+                            except Exception:
+                                pass
+                        field_set = True
+                        break
+                except Exception:
+                    pass
+            if field_set:
+                break
+        except Exception:
+            pass
+
+    # Pattern 2: discover_elements fallback (works when table IDs differ)
+    if not field_set:
+        elems = discover_elements()
+        lo_id = hi_id = None
+        # Look for the field name label first, then LOW/HIGH inputs near it
+        for e in elems:
+            eid = e.get("id", "").upper()
+            val = e.get("value", "").upper()
+            if field_name.upper() in val or field_name.upper() in eid:
+                if "LOW" in eid:
+                    lo_id = e["id"]
+                elif "HIGH" in eid:
+                    hi_id = e["id"]
+        # Also scan for any field whose id contains the field_name
+        if not lo_id:
+            for e in elems:
+                eid = e.get("id", "").upper()
+                if field_name.upper() in eid and "LOW" in eid:
+                    lo_id = e["id"]
+                elif field_name.upper() in eid and "HIGH" in eid:
+                    hi_id = e["id"]
+        if lo_id:
+            try:
+                session.FindById(lo_id).Text = str(low_value)
+                field_set = True
+            except Exception:
+                pass
+        if hi_id and high_value is not None:
+            try:
+                session.FindById(hi_id).Text = str(high_value)
+            except Exception:
+                pass
+
+    # Execute
+    session.FindById("wnd[0]").SendVKey(8)
+    time.sleep(2)
+
+    return _find_shell_anywhere([
+        "wnd[0]/usr/cntlGRID1/shellcont/shell",
+        "wnd[0]/usr/cntlGRID/shellcont/shell",
+        "wnd[0]/usr/cntlALV_CONTAINER/shellcont/shell",
+    ]), field_set
+
+
 def scan_st22_dumps(date_from=None, date_to=None):
     """
     List ABAP runtime errors from ST22.
@@ -1577,81 +1770,83 @@ def get_idoc_detail(idoc_number):
         "fix_hints":       [],
     }
 
-    # ── Strategy 1: Navigate WE02 and read the screen ─────────────────────────
+    # ── Strategy 1: Navigate WE02 and read the GuiTree + right panel ──────────
     go_to_transaction("WE02")
     time.sleep(1.5)
 
+    # Enter IDoc number in both LOW and HIGH so exactly one IDoc is selected
     for fid in ("wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
                 "wnd[0]/usr/ctxtDOCNUM",
                 "wnd[0]/usr/ctxtSEL_DOCNUM"):
         try: session.FindById(fid).Text = docnum; break
         except Exception: pass
+    for fid in ("wnd[0]/usr/ctxtSEL_DOCNUM-HIGH",):
+        try: session.FindById(fid).Text = docnum
+        except Exception: pass
 
-    session.FindById("wnd[0]").SendVKey(8)
+    session.FindById("wnd[0]").SendVKey(8)   # Execute
     time.sleep(2.5)
     detail["screen"] = get_screen_text()
 
-    # Try ALV/tree shell
-    shell = _find_shell_anywhere([
-        "wnd[0]/usr/cntlWE02_CONTAINER/shellcont/shell",
-        "wnd[0]/usr/cntlGRID1/shellcont/shell",
-        "wnd[0]/usr/cntlGRID/shellcont/shell",
-        "wnd[0]/usr/cntlTREE/shellcont/shell",
-    ])
-    if shell:
-        rows_data = _read_shell_rows(
-            shell,
-            ["DOCNUM","STATUS","LOGDAT","LOGTIM","STAMQU","STATXT","SEGNAM"],
-            max_rows=300
-        )
-        for row in rows_data:
-            if row.get("STATXT"):
-                detail["status_records"].append(row)
-                txt = row.get("STATXT","").lower()
-                if any(e in txt for e in ["error","fehler","not found",
-                                           "nicht","invalid","missing"]):
-                    detail["error_messages"].append(row["STATXT"])
-            if row.get("SEGNAM"):
-                detail["segments"].append(row)
-
-    # Screen text walk (catches classic list / tree labels)
-    screen_txts = _screen_texts()
-    detail["all_screen_text"] = "\n".join(screen_txts[:200])
-
-    # ── Strategy 2: Read EDIDS table (IDoc status records) via SE16N ──────────
-    # Always do this — EDIDS has the exact error text regardless of GUI state
-    try:
-        go_to_transaction("SE16N")
-        time.sleep(1)
-        for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
-            try: session.FindById(fid).Text = "EDIDS"; break
-            except Exception: pass
-        session.FindById("wnd[0]").SendVKey(0)
-        time.sleep(1.5)
-
-        elems = discover_elements()
-        for e in elems:
-            eid = e.get("id","").upper()
-            if "DOCNUM" in eid and "LOW" in eid:
-                try: session.FindById(e["id"]).Text = docnum; break
-                except Exception: pass
-        for e in elems:
-            eid = e.get("id","").upper()
-            if "DOCNUM" in eid and "HIGH" in eid:
-                try: session.FindById(e["id"]).Text = docnum; break
-                except Exception: pass
-
-        for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
-            try: session.FindById(fid).Text = "500"; break
-            except Exception: pass
-
-        session.FindById("wnd[0]").SendVKey(8)
+    # WE02 shows a list screen first; if only one IDoc selected it may open
+    # the detail directly.  If the title still says "Display IDocs" we need
+    # to navigate into the first result row.
+    title_text = detail["screen"]
+    if "IDoc Display:" not in title_text and "IDoc-Anzeige:" not in title_text:
+        # Try double-clicking the first row (Enter on list selects first row)
+        session.FindById("wnd[0]").SendVKey(2)   # F2 = double-click / choose
         time.sleep(2)
+        detail["screen"] = get_screen_text()
 
-        edids_shell = _find_shell_anywhere([
-            "wnd[0]/usr/cntlGRID1/shellcont/shell",
-            "wnd[0]/usr/cntlGRID/shellcont/shell",
-        ])
+    # ── 1a. Read the GuiTree (left panel: Control Record / Data records / Status) ──
+    tree = _find_gui_tree_anywhere()
+    if tree:
+        node_texts = _read_gui_tree_texts(tree, max_nodes=400)
+        detail["tree_nodes"] = node_texts
+        # Combine for full-text search
+        combined_tree = "\n".join(node_texts)
+        # Error keywords: SAP returns status text as tree node children of status node
+        for txt in node_texts:
+            tl = txt.lower()
+            if any(kw in tl for kw in [
+                "error", "fehler", "not found", "nicht gefunden",
+                "exception", "invalid", "missing", "edi:", "failed",
+                "cannot", "not exist", "no match", "application error",
+                "partner", "profile", "function module", "posting period",
+                "syntax", "segment"
+            ]):
+                if txt not in detail["error_messages"]:
+                    detail["error_messages"].append(txt)
+            # Status record lines: numeric code + text or "IDoc with errors"
+            if (txt[:2].isdigit() and len(txt) > 3) or "idoc with" in tl:
+                detail["status_records"].append({"STATXT": txt, "source": "WE02_tree"})
+        detail["tree_source"] = f"WE02 GuiTree: {len(node_texts)} nodes"
+
+    # ── 1b. Read the right panel (Short Technical Information + all labels) ──
+    screen_txts = _screen_texts()
+    detail["all_screen_text"] = "\n".join(screen_txts[:300])
+
+    # Parse the right panel for control record fields
+    import re as _re
+    full = detail["all_screen_text"]
+    _ctrl = detail["control_record"]
+    for pat, fld in [
+        (r'MATMAS\d*|ORDERS\d*|INVOIC\d*|DESADV\d*|DEBMAS|CREMAS|WMMBID|PORDCR|SHPORD', 'MESTYP'),
+        (r'(?:Message Type|Nachrichtentyp)[^\n]*?([A-Z][A-Z0-9]+)', 'MESTYP'),
+        (r'(?:Basic type|Basistyp)[^\n]*?([A-Z][A-Z0-9]+)', 'IDOCTP'),
+        (r'(?:Partner No\.|Partnernummer)[^\n]*?([A-Z0-9_]+)', 'SNDPRN'),
+        (r'(?:Partn\.Type|Partnertyp)[^\n]*?(LS|KU|LI|KD|VN)',  'SNDPRT'),
+        (r'(?:Port)[^\n]*?([A-Z0-9]+)', 'RCVPOR'),
+        (r'(?:Direction|Richtung)[^\n]*?(\d)', 'DIRECT'),
+        (r'(?:Current Status|Status)[^\n]*?(\d{2})', 'STATUS'),
+    ]:
+        m = _re.search(pat, full, _re.IGNORECASE)
+        if m and m.group(1) and fld not in _ctrl:
+            _ctrl[fld] = m.group(1).strip()
+
+    # ── Strategy 2: Read EDIDS table via SE16N (always has exact error text) ───
+    try:
+        edids_shell, _ = _se16n_set_filter("EDIDS", "DOCNUM", docnum, docnum)
         if edids_shell:
             edids_rows = _read_shell_rows(
                 edids_shell,
@@ -1663,44 +1858,22 @@ def get_idoc_detail(idoc_number):
                 if row.get("STATXT"):
                     detail["status_records"].append(row)
                     txt = row.get("STATXT","").lower()
-                    if any(e in txt for e in ["error","fehler","not found",
-                                               "nicht","invalid","missing",
-                                               "exception","fail","cannot"]):
+                    if any(kw in txt for kw in [
+                        "error","fehler","not found","nicht","invalid",
+                        "missing","exception","fail","cannot","partner",
+                        "profile","function module","posting period"
+                    ]):
                         if row["STATXT"] not in detail["error_messages"]:
                             detail["error_messages"].append(row["STATXT"])
-            detail["edids_source"] = f"{len(edids_rows)} status records from EDIDS table"
+            detail["edids_source"] = f"{len(edids_rows)} rows from EDIDS"
+        else:
+            detail["edids_note"] = "EDIDS shell not found after filter"
     except Exception as edids_err:
         detail["edids_error"] = str(edids_err)
 
-    # ── Strategy 3: Read EDIDC (control record) ───────────────────────────────
+    # ── Strategy 3: Read EDIDC control record via SE16N ───────────────────────
     try:
-        go_to_transaction("SE16N")
-        time.sleep(1)
-        for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
-            try: session.FindById(fid).Text = "EDIDC"; break
-            except Exception: pass
-        session.FindById("wnd[0]").SendVKey(0)
-        time.sleep(1.5)
-
-        elems = discover_elements()
-        for e in elems:
-            eid = e.get("id","").upper()
-            if "DOCNUM" in eid and "LOW" in eid:
-                try: session.FindById(e["id"]).Text = docnum; break
-                except Exception: pass
-        for e in elems:
-            eid = e.get("id","").upper()
-            if "DOCNUM" in eid and "HIGH" in eid:
-                try: session.FindById(e["id"]).Text = docnum; break
-                except Exception: pass
-
-        session.FindById("wnd[0]").SendVKey(8)
-        time.sleep(2)
-
-        edidc_shell = _find_shell_anywhere([
-            "wnd[0]/usr/cntlGRID1/shellcont/shell",
-            "wnd[0]/usr/cntlGRID/shellcont/shell",
-        ])
+        edidc_shell, _ = _se16n_set_filter("EDIDC", "DOCNUM", docnum, docnum)
         if edidc_shell:
             ctrl_rows = _read_shell_rows(
                 edidc_shell,
@@ -1710,9 +1883,12 @@ def get_idoc_detail(idoc_number):
                 max_rows=5
             )
             if ctrl_rows:
-                detail["control_record"] = ctrl_rows[0]
+                # Merge with what was already parsed from the screen
+                for k, v in ctrl_rows[0].items():
+                    if v and k not in detail["control_record"]:
+                        detail["control_record"][k] = v
                 detail["status_desc"] = IDOC_STATUS.get(
-                    ctrl_rows[0].get("STATUS",""), "Unknown")
+                    detail["control_record"].get("STATUS", ""), "Unknown")
     except Exception:
         pass
 
