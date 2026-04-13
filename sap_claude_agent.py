@@ -2695,55 +2695,92 @@ def _bd87_find_tree():
 
 
 def _bd87_fill_selection(df, dt, message_type, docnum_lo, docnum_hi):
-    """Fill BD87 selection screen fields. Works for all known field ID variants."""
-    field_sets = [
-        # (low_date, high_date, mestyp, docnum_lo, docnum_hi)
-        ("wnd[0]/usr/ctxtSEL_CREDAT-LOW",  "wnd[0]/usr/ctxtSEL_CREDAT-HIGH",
-         "wnd[0]/usr/ctxtSEL_MESTYP-LOW",  "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
-         "wnd[0]/usr/ctxtSEL_DOCNUM-HIGH"),
-        # sub-screen variant
-        ("wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_CREDAT-LOW",
-         "wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_CREDAT-HIGH",
-         "wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_MESTYP-LOW",
-         "wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_DOCNUM-LOW",
-         "wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_DOCNUM-HIGH"),
+    """
+    Fill BD87 'Select IDocs' screen fields.
+
+    BD87 field layout (from screen inspection):
+      • IDoc Number   — SEL_DOCNUM-LOW / HIGH  (ctxt OR txt)
+      • Created On    — SEL_CREDAT-LOW / HIGH
+      • Changed On    — SEL_UPDDAT-LOW / HIGH  ← BD87 auto-fills this; primary date
+      • IDoc Status   — SEL_STATUS-LOW / HIGH
+      • Message Type  — SEL_MESTYP-LOW / HIGH
+
+    Strategy:
+      1. Try two known sub-screen prefixes × both ctxt and txt prefixes
+      2. Walk all elements and match by ID fragment (DOCNUM, UPDDAT, CREDAT, MESTYP)
+      3. Label-based search for IDoc Number field as last resort
+    """
+    # ── Tier 1: hardcoded ID sets ─────────────────────────────────────────────
+    PREFIXES = [
+        "wnd[0]/usr/",
+        "wnd[0]/usr/sub:SAPLBD7H:0100/",
+        "wnd[0]/usr/sub:SAPLBD87:0100/",
     ]
-    for (flo, fhi, fmsg, fdlo, fdhi) in field_sets:
-        try:
-            session.FindById(flo).Text = df
-            session.FindById(fhi).Text = dt
-            if message_type:
-                try:
-                    session.FindById(fmsg).Text = message_type.upper()
-                except Exception:
-                    pass
-            if docnum_lo:
-                try:
-                    session.FindById(fdlo).Text = docnum_lo
-                    session.FindById(fdhi).Text = docnum_hi
-                except Exception:
-                    pass
-            return True
-        except Exception:
-            pass
-    # Last resort: discover and fill by ID fragment
-    elems = discover_elements()
+    for pfx in PREFIXES:
+        for typ in ("ctxt", "txt"):
+            try:
+                # IDoc Number
+                lo_fid = f"{pfx}{typ}SEL_DOCNUM-LOW"
+                hi_fid = f"{pfx}{typ}SEL_DOCNUM-HIGH"
+                if docnum_lo:
+                    session.FindById(lo_fid).Text = docnum_lo
+                    try: session.FindById(hi_fid).Text = docnum_hi
+                    except Exception: pass
+
+                # Date — try Changed On (UPDDAT) first, then Created On (CREDAT)
+                date_set = False
+                for dfield in ("SEL_UPDDAT", "SEL_CREDAT"):
+                    try:
+                        session.FindById(f"{pfx}{typ}{dfield}-LOW").Text = df
+                        try: session.FindById(f"{pfx}{typ}{dfield}-HIGH").Text = dt
+                        except Exception: pass
+                        date_set = True
+                        break
+                    except Exception:
+                        pass
+
+                # Message type
+                if message_type:
+                    try:
+                        session.FindById(f"{pfx}{typ}SEL_MESTYP-LOW").Text = \
+                            message_type.upper()
+                    except Exception:
+                        pass
+
+                return True
+            except Exception:
+                pass
+
+    # ── Tier 2: element scan by ID fragment ───────────────────────────────────
+    elems  = discover_elements()
     filled = False
     for e in elems:
         eid = e.get("id", "").upper()
         try:
-            if "CREDAT" in eid and "LOW" in eid:
+            if "DOCNUM" in eid and "LOW" in eid and docnum_lo:
+                session.FindById(e["id"]).Text = docnum_lo; filled = True
+            elif "DOCNUM" in eid and "HIGH" in eid and docnum_hi:
+                session.FindById(e["id"]).Text = docnum_hi
+            elif ("UPDDAT" in eid or "CREDAT" in eid) and "LOW" in eid:
                 session.FindById(e["id"]).Text = df; filled = True
-            elif "CREDAT" in eid and "HIGH" in eid:
+            elif ("UPDDAT" in eid or "CREDAT" in eid) and "HIGH" in eid:
                 session.FindById(e["id"]).Text = dt
             elif "MESTYP" in eid and "LOW" in eid and message_type:
                 session.FindById(e["id"]).Text = message_type.upper()
-            elif "DOCNUM" in eid and "LOW" in eid and docnum_lo:
-                session.FindById(e["id"]).Text = docnum_lo
-            elif "DOCNUM" in eid and "HIGH" in eid and docnum_hi:
-                session.FindById(e["id"]).Text = docnum_hi
         except Exception:
             pass
+
+    # ── Tier 3: label-based search for IDoc Number field ─────────────────────
+    if not filled and docnum_lo:
+        obj, _ = _find_field_by_label(
+            ["IDoc Number", "IDoc-Nummer", "IDoc Nummer"])
+        if obj:
+            try:
+                obj.Text = docnum_lo
+                filled = True
+            except Exception:
+                pass
+
     return filled
 
 
