@@ -6949,6 +6949,97 @@ def run_agent(user_query, api_key, messages=None):
     print(f"Audit log      → {LOG_DIR}")
     return messages, last_text
 
+# ── NLP Input Parser ───────────────────────────────────────────────────────────
+def _nlp_parse_input(query: str, last_text: str, api_key: str) -> tuple:
+    """
+    Use Claude Haiku to classify user intent and enrich terse keyboard input.
+
+    Returns (action, enriched_query) where:
+      action         : "CONTINUE" | "NEW_TASK"
+      enriched_query : full natural-language expansion of what the user meant
+
+    Examples:
+      "A"              → CONTINUE, "Approved. Please proceed with the fix."
+      "R"              → CONTINUE, "Rejected. Please skip this fix."
+      "yes"            → CONTINUE, "Yes, please proceed."
+      "do all"         → CONTINUE, "Please fix all remaining errors automatically."
+      "skip vendor"    → CONTINUE, "Skip the vendor fix but continue with the others."
+      "what about 198025" → CONTINUE, "What was the result for IDoc 198025?"
+      "scan failed jobs" → NEW_TASK, (original query)
+    """
+    if not last_text:
+        return "NEW_TASK", query
+
+    # Explicit hard resets — skip API call
+    q_lower = query.strip().lower()
+    if q_lower in ("new", "reset", "clear", "start over", "new task", "/new"):
+        return "NEW_TASK", query
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    prompt = f"""You are the input parser for an SAP automation agent (ARTILEGENZ).
+
+The agent's last response (last 700 chars):
+---
+{last_text[-700:]}
+---
+
+The user just typed: "{query}"
+
+Your job:
+1. Decide if this is a CONTINUATION of the current conversation or a NEW_TASK.
+
+   CONTINUATION examples:
+     - Approval/rejection: "A", "R", "yes", "no", "ok", "sure", "skip", "go", "proceed"
+     - Follow-up question: "what about idoc 198025", "did it work", "show details"
+     - Instruction to current task: "do all of them", "fix all", "skip the vendor one",
+       "try again", "also check the GL account", "what's the error text"
+     - Short acknowledgement: "ok thanks", "got it", "understood", "continue"
+     - Correction: "actually fix all not just one", "use company code 2000"
+
+   NEW_TASK examples:
+     - Completely different SAP operation: "scan failed jobs this week",
+       "show all blocked invoices", "fix ABAP dump in SAPMV45A",
+       "create partner profile for vendor 100012"
+     - Only NEW_TASK if it is CLEARLY unrelated to what the agent just discussed.
+
+2. Enrich the user's input into a clear natural-language instruction.
+   Keep the user's intent exactly — just expand terse input so the agent understands.
+   Do NOT add information that wasn't implied. Do NOT change the meaning.
+
+Reply in this EXACT format (two lines, nothing else):
+ACTION: CONTINUE|NEW_TASK
+ENRICHED: <the enriched instruction>"""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        action   = "CONTINUE"
+        enriched = query
+        for line in text.splitlines():
+            if line.startswith("ACTION:"):
+                val = line.split(":", 1)[1].strip().upper()
+                action = val if val in ("CONTINUE", "NEW_TASK") else "CONTINUE"
+            elif line.startswith("ENRICHED:"):
+                enriched = line.split(":", 1)[1].strip()
+        return action, enriched
+
+    except Exception:
+        # Heuristic fallback if Haiku call fails
+        SAP_ACTIONS = {"scan","fix","show","find","create","release","reverse",
+                       "check","run","load","repair","list","update","cancel",
+                       "idoc","order","vendor","material","invoice","job",
+                       "workflow","lock","dump","abap","delivery","purchase"}
+        words = set(q_lower.split())
+        if len(query) > 80 and bool(words & SAP_ACTIONS):
+            return "NEW_TASK", query
+        return "CONTINUE", query
+
+
 # ── Entry Point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -6958,7 +7049,7 @@ if __name__ == "__main__":
     print("\n" + "═" * 68)
     print("  ARTILEGENZ SAP Agent v13.0  —  User: S4ABAP24  [SAP_ALL]")
     print("  Mode: AUTONOMOUS AUTO-FIX  —  Full System Access")
-    print("  Agent fixes errors automatically and reports what was done.")
+    print("  NLP input parsing active — type naturally.")
     print("═" * 68)
     print("\nType any query. Type 'new' to reset context. Type 'exit' to quit.")
     print('Examples: "Fix all IDoc errors from today"')
@@ -6966,47 +7057,8 @@ if __name__ == "__main__":
     print('          "Fix all failed background jobs this week"')
     print()
 
-    # ── Continuity engine ─────────────────────────────────────────────────────
-    # The agent maintains a live conversation thread. Any short user response
-    # (feedback, follow-up, single words) continues the same thread.
-    # Only a clearly NEW multi-word query about a different topic resets it.
-
-    # Words that explicitly reset the conversation
-    RESET_WORDS = {"new", "reset", "restart", "clear", "start over", "new query",
-                   "different", "new task", "another"}
-
-    # Minimum character length that could be a new topic (not a follow-up)
-    NEW_TOPIC_THRESHOLD = 60
-
-    # SAP transaction / domain keywords — if present in a long response it's new
-    SAP_KEYWORDS = {
-        "scan", "find", "fix", "show", "check", "create", "release",
-        "reverse", "cancel", "run", "load", "update", "list", "repair",
-        "idoc", "purchase", "sales", "order", "invoice", "vendor", "customer",
-        "material", "delivery", "job", "workflow", "lock", "dump", "abap",
-        "fi", "co", "mm", "sd", "pp", "wm", "sm", "we", "va", "me", "fb",
-    }
-
-    pending_messages = None   # current conversation thread
-    last_text        = ""     # last assistant response text
-
-    def _is_new_topic(query: str, has_pending: bool) -> bool:
-        """Return True when query should start a fresh conversation."""
-        if not has_pending:
-            return True
-        q = query.strip().lower()
-        # Explicit reset
-        if q in RESET_WORDS or any(q.startswith(r + " ") for r in RESET_WORDS):
-            return True
-        # Short response → always a continuation (follow-up / acknowledgement)
-        if len(query.strip()) <= NEW_TOPIC_THRESHOLD:
-            return False
-        # Long query AND contains SAP action keywords → likely a new task
-        words = set(q.split())
-        if words & SAP_KEYWORDS:
-            return True
-        # Long but no SAP keywords → continuation (e.g. "please also check the vendor")
-        return False
+    pending_messages = None   # current live conversation thread
+    last_text        = ""     # last assistant response (for NLP context)
 
     while True:
         try:
@@ -7020,15 +7072,25 @@ if __name__ == "__main__":
         if query.lower() in ("exit", "quit", "q"):
             break
 
-        new_topic = _is_new_topic(query, pending_messages is not None)
+        # ── NLP classification ────────────────────────────────────────────────
+        if pending_messages is not None:
+            action, enriched = _nlp_parse_input(query, last_text, API_KEY)
+            if enriched != query:
+                print(f"  [NLP] {action} → \"{enriched}\"")
+            else:
+                print(f"  [NLP] {action}")
+        else:
+            action   = "NEW_TASK"
+            enriched = query
 
-        if new_topic:
+        # ── Route to agent ────────────────────────────────────────────────────
+        if action == "NEW_TASK":
             if pending_messages is not None:
                 print("\n[Starting new conversation]")
-            pending_messages, last_text = run_agent(query, API_KEY)
+                pending_messages = None
+            pending_messages, last_text = run_agent(enriched, API_KEY)
         else:
-            # Continue the existing thread — pass user response as next message
-            print(f"\n[Continuing conversation]")
+            # CONTINUE — pass the enriched message into the existing thread
             pending_messages, last_text = run_agent(
-                query, API_KEY, messages=pending_messages
+                enriched, API_KEY, messages=pending_messages
             )
