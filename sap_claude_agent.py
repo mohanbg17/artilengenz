@@ -6853,6 +6853,88 @@ WHEN A TOOL RETURNS AN ERROR:
   they can paste it manually.
 """
 
+# ── Token / Rate-Limit Management ──────────────────────────────────────────────
+
+# Maximum chars stored per tool result in the messages list.
+# Full output is still printed to console; only the stored copy is capped.
+_TOOL_RESULT_CAP = 1500
+
+# When the messages list grows past this many entries, compress older exchanges.
+# Each tool call = 2 entries (assistant + user/tool_result), so 40 = ~20 calls.
+_MSG_COMPRESS_THRESHOLD = 40
+# How many of the most-recent messages to always keep intact
+_MSG_KEEP_RECENT = 20
+
+
+def _cap_tool_result(content_str: str) -> str:
+    """Truncate a tool result string to _TOOL_RESULT_CAP chars."""
+    if len(content_str) <= _TOOL_RESULT_CAP:
+        return content_str
+    return content_str[:_TOOL_RESULT_CAP] + " ...[truncated]"
+
+
+def _compress_messages(messages: list) -> list:
+    """
+    When the conversation thread grows very long, replace the oldest middle
+    section with a lightweight summary placeholder so the token count stays
+    manageable.  Always preserves:
+      • messages[0]  — original user query
+      • last _MSG_KEEP_RECENT messages — most recent context
+    """
+    if len(messages) <= _MSG_COMPRESS_THRESHOLD:
+        return messages
+
+    first      = messages[0]
+    middle     = messages[1 : len(messages) - _MSG_KEEP_RECENT]
+    recent     = messages[len(messages) - _MSG_KEEP_RECENT :]
+
+    # Count how many tool calls were in the compressed window
+    tool_calls = sum(
+        1 for m in middle
+        if m["role"] == "assistant"
+        and isinstance(m.get("content"), list)
+        and any(getattr(b, "type", None) == "tool_use" or
+                (isinstance(b, dict) and b.get("type") == "tool_use")
+                for b in m["content"])
+    )
+
+    summary = {
+        "role":    "user",
+        "content": (
+            f"[Earlier portion of this conversation compressed to save tokens. "
+            f"{len(middle)} messages / ~{tool_calls} tool calls were made in the "
+            f"previous steps. The most recent {_MSG_KEEP_RECENT} messages follow.]"
+        ),
+    }
+
+    compressed = [first, summary] + recent
+    print(f"  [Context compressed: {len(messages)} → {len(compressed)} messages]")
+    return compressed
+
+
+def _api_call_with_retry(client, max_retries=4, **kwargs):
+    """
+    Call client.messages.create with exponential back-off on 429 rate-limit
+    errors.  Also compresses messages on the second and later attempts.
+    """
+    import anthropic as _anthropic
+    wait = 5  # seconds before first retry
+    for attempt in range(max_retries + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except _anthropic.RateLimitError as exc:
+            if attempt == max_retries:
+                raise
+            print(f"\n  [Rate limit (429) — waiting {wait}s, retry {attempt + 1}/{max_retries}...]")
+            time.sleep(wait)
+            wait = min(wait * 2, 60)   # cap at 60 s
+            # On retry, compress the messages to reduce token count
+            if "messages" in kwargs:
+                kwargs["messages"] = _compress_messages(kwargs["messages"])
+        except Exception:
+            raise
+
+
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
 def run_agent(user_query, api_key, messages=None):
     """
@@ -6874,7 +6956,11 @@ def run_agent(user_query, api_key, messages=None):
     print("\nARTILEGENZ agent running...\n")
 
     while True:
-        response = client.messages.create(
+        # Compress if thread is very long before sending
+        messages = _compress_messages(messages)
+
+        response = _api_call_with_retry(
+            client,
             model="claude-opus-4-6",
             max_tokens=8192,
             system=SYSTEM_PROMPT,
@@ -6907,13 +6993,15 @@ def run_agent(user_query, api_key, messages=None):
                 except Exception as exc:
                     result = {"error": str(exc)}
 
-                preview = json.dumps(result, ensure_ascii=False)[:300]
-                print(f"   Out  : {preview}")
+                full_content = json.dumps(result, ensure_ascii=False)
+                # Print more to console than we store in the thread
+                print(f"   Out  : {full_content[:400]}")
 
                 tool_results.append({
                     "type":        "tool_result",
                     "tool_use_id": block.id,
-                    "content":     json.dumps(result, ensure_ascii=False),
+                    # Cap stored content to keep tokens under control
+                    "content":     _cap_tool_result(full_content),
                 })
 
             messages.append({"role": "user", "content": tool_results})
