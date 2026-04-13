@@ -798,118 +798,304 @@ def se11_create_table(table_name, short_text, package="$TMP"):
         return {"error": str(e)}
 
 
-# ── ABAP Dump Functions (ST22) ────────────────────────────────────────────────
+# ── Universal ALV Shell Finder ────────────────────────────────────────────────
+def _find_shell_anywhere(container_hints=None):
+    """
+    Robustly locate any ALV grid shell on the current screen.
+    Tries a list of known container IDs first, then walks the full UI tree.
+    Returns the first usable GuiShell object, or None.
+    """
+    candidates = list(container_hints or [])
+    for hint in candidates:
+        for path in (hint, hint + "/shell", hint.rstrip("/shell")):
+            try:
+                obj = session.FindById(path, False)
+                if obj and hasattr(obj, "RowCount"):
+                    return obj
+            except Exception:
+                pass
+
+    # Walk the entire window tree looking for any object with RowCount
+    found = [None]
+    def walk(comp, depth=0):
+        if found[0] or depth > 7:
+            return
+        try:
+            n = comp.Children.Count
+        except Exception:
+            return
+        for i in range(n):
+            try:
+                child = comp.Children(i)
+                try:
+                    if hasattr(child, "RowCount"):
+                        _ = child.RowCount      # confirm accessible
+                        found[0] = child
+                        return
+                except Exception:
+                    pass
+                walk(child, depth + 1)
+                if found[0]:
+                    return
+            except Exception:
+                pass
+    walk(session.FindById("wnd[0]"))
+    return found[0]
+
+
+def _read_shell_rows(shell, columns, max_rows=300):
+    """Read up to max_rows from an ALV shell into a list of dicts."""
+    rows = []
+    try:
+        count = shell.RowCount
+        for i in range(min(count, max_rows)):
+            row = {}
+            for col in columns:
+                try:
+                    row[col] = shell.GetCellValue(i, col)
+                except Exception:
+                    pass
+            if any(v for v in row.values() if v):
+                row["_row"] = i
+                rows.append(row)
+    except Exception:
+        pass
+    return rows
+
+
+def _screen_texts():
+    """Walk the current screen and return all visible text strings."""
+    texts = []
+    def walk(comp, depth=0):
+        if depth > 8:
+            return
+        try:
+            n = comp.Children.Count
+        except Exception:
+            return
+        for i in range(n):
+            try:
+                child = comp.Children(i)
+                if child.Type in ("GuiTextField", "GuiCTextField",
+                                  "GuiLabel", "GuiStatusbar", "GuiTitlebar"):
+                    try:
+                        t = child.Text.strip()
+                        if t:
+                            texts.append(t)
+                    except Exception:
+                        pass
+                walk(child, depth + 1)
+            except Exception:
+                pass
+    walk(session.FindById("wnd[0]"))
+    return texts
+
+
 def scan_st22_dumps(date_from=None, date_to=None):
-    """List ABAP runtime errors from ST22."""
-    go_to_transaction("ST22")
-    time.sleep(1.5)
+    """
+    List ABAP runtime errors from ST22.
+    Strategy:
+      1. Navigate ST22 and try to read the ALV/list grid (all known container IDs).
+      2. Walk full UI tree for any accessible shell.
+      3. Fall back to reading SNAP table directly via SE16N.
+      4. Always return screen texts + element list so Claude can see what's visible.
+    """
     today = datetime.now().strftime("%d.%m.%Y")
     df = date_from or today
     dt = date_to   or today
-    try:
-        for fid in ("wnd[0]/usr/ctxtSEL_DATUM-LOW", "wnd[0]/usr/ctxtP_DATUM"):
-            try:
-                session.FindById(fid).Text = df
-                break
-            except Exception:
-                pass
-        for fid in ("wnd[0]/usr/ctxtSEL_DATUM-HIGH", "wnd[0]/usr/ctxtP_DATUM2"):
-            try:
-                session.FindById(fid).Text = dt
-                break
-            except Exception:
-                pass
-    except Exception:
-        pass
-    session.FindById("wnd[0]").SendVKey(8)   # Execute
-    time.sleep(2)
+
+    go_to_transaction("ST22")
+    time.sleep(1.5)
+
+    # ── Set date fields — try every known field ID variant ────────────────────
+    for fid in ("wnd[0]/usr/ctxtSEL_DATUM-LOW",
+                "wnd[0]/usr/ctxtP_DATUM",
+                "wnd[0]/usr/subBESTIM:RSTS22:0200/ctxtSTARTDAT",
+                "wnd[0]/usr/ctxtDAT1"):
+        try: session.FindById(fid).Text = df; break
+        except Exception: pass
+
+    for fid in ("wnd[0]/usr/ctxtSEL_DATUM-HIGH",
+                "wnd[0]/usr/ctxtP_DATUM2",
+                "wnd[0]/usr/subBESTIM:RSTS22:0200/ctxtENDDAT",
+                "wnd[0]/usr/ctxtDAT2"):
+        try: session.FindById(fid).Text = dt; break
+        except Exception: pass
+
+    # Try "All Clients" button before executing
+    for fid in ("wnd[0]/tbar[1]/btn[7]", "wnd[0]/tbar[1]/btn[8]"):
+        try: session.FindById(fid).Press(); time.sleep(0.5); break
+        except Exception: pass
+
+    session.FindById("wnd[0]").SendVKey(8)   # F8 Execute
+    time.sleep(2.5)
 
     dumps = []
-    # Try ALV grid first
-    try:
-        shell = session.FindById(
-            "wnd[0]/usr/cntlST22_CONTAINER/shellcont/shell", False)
-        if shell:
-            rows = shell.RowCount
-            for i in range(min(rows, 50)):
-                row = {}
-                for col in ["DATUM","UZEIT","UNAME","REPID","ERTYP","MANDT"]:
-                    try:
-                        row[col] = shell.GetCellValue(i, col)
-                    except Exception:
-                        pass
-                if any(row.values()):
-                    row["index"] = i
-                    dumps.append(row)
-    except Exception:
-        pass
+    method_used = "none"
 
-    return {"date": df, "dumps": dumps, "count": len(dumps),
-            "screen": get_screen_text()}
+    # ── Strategy 1: Try every known ST22 ALV container ID ─────────────────────
+    ST22_CONTAINERS = [
+        "wnd[0]/usr/cntlST22_CONTAINER/shellcont/shell",
+        "wnd[0]/usr/cntlST22_CONTAINER/shellcont/shell/shellcont/shell",
+        "wnd[0]/usr/cntlGRID1/shellcont/shell",
+        "wnd[0]/usr/cntlGRID/shellcont/shell",
+        "wnd[0]/usr/cntlCONTAINER/shellcont/shell",
+        "wnd[0]/usr/cntlALV_CONTAINER/shellcont/shell",
+    ]
+    ST22_COLS = ["DATUM","UZEIT","UNAME","REPID","ERTYP","MANDT",
+                 "ADATE","ATIME","SYSUNAM","ABTYPE","SRTXT",
+                 "CPROG","INCLNAME","ERRLINE"]
+
+    shell = _find_shell_anywhere(ST22_CONTAINERS)
+    if shell:
+        dumps = _read_shell_rows(shell, ST22_COLS, max_rows=200)
+        for i, d in enumerate(dumps):
+            d["index"] = i
+        method_used = "alv_grid"
+
+    # ── Strategy 2: SNAP table via SE16N (most reliable fallback) ─────────────
+    if not dumps:
+        try:
+            df_snap = datetime.strptime(df, "%d.%m.%Y").strftime("%Y%m%d")
+            dt_snap = datetime.strptime(dt, "%d.%m.%Y").strftime("%Y%m%d")
+
+            go_to_transaction("SE16N")
+            time.sleep(1)
+            for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
+                try: session.FindById(fid).Text = "SNAP"; break
+                except Exception: pass
+            session.FindById("wnd[0]").SendVKey(0)
+            time.sleep(1.5)
+
+            # Set DATUM filter
+            elems = discover_elements()
+            for e in elems:
+                if "DATUM" in e.get("id","").upper() and "LOW" in e.get("id","").upper():
+                    try: session.FindById(e["id"]).Text = df_snap; break
+                    except Exception: pass
+            for e in elems:
+                if "DATUM" in e.get("id","").upper() and "HIGH" in e.get("id","").upper():
+                    try: session.FindById(e["id"]).Text = dt_snap; break
+                    except Exception: pass
+
+            # Max rows
+            for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
+                try: session.FindById(fid).Text = "500"; break
+                except Exception: pass
+
+            session.FindById("wnd[0]").SendVKey(8)
+            time.sleep(2.5)
+
+            snap_shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
+            if snap_shell:
+                snap_cols = ["DATUM","UZEIT","MANDT","UNAME","REPID",
+                             "ERTYP","ARID","SRTXT","CPROG"]
+                rows = _read_shell_rows(snap_shell, snap_cols, max_rows=500)
+                for i, r in enumerate(rows):
+                    d = r.get("DATUM","")
+                    if df_snap <= d <= dt_snap:
+                        r["index"] = len(dumps)
+                        dumps.append(r)
+                method_used = "snap_table"
+        except Exception as snap_err:
+            pass
+
+    # ── Strategy 3: Parse visible screen text ─────────────────────────────────
+    screen_txts = _screen_texts()
+    all_elements = discover_elements()
+
+    result = {
+        "date_from": df,
+        "date_to":   dt,
+        "dumps":     dumps,
+        "count":     len(dumps),
+        "method":    method_used,
+        "screen":    get_screen_text(),
+    }
+    if not dumps:
+        # Provide everything visible so Claude can diagnose the screen
+        result["screen_texts"]  = screen_txts[:150]
+        result["all_elements"]  = [e["id"] for e in all_elements[:80]]
+        result["note"] = (
+            "ALV grid not found and SNAP fallback returned 0 rows. "
+            "screen_texts and all_elements show exactly what is currently visible. "
+            "Use discover_screen_elements then set_field_value to interact manually."
+        )
+    return result
 
 
 def get_dump_detail(dump_index=0):
     """
-    Open a specific dump from ST22 (by row index) and extract:
-    error type, program, include, line number, error text, call stack, variables.
+    Open a specific dump from ST22 by row index.
+    Tries ALV double-click, then row selection + Enter, then direct navigation.
+    Extracts: error type, program, include, line, error text, call stack.
     """
     try:
-        # Try ALV double-click
-        try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlST22_CONTAINER/shellcont/shell", False)
-            if shell:
-                shell.SetCurrentCell(dump_index, "DATUM")
-                shell.DoubleClickCurrentCell()
-                time.sleep(2)
-            else:
-                raise Exception("no shell")
-        except Exception:
-            # Fallback: position cursor and press Enter
-            session.FindById("wnd[0]").SendVKey(2)
-            time.sleep(2)
-
-        # Walk all text from dump detail screen
-        texts = []
-        def walk_text(comp, depth=0):
-            if depth > 9:
-                return
+        # ── Try to double-click the row in the ALV grid ───────────────────────
+        opened = False
+        shell = _find_shell_anywhere([
+            "wnd[0]/usr/cntlST22_CONTAINER/shellcont/shell",
+            "wnd[0]/usr/cntlGRID1/shellcont/shell",
+            "wnd[0]/usr/cntlGRID/shellcont/shell",
+        ])
+        if shell:
             try:
-                n = comp.Children.Count
+                # Try to select via first visible column
+                for col in ("DATUM","ADATE","ERTYP","REPID","_row"):
+                    try:
+                        shell.SetCurrentCell(dump_index, col)
+                        shell.DoubleClickCurrentCell()
+                        opened = True
+                        break
+                    except Exception:
+                        pass
             except Exception:
-                return
-            for i in range(n):
-                try:
-                    child = comp.Children(i)
-                    if child.Type in ("GuiTextField","GuiCTextField",
-                                     "GuiLabel","GuiStatusbar","GuiTitlebar"):
-                        try:
-                            t = child.Text.strip()
-                            if t:
-                                texts.append(t)
-                        except Exception:
-                            pass
-                    walk_text(child, depth + 1)
-                except Exception:
-                    pass
+                pass
 
-        walk_text(session.FindById("wnd[0]"))
-        raw = "\n".join(texts[:300])
+        if not opened:
+            # Fallback: use keyboard to navigate to row then Enter
+            try:
+                for _ in range(dump_index):
+                    session.FindById("wnd[0]").SendVKey(2)   # cursor down
+                    time.sleep(0.1)
+                session.FindById("wnd[0]").SendVKey(2)       # Enter on row
+            except Exception:
+                session.FindById("wnd[0]").SendVKey(0)
 
-        # Parse key fields from raw text
-        result = {"dump_index": dump_index, "raw": raw,
-                  "screen": get_screen_text()}
+        time.sleep(2)
 
-        # Extract program name from dump text
-        for line in texts:
-            if "Program" in line or "REPID" in line:
-                result["program_hint"] = line
-                break
+        # ── Collect all text from the dump detail screen ──────────────────────
+        raw_texts = _screen_texts()
+        raw = "\n".join(raw_texts[:400])
+
+        result = {
+            "dump_index":  dump_index,
+            "raw":         raw,
+            "screen":      get_screen_text(),
+            "all_elements": [e["id"] for e in discover_elements()[:60]],
+        }
+
+        # Extract key fields by pattern scanning
+        import re
+        for line in raw_texts:
+            ll = line.lower()
+            if not result.get("program")  and ("program" in ll or "repid" in ll):
+                result["program"] = line
+            if not result.get("error_type") and ("exception" in ll or "ertyp" in ll
+                                                   or "runtime error" in ll.replace(" ","")):
+                result["error_type"] = line
+            if not result.get("line_number") and re.search(r"\bline\b|\bzeile\b", ll):
+                result["line_number"] = line
+            if not result.get("include") and ("include" in ll or "includes" in ll):
+                result["include"] = line
 
         return result
 
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "dump_index": dump_index}
 
 
 def _clipboard_copy_from_sap():
@@ -1204,95 +1390,160 @@ IDOC_FIX_MAP = {
 def scan_idoc_errors(date_from=None, date_to=None, direction="both",
                      status_filter="51"):
     """
-    Scan for IDoc errors using WE05 (IDoc list).
-    Returns list of failed IDocs with number, status, message type, partner.
-    status_filter: comma-separated status codes to search e.g. '51,26,56'
-    direction: 'inbound', 'outbound', or 'both'
+    Scan for IDoc errors.
+    Strategy:
+      1. Navigate WE05 and try all known ALV container IDs.
+      2. Walk full UI tree for any accessible shell.
+      3. Fall back to reading EDIDC table directly via SE16N.
+    status_filter: comma-separated status codes e.g. '51,26,56' or 'all'.
+    direction: 'inbound', 'outbound', or 'both'.
     """
     today = datetime.now().strftime("%d.%m.%Y")
     df = date_from or today
     dt = date_to   or today
+    statuses = [] if status_filter == "all" else status_filter.split(",")
+
+    # Convert DD.MM.YYYY → YYYYMMDD for table filter
+    try:
+        df_sap = datetime.strptime(df, "%d.%m.%Y").strftime("%Y%m%d")
+        dt_sap = datetime.strptime(dt, "%d.%m.%Y").strftime("%Y%m%d")
+    except Exception:
+        df_sap = df_sap = ""
 
     go_to_transaction("WE05")
     time.sleep(1.5)
 
-    try:
-        # Set date range
-        for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-LOW",
-                    "wnd[0]/usr/ctxtLOW_DATE"):
-            try:
-                session.FindById(fid).Text = df
-                break
-            except Exception:
-                pass
-        for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-HIGH",
-                    "wnd[0]/usr/ctxtHIGH_DATE"):
-            try:
-                session.FindById(fid).Text = dt
-                break
-            except Exception:
-                pass
+    # ── Set selection fields ───────────────────────────────────────────────────
+    for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-LOW", "wnd[0]/usr/ctxtLOW_DATE",
+                "wnd[0]/usr/ctxtCREDAT-LOW"):
+        try: session.FindById(fid).Text = df; break
+        except Exception: pass
+    for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-HIGH", "wnd[0]/usr/ctxtHIGH_DATE",
+                "wnd[0]/usr/ctxtCREDAT-HIGH"):
+        try: session.FindById(fid).Text = dt; break
+        except Exception: pass
 
-        # Set direction (inbound/outbound)
-        if direction == "inbound":
-            for fid in ("wnd[0]/usr/radRB_DIRECT_1",
-                        "wnd[0]/usr/radINBOUND"):
-                try:
-                    session.FindById(fid).Select()
-                    break
-                except Exception:
-                    pass
-        elif direction == "outbound":
-            for fid in ("wnd[0]/usr/radRB_DIRECT_2",
-                        "wnd[0]/usr/radOUTBOUND"):
-                try:
-                    session.FindById(fid).Select()
-                    break
-                except Exception:
-                    pass
+    if direction == "inbound":
+        for fid in ("wnd[0]/usr/radRB_DIRECT_1", "wnd[0]/usr/radINBOUND"):
+            try: session.FindById(fid).Select(); break
+            except Exception: pass
+    elif direction == "outbound":
+        for fid in ("wnd[0]/usr/radRB_DIRECT_2", "wnd[0]/usr/radOUTBOUND"):
+            try: session.FindById(fid).Select(); break
+            except Exception: pass
 
-        # Execute
-        session.FindById("wnd[0]").SendVKey(8)
-        time.sleep(2.5)
+    # Put status codes into the selection screen if there's a field for it
+    if statuses:
+        for fid in ("wnd[0]/usr/ctxtSEL_STATUS-LOW", "wnd[0]/usr/ctxtSTATUS"):
+            try: session.FindById(fid).Text = statuses[0]; break
+            except Exception: pass
 
-        # Read ALV grid
-        idocs = []
+    session.FindById("wnd[0]").SendVKey(8)
+    time.sleep(2.5)
+
+    idocs = []
+    method_used = "none"
+
+    # ── Strategy 1: Try all known WE05 ALV container IDs ─────────────────────
+    WE05_CONTAINERS = [
+        "wnd[0]/usr/cntlWE05_CONTAINER/shellcont/shell",
+        "wnd[0]/usr/cntlGRID1/shellcont/shell",
+        "wnd[0]/usr/cntlGRID/shellcont/shell",
+        "wnd[0]/usr/cntlCONTAINER/shellcont/shell",
+        "wnd[0]/usr/cntlALV/shellcont/shell",
+    ]
+    IDOC_COLS = ["DOCNUM","STATUS","MANDT","DIRECT","MESTYP","MESCOD",
+                 "MESFCT","SNDPRT","SNDPRN","RCVPRT","RCVPRN",
+                 "CREDAT","CRETIM","UPDDAT","STATXT"]
+
+    shell = _find_shell_anywhere(WE05_CONTAINERS)
+    if shell:
+        rows_data = _read_shell_rows(shell, IDOC_COLS, max_rows=500)
+        for row in rows_data:
+            if not row.get("DOCNUM"):
+                continue
+            row["status_desc"] = IDOC_STATUS.get(row.get("STATUS",""), "Unknown")
+            if status_filter == "all" or row.get("STATUS","") in statuses:
+                idocs.append(row)
+        method_used = "alv_grid"
+
+    # ── Strategy 2: EDIDC table fallback ─────────────────────────────────────
+    if not idocs:
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlWE05_CONTAINER/shellcont/shell", False)
-            if shell:
-                rows = shell.RowCount
-                for i in range(min(rows, 200)):
-                    row = {}
-                    for col in ["DOCNUM","STATUS","MANDT","DIRECT",
-                                "MESTYP","MESCOD","MESFCT","SNDPRT",
-                                "SNDPRN","RCVPRT","RCVPRN","CREDAT",
-                                "CRETIM","UPDDAT","STATXT"]:
-                        try:
-                            row[col] = shell.GetCellValue(i, col)
-                        except Exception:
-                            pass
-                    if row.get("DOCNUM"):
-                        row["status_desc"] = IDOC_STATUS.get(
-                            row.get("STATUS",""), "Unknown")
-                        # Filter by status
-                        if status_filter == "all" or \
-                           row.get("STATUS","") in status_filter.split(","):
-                            idocs.append(row)
+            go_to_transaction("SE16N")
+            time.sleep(1)
+            for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
+                try: session.FindById(fid).Text = "EDIDC"; break
+                except Exception: pass
+            session.FindById("wnd[0]").SendVKey(0)
+            time.sleep(1.5)
+
+            elems = discover_elements()
+            # Set CREDAT (creation date) filter
+            for e in elems:
+                eid = e.get("id","").upper()
+                if "CREDAT" in eid and "LOW" in eid:
+                    try: session.FindById(e["id"]).Text = df_sap; break
+                    except Exception: pass
+            for e in elems:
+                eid = e.get("id","").upper()
+                if "CREDAT" in eid and "HIGH" in eid:
+                    try: session.FindById(e["id"]).Text = dt_sap; break
+                    except Exception: pass
+
+            # Set STATUS filter (first code only — SE16N single value)
+            if statuses:
+                for e in elems:
+                    eid = e.get("id","").upper()
+                    if "STATUS" in eid and "LOW" in eid:
+                        try: session.FindById(e["id"]).Text = statuses[0]; break
+                        except Exception: pass
+
+            # Max rows
+            for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
+                try: session.FindById(fid).Text = "1000"; break
+                except Exception: pass
+
+            session.FindById("wnd[0]").SendVKey(8)
+            time.sleep(2.5)
+
+            edidc_shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
+            if edidc_shell:
+                edidc_cols = ["DOCNUM","STATUS","DIRECT","MESTYP","SNDPRT",
+                              "SNDPRN","RCVPRT","RCVPRN","CREDAT","CRETIM"]
+                rows_data = _read_shell_rows(edidc_shell, edidc_cols, max_rows=1000)
+                for row in rows_data:
+                    if not row.get("DOCNUM"):
+                        continue
+                    row["status_desc"] = IDOC_STATUS.get(row.get("STATUS",""), "Unknown")
+                    # Apply direction filter
+                    if direction == "inbound"  and row.get("DIRECT","") != "1": continue
+                    if direction == "outbound" and row.get("DIRECT","") != "2": continue
+                    # Apply status filter
+                    if status_filter == "all" or row.get("STATUS","") in statuses:
+                        idocs.append(row)
+                method_used = "edidc_table"
         except Exception:
             pass
 
-        return {
-            "date_from":   df,
-            "date_to":     dt,
-            "idoc_errors": idocs,
-            "count":       len(idocs),
-            "screen":      get_screen_text(),
-            "note": (f"Found {len(idocs)} IDocs matching status {status_filter}. "
-                     "Call get_idoc_detail for each to analyse root cause."),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    result = {
+        "date_from":   df,
+        "date_to":     dt,
+        "idoc_errors": idocs,
+        "count":       len(idocs),
+        "method":      method_used,
+        "screen":      get_screen_text(),
+        "note": (f"Found {len(idocs)} IDocs matching status {status_filter} "
+                 f"(method: {method_used}). "
+                 "Call get_idoc_detail for each to analyse root cause."),
+    }
+    if not idocs:
+        result["screen_texts"] = _screen_texts()[:100]
+        result["all_elements"] = [e["id"] for e in discover_elements()[:80]]
+    return result
 
 
 def get_idoc_detail(idoc_number):
@@ -1327,8 +1578,11 @@ def get_idoc_detail(idoc_number):
 
         # Try to read tree/ALV structure
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlWE02_CONTAINER/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlWE02_CONTAINER/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 rows = shell.RowCount
                 for i in range(min(rows, 300)):
@@ -1705,8 +1959,11 @@ def scan_po_errors(date_from=None, date_to=None, company_code="",
 
         pos = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 300)):
                     row = {}
@@ -1938,8 +2195,11 @@ def scan_blocked_invoices(date_from=None, date_to=None, company_code="1000"):
                          "Q":"Quantity variance","D":"Date variance",
                          "A":"Amount exceeded","S":"Stochastic block"}
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
@@ -2160,8 +2420,11 @@ def scan_open_purchase_reqs(date_from=None, date_to=None,
 
         reqs = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
@@ -2311,8 +2574,11 @@ def scan_sd_errors(date_from=None, date_to=None, sales_org="",
 
         orders = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 300)):
                     row = {}
@@ -2815,8 +3081,11 @@ def scan_credit_blocks(date_from=None, date_to=None, sales_org=""):
 
         blocks = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
@@ -2871,8 +3140,11 @@ def scan_incomplete_orders(date_from=None, date_to=None, sales_org=""):
 
         orders = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
@@ -2954,8 +3226,11 @@ def scan_fi_errors(date_from=None, date_to=None, company_code="1000",
 
         items = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 300)):
                     row = {}
@@ -3232,8 +3507,11 @@ def scan_delivery_errors(date_from=None, date_to=None,
 
         deliveries = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
@@ -3424,8 +3702,11 @@ def scan_failed_jobs(date_from=None, date_to=None, job_name="",
 
         jobs = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
@@ -3474,8 +3755,11 @@ def restart_failed_job(job_name, job_count):
 
         # Find and select the row matching job_count
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 100)):
                     jc = shell.GetCellValue(i, "JOBCOUNT")
@@ -3542,8 +3826,11 @@ def scan_workflow_errors(date_from=None, date_to=None, task_id=""):
 
         items = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
@@ -3622,8 +3909,11 @@ def scan_sm12_locks(client="", username="", table_name=""):
 
         locks = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
@@ -3712,8 +4002,11 @@ def scan_sm58_errors(date_from=None, date_to=None):
 
         errors = []
         try:
-            shell = session.FindById(
-                "wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+            shell = _find_shell_anywhere([
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                "wnd[0]/usr/cntlGRID/shellcont/shell",
+            ])
             if shell:
                 for i in range(min(shell.RowCount, 200)):
                     row = {}
