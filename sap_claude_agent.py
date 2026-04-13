@@ -909,6 +909,191 @@ def _screen_texts():
 
 
 # ── GuiTree Reader (for WE02, BD87 result, etc.) ──────────────────────────────
+def _find_input_field_by_fragment(fragment: str):
+    """
+    Walk the FULL GUI tree (depth 9, not limited to 50 results) and return
+    the first GuiTextField / GuiCTextField whose SAP field ID contains 'fragment'.
+    More reliable than discover_elements when the field is deep in the tree
+    or beyond the 50-element cap.
+    Returns (sap_object, element_id) or (None, None).
+    """
+    SKIP_TYPES = {"GuiShell", "GuiTree", "GuiGridView", "GuiTableControl",
+                  "GuiContainerShell", "GuiSplitterContainer"}
+    found_obj = [None]
+    found_id  = [None]
+
+    def _walk(comp, depth=0):
+        if found_obj[0] or depth > 9:
+            return
+        try:
+            n = comp.Children.Count
+        except Exception:
+            return
+        for i in range(n):
+            try:
+                child = comp.Children(i)
+                t = child.Type
+                if t in ("GuiTextField", "GuiCTextField"):
+                    try:
+                        cid = child.Id
+                        if fragment.upper() in cid.upper():
+                            found_obj[0] = child
+                            found_id[0]  = cid
+                            return
+                    except Exception:
+                        pass
+                if t not in SKIP_TYPES:
+                    _walk(child, depth + 1)
+                    if found_obj[0]:
+                        return
+            except Exception:
+                pass
+
+    _walk(session.FindById("wnd[0]"))
+    return found_obj[0], found_id[0]
+
+
+def _clear_selection_screen():
+    """
+    Clear all text/ctxt input fields on the current SAP selection screen.
+    Also tries the standard keyboard shortcut Ctrl+F8 (Clear all) and F7.
+    """
+    # Try menu/vkey clear first
+    for vkey in (8, 17, 7):   # Ctrl+F8, F7 are common "clear" shortcuts
+        # Note: only use dedicated clear shortcuts, not F8 (Execute)
+        pass  # safe skip — F8 would execute, 17=Ctrl+Q etc.
+
+    # Walk all input fields and blank them
+    SKIP_TYPES = {"GuiShell", "GuiTree", "GuiGridView", "GuiTableControl",
+                  "GuiContainerShell", "GuiSplitterContainer"}
+    def _clear_walk(comp, depth=0):
+        if depth > 8:
+            return
+        try:
+            n = comp.Children.Count
+        except Exception:
+            return
+        for i in range(n):
+            try:
+                child = comp.Children(i)
+                t = child.Type
+                if t in ("GuiTextField", "GuiCTextField"):
+                    try:
+                        child.Text = ""
+                    except Exception:
+                        pass
+                if t not in SKIP_TYPES:
+                    _clear_walk(child, depth + 1)
+            except Exception:
+                pass
+    _clear_walk(session.FindById("wnd[0]"))
+
+
+def _we02_navigate_to_idoc(docnum_padded: str) -> bool:
+    """
+    Navigate WE02 to the detail screen for a single specific IDoc.
+
+    Steps:
+      1. go_to_transaction WE02 (always gives a fresh selection screen)
+      2. Clear ALL input fields so no leftover dates/filters interfere
+      3. Find the DOCNUM field by walking the full GUI tree
+      4. Set DOCNUM LOW = HIGH = docnum_padded
+      5. Execute F8
+      6. If a list screen appears, double-click / choose the first row
+      7. Return True when the IDoc detail screen is reached
+
+    Returns True if the IDoc Display screen is reached.
+    """
+    go_to_transaction("WE02")
+    time.sleep(2)
+
+    # ── Step 2: Clear all selection fields ───────────────────────────────────
+    _clear_selection_screen()
+    time.sleep(0.3)
+
+    # ── Step 3 & 4: Find DOCNUM field and set it ──────────────────────────────
+    set_lo = False
+
+    # Try known IDs first (fastest path — no tree walk needed)
+    known_ids = [
+        "wnd[0]/usr/ctxtS_DOCNUM-LOW",
+        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
+        "wnd[0]/usr/ctxtDOCNUM-LOW",
+        "wnd[0]/usr/ctxtDOCNUM",
+        "wnd[0]/usr/ctxtS_DOCNUM",
+        "wnd[0]/usr/ctxtSEL_DOCNUM",
+    ]
+    for fid in known_ids:
+        try:
+            obj = session.FindById(fid)
+            obj.Text = docnum_padded
+            obj.SetFocus()
+            set_lo = True
+            # Set matching HIGH field
+            hi_fid = (fid.replace("-LOW", "-HIGH")
+                         .replace("_LOW", "_HIGH"))
+            try:
+                session.FindById(hi_fid).Text = docnum_padded
+            except Exception:
+                pass
+            break
+        except Exception:
+            pass
+
+    if not set_lo:
+        # Full-tree scan — finds the field regardless of exact ID
+        lo_obj, lo_id = _find_input_field_by_fragment("DOCNUM")
+        if lo_obj:
+            try:
+                lo_obj.Text = docnum_padded
+                lo_obj.SetFocus()
+                set_lo = True
+                # Try to find and set the HIGH field
+                hi_id = (lo_id.replace("-LOW", "-HIGH")
+                              .replace("_LOW", "_HIGH"))
+                if hi_id != lo_id:
+                    try:
+                        session.FindById(hi_id).Text = docnum_padded
+                    except Exception:
+                        pass
+                else:
+                    # Try to find any sibling HIGH field
+                    hi_obj, _ = _find_input_field_by_fragment("DOCNUM-HIGH")
+                    if not hi_obj:
+                        hi_obj, _ = _find_input_field_by_fragment("DOCNUM_HIGH")
+                    if hi_obj:
+                        try:
+                            hi_obj.Text = docnum_padded
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    # ── Step 5: Execute ───────────────────────────────────────────────────────
+    session.FindById("wnd[0]").SendVKey(8)   # F8 = Execute
+    time.sleep(3)
+
+    # ── Step 6: Navigate from list screen into IDoc detail ───────────────────
+    screen = get_screen_text()
+    on_detail = ("IDoc Display:" in screen or "IDoc-Anzeige:" in screen
+                 or "0000000000" in screen)
+    if not on_detail:
+        # On list screen — choose first row
+        for vkey in (2, 0, 13):   # F2=choose, Enter, Enter
+            try:
+                session.FindById("wnd[0]").SendVKey(vkey)
+                time.sleep(1.5)
+                screen = get_screen_text()
+                if ("IDoc Display:" in screen or "IDoc-Anzeige:" in screen
+                        or docnum_padded.lstrip("0") in screen):
+                    on_detail = True
+                    break
+            except Exception:
+                pass
+
+    return on_detail, set_lo, screen
+
+
 def _find_gui_tree_anywhere():
     """Walk the current screen and return the first GuiTree object found."""
     found = [None]
@@ -1796,62 +1981,7 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
     return result
 
 
-def _we02_set_docnum(docnum: str) -> bool:
-    """
-    Set the IDoc number filter on the WE02 selection screen.
-    Tries hardcoded IDs first, then discovers fields dynamically.
-    Returns True if the field was set.
-    """
-    # Known IDs across SAP versions
-    known_lo = [
-        "wnd[0]/usr/ctxtS_DOCNUM-LOW",     # ECC 6.0
-        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",   # S/4 variant 1
-        "wnd[0]/usr/ctxtDOCNUM",           # S/4 variant 2
-        "wnd[0]/usr/ctxtSEL_DOCNUM",       # S/4 variant 3
-        "wnd[0]/usr/ctxtDOCNUM-LOW",
-    ]
-    known_hi = [
-        "wnd[0]/usr/ctxtS_DOCNUM-HIGH",
-        "wnd[0]/usr/ctxtSEL_DOCNUM-HIGH",
-        "wnd[0]/usr/ctxtDOCNUM-HIGH",
-    ]
-    set_lo = False
-    for fid in known_lo:
-        try:
-            session.FindById(fid).Text = docnum
-            set_lo = True
-            break
-        except Exception:
-            pass
-    for fid in known_hi:
-        try:
-            session.FindById(fid).Text = docnum
-            break
-        except Exception:
-            pass
-
-    if set_lo:
-        return True
-
-    # Dynamic fallback: discover all ctxt/txt fields and look for DOCNUM
-    elems = discover_elements()
-    for e in elems:
-        eid = e.get("id", "").upper()
-        if "DOCNUM" in eid and e.get("type") in ("GuiCTextField", "GuiTextField"):
-            try:
-                obj = session.FindById(e["id"])
-                obj.Text = docnum
-                set_lo = True
-                # Also try to find the matching HIGH field
-                hi_id = e["id"].replace("-LOW", "-HIGH").replace("LOW", "HIGH")
-                try:
-                    session.FindById(hi_id).Text = docnum
-                except Exception:
-                    pass
-                break
-            except Exception:
-                pass
-    return set_lo
+    # _we02_set_docnum removed — replaced by _we02_navigate_to_idoc above
 
 
 def get_idoc_detail(idoc_number):
@@ -1982,23 +2112,16 @@ def get_idoc_detail(idoc_number):
         except Exception as e:
             detail["edids_error"] = str(e)
 
-    # ── Strategy 2: Navigate WE02 → read GuiTree + right panel ───────────────
-    go_to_transaction("WE02")
-    time.sleep(1.5)
-
-    docnum_set = _we02_set_docnum(docnum)
+    # ── Strategy 2: Navigate WE02 — clear all fields, enter DOCNUM, execute ─────
+    # Uses _we02_navigate_to_idoc which:
+    #   • clears ALL selection fields (date ranges, status, direction, etc.)
+    #   • finds the DOCNUM field via full GUI-tree scan (not limited to 50 elems)
+    #   • sets DOCNUM LOW = HIGH = zero-padded IDoc number
+    #   • executes and enters the IDoc detail screen
+    on_detail, docnum_set, we02_screen = _we02_navigate_to_idoc(docnum)
     detail["we02_docnum_set"] = docnum_set
-
-    session.FindById("wnd[0]").SendVKey(8)   # Execute
-    time.sleep(2.5)
-    detail["screen"] = get_screen_text()
-
-    # WE02 shows a list screen first — enter the first (and only) result
-    title = detail["screen"]
-    if "IDoc Display:" not in title and "IDoc-Anzeige:" not in title:
-        session.FindById("wnd[0]").SendVKey(2)   # F2 = choose
-        time.sleep(2)
-        detail["screen"] = get_screen_text()
+    detail["we02_on_detail"]  = on_detail
+    detail["screen"]          = we02_screen
 
     # ── Strategy 2a: WE02 GuiTree — left panel (status record text) ─────────────
     tree = _find_gui_tree_anywhere()
