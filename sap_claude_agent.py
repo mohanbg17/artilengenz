@@ -1823,7 +1823,7 @@ IDOC_FIX_MAP = {
 
 
 def scan_idoc_errors(date_from=None, date_to=None, direction="both",
-                     status_filter="51"):
+                     status_filter="51", idoc_number=None):
     """
     Scan for IDoc errors.
     Strategy:
@@ -1832,18 +1832,33 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
       3. Fall back to reading EDIDC table directly via SE16N.
     status_filter: comma-separated status codes e.g. '51,26,56' or 'all'.
     direction: 'inbound', 'outbound', or 'both'.
+    idoc_number: specific IDoc number to filter on (e.g. '198025'). When set,
+                 the DOCNUM LOW/HIGH fields are populated so only that IDoc is
+                 returned. Date range is widened automatically to 01.01.2020 so
+                 older IDocs are not excluded.
     """
     today = datetime.now().strftime("%d.%m.%Y")
-    df = date_from or today
-    dt = date_to   or today
+
+    # When a specific IDoc number is given, use a wide date range so the IDoc
+    # is never excluded by date filter regardless of when it was created.
+    if idoc_number:
+        df = date_from or "01.01.2020"
+        dt = date_to   or today
+    else:
+        df = date_from or today
+        dt = date_to   or today
+
     statuses = [] if status_filter == "all" else status_filter.split(",")
+
+    # Zero-pad the IDoc number for SAP (16 digits)
+    docnum_padded = str(idoc_number).zfill(16) if idoc_number else ""
 
     # Convert DD.MM.YYYY → YYYYMMDD for table filter
     try:
         df_sap = datetime.strptime(df, "%d.%m.%Y").strftime("%Y%m%d")
         dt_sap = datetime.strptime(dt, "%d.%m.%Y").strftime("%Y%m%d")
     except Exception:
-        df_sap = df_sap = ""
+        df_sap = dt_sap = ""
 
     go_to_transaction("WE05")
     time.sleep(1.5)
@@ -1872,6 +1887,41 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
         for fid in ("wnd[0]/usr/ctxtSEL_STATUS-LOW", "wnd[0]/usr/ctxtSTATUS"):
             try: session.FindById(fid).Text = statuses[0]; break
             except Exception: pass
+
+    # ── Set DOCNUM filter when a specific IDoc number is requested ────────────
+    if docnum_padded:
+        docnum_set = False
+        for fid in ("wnd[0]/usr/ctxtS_DOCNUM-LOW",
+                    "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
+                    "wnd[0]/usr/ctxtDOCNUM-LOW"):
+            try:
+                session.FindById(fid).Text = docnum_padded
+                docnum_set = True
+                break
+            except Exception:
+                pass
+        if not docnum_set:
+            obj, oid = _find_input_field_by_fragment("S_DOCNUM-LOW")
+            if not obj:
+                obj, oid = _find_input_field_by_fragment("DOCNUM-LOW")
+            if not obj:
+                obj, oid = _find_input_field_by_fragment("DOCNUM")
+            if obj:
+                try:
+                    obj.Text = docnum_padded
+                    docnum_set = True
+                except Exception:
+                    pass
+        # Set HIGH field = same value so range == exactly this IDoc
+        if docnum_set:
+            for fid in ("wnd[0]/usr/ctxtS_DOCNUM-HIGH",
+                        "wnd[0]/usr/ctxtSEL_DOCNUM-HIGH",
+                        "wnd[0]/usr/ctxtDOCNUM-HIGH"):
+                try:
+                    session.FindById(fid).Text = docnum_padded
+                    break
+                except Exception:
+                    pass
 
     session.FindById("wnd[0]").SendVKey(8)
     time.sleep(2.5)
@@ -1934,6 +1984,19 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
                         try: session.FindById(e["id"]).Text = statuses[0]; break
                         except Exception: pass
 
+            # Set DOCNUM filter when a specific IDoc number is requested
+            if docnum_padded:
+                for e in elems:
+                    eid = e.get("id","").upper()
+                    if "DOCNUM" in eid and "LOW" in eid:
+                        try: session.FindById(e["id"]).Text = docnum_padded; break
+                        except Exception: pass
+                for e in elems:
+                    eid = e.get("id","").upper()
+                    if "DOCNUM" in eid and "HIGH" in eid:
+                        try: session.FindById(e["id"]).Text = docnum_padded; break
+                        except Exception: pass
+
             # Max rows
             for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
                 try: session.FindById(fid).Text = "1000"; break
@@ -1964,15 +2027,17 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
         except Exception:
             pass
 
+    idoc_filter_note = (f" (DOCNUM filter: {idoc_number})" if idoc_number else "")
     result = {
-        "date_from":   df,
-        "date_to":     dt,
-        "idoc_errors": idocs,
-        "count":       len(idocs),
-        "method":      method_used,
-        "screen":      get_screen_text(),
-        "note": (f"Found {len(idocs)} IDocs matching status {status_filter} "
-                 f"(method: {method_used}). "
+        "date_from":    df,
+        "date_to":      dt,
+        "idoc_number":  idoc_number,
+        "idoc_errors":  idocs,
+        "count":        len(idocs),
+        "method":       method_used,
+        "screen":       get_screen_text(),
+        "note": (f"Found {len(idocs)} IDocs matching status {status_filter}"
+                 f"{idoc_filter_note} (method: {method_used}). "
                  "Call get_idoc_detail for each to analyse root cause."),
     }
     if not idocs:
@@ -2678,6 +2743,101 @@ def _bd87_select_all_and_process():
     return selected, processed
 
 
+def _we09_navigate_to_idoc(idoc_number) -> dict:
+    """
+    Navigate WE09 (IDoc Search) to display a single specific IDoc.
+
+    WE09 is a search transaction: you enter DOCNUM LOW/HIGH on its selection
+    screen, execute (F8), and the result list shows the matching IDoc(s).
+    Double-clicking opens the IDoc detail screen.
+
+    Returns dict with keys:
+      on_detail  — True if IDoc detail screen was reached
+      screen     — current screen text
+      docnum     — the padded IDoc number used
+    """
+    docnum_padded = str(idoc_number).zfill(16)
+
+    go_to_transaction("WE09")
+    time.sleep(2)
+
+    # Clear selection screen
+    _clear_selection_screen()
+    time.sleep(0.3)
+
+    # Set DOCNUM LOW field
+    docnum_set = False
+    known_ids = [
+        "wnd[0]/usr/ctxtS_DOCNUM-LOW",
+        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
+        "wnd[0]/usr/ctxtDOCNUM-LOW",
+        "wnd[0]/usr/ctxtDOCNUM",
+        "wnd[0]/usr/ctxtS_DOCNUM",
+    ]
+    for fid in known_ids:
+        try:
+            session.FindById(fid).Text = docnum_padded
+            docnum_set = True
+            hi_fid = fid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
+            try:
+                session.FindById(hi_fid).Text = docnum_padded
+            except Exception:
+                pass
+            break
+        except Exception:
+            pass
+
+    if not docnum_set:
+        obj, oid = _find_input_field_by_fragment("S_DOCNUM-LOW")
+        if not obj:
+            obj, oid = _find_input_field_by_fragment("DOCNUM-LOW")
+        if not obj:
+            obj, oid = _find_input_field_by_fragment("DOCNUM")
+        if obj:
+            try:
+                obj.Text = docnum_padded
+                docnum_set = True
+                hi_id = oid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
+                if hi_id != oid:
+                    try:
+                        session.FindById(hi_id).Text = docnum_padded
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    # Execute
+    session.FindById("wnd[0]").SendVKey(8)
+    time.sleep(3)
+
+    screen = get_screen_text()
+    on_detail = ("IDoc Display:" in screen or "IDoc-Anzeige:" in screen
+                 or docnum_padded.lstrip("0") in screen)
+
+    if not on_detail:
+        # List screen — enter the first row
+        for vkey in (2, 0, 13):
+            try:
+                session.FindById("wnd[0]").SendVKey(vkey)
+                time.sleep(1.5)
+                screen = get_screen_text()
+                if ("IDoc Display:" in screen or "IDoc-Anzeige:" in screen
+                        or docnum_padded.lstrip("0") in screen):
+                    on_detail = True
+                    break
+            except Exception:
+                pass
+
+    return {
+        "on_detail":   on_detail,
+        "docnum":      docnum_padded,
+        "screen":      screen,
+        "docnum_set":  docnum_set,
+        "note": ("WE09: IDoc detail screen reached." if on_detail
+                 else "WE09: could not reach IDoc detail — check screen."),
+    }
+
+
 def bd87_select_and_reprocess(idoc_numbers=None, message_type="",
                                date_from=None, date_to=None):
     """
@@ -2689,8 +2849,15 @@ def bd87_select_and_reprocess(idoc_numbers=None, message_type="",
                   IDocs matching date / message_type.
     """
     today = datetime.now().strftime("%d.%m.%Y")
-    df = date_from or today
-    dt = date_to   or today
+    # When specific IDoc numbers are given, use a wide date range (01.01.2020→today)
+    # so IDocs created on any date are included. The DOCNUM filter makes the date
+    # range effectively irrelevant, but BD87 still requires non-empty date fields.
+    if idoc_numbers:
+        df = date_from or "01.01.2020"
+        dt = date_to   or today
+    else:
+        df = date_from or today
+        dt = date_to   or today
 
     docnum_lo = docnum_hi = ""
     if idoc_numbers:
@@ -6365,13 +6532,18 @@ TOOLS = [
             "status_filter: comma-separated status codes e.g. '51,26,56' "
             "or 'all' for every status. "
             "direction: 'inbound', 'outbound', or 'both'. "
+            "idoc_number: pass a specific IDoc number (e.g. '198025') to filter "
+            "WE05 to show ONLY that IDoc — the DOCNUM LOW/HIGH fields are set "
+            "automatically and the date range is widened to 01.01.2020 so the IDoc "
+            "is never excluded by date. ALWAYS pass idoc_number when the user has "
+            "given you a specific IDoc number. "
             "ALWAYS call this first when diagnosing IDoc errors."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "date_from":     {"type": "string",
-                                  "description": "DD.MM.YYYY (defaults to today)"},
+                                  "description": "DD.MM.YYYY (defaults to today, or 01.01.2020 when idoc_number set)"},
                 "date_to":       {"type": "string",
                                   "description": "DD.MM.YYYY (defaults to today)"},
                 "direction":     {"type": "string",
@@ -6379,6 +6551,10 @@ TOOLS = [
                                   "description": "IDoc direction filter"},
                 "status_filter": {"type": "string",
                                   "description": "Comma-separated status codes or 'all'"},
+                "idoc_number":   {"type": "string",
+                                  "description": "Specific IDoc number to filter on (e.g. '198025'). "
+                                                 "Sets DOCNUM LOW=HIGH on WE05 selection screen. "
+                                                 "ALWAYS pass this when a specific IDoc number is known."},
             },
             "required": [],
         },
@@ -6412,6 +6588,24 @@ TOOLS = [
             "properties": {
                 "idoc_number": {"type": "string",
                                 "description": "IDoc document number"},
+            },
+            "required": ["idoc_number"],
+        },
+    },
+    {
+        "name": "view_idoc_in_we09",
+        "description": (
+            "Navigate WE09 (IDoc Search) to display a specific IDoc directly. "
+            "WE09 sets DOCNUM LOW=HIGH on its selection screen so only the requested "
+            "IDoc is shown. Use as an alternative to get_idoc_detail when WE02 has "
+            "GUI issues, or when you want to view the IDoc in WE09 specifically. "
+            "ALWAYS pass the IDoc number directly — do NOT leave it blank."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "idoc_number": {"type": "string",
+                                "description": "IDoc number to display (e.g. '198025')"},
             },
             "required": ["idoc_number"],
         },
@@ -6757,11 +6951,14 @@ def dispatch(tool_name, tool_input):
             tool_input.get("date_to"),
             tool_input.get("direction", "both"),
             tool_input.get("status_filter", "51,26,56"),
+            tool_input.get("idoc_number"),
         )
     if tool_name == "get_idoc_detail":
         return get_idoc_detail(tool_input["idoc_number"])
     if tool_name == "get_idoc_segments":
         return get_idoc_segments(tool_input["idoc_number"])
+    if tool_name == "view_idoc_in_we09":
+        return _we09_navigate_to_idoc(tool_input["idoc_number"])
     if tool_name == "reprocess_idoc":
         return reprocess_idoc(
             tool_input["idoc_number"],
@@ -7794,6 +7991,37 @@ BAD (do not do this):
   "I will now proceed to investigate the first IDoc by calling get_idoc_detail
    to understand the root cause of the error, after which I will determine the
    appropriate fix strategy based on the error message returned..."
+
+═══════════════════════════════════════════════════════════
+ PASSING IDOC NUMBERS TO TRANSACTIONS — MANDATORY RULES
+═══════════════════════════════════════════════════════════
+When the user provides a specific IDoc number (e.g. 198025), you MUST pass it
+directly to every relevant tool call. NEVER show all IDocs when a specific one
+was given.
+
+RULES:
+  1. scan_idoc_errors  → ALWAYS pass idoc_number="198025" (not just date range).
+                         The function sets DOCNUM LOW=HIGH in WE05 automatically.
+                         Date range is auto-widened to 01.01.2020 when idoc_number set.
+
+  2. get_idoc_detail   → ALWAYS pass idoc_number="198025". Opens WE02 with that
+                         specific IDoc — clears all fields first, sets DOCNUM filter.
+
+  3. view_idoc_in_we09 → Pass idoc_number="198025". Navigates WE09 selection
+                         screen, sets DOCNUM LOW=HIGH, executes, enters detail.
+
+  4. bd87_select_and_reprocess → Pass idoc_numbers=["198025"]. The function sets
+                         DOCNUM LOW=HIGH on BD87 selection screen. Date range is
+                         automatically widened to 01.01.2020 so old IDocs are found.
+
+  5. Do NOT rely on date range alone — IDoc 198025 may have been created on any
+     date. Always filter by DOCNUM directly.
+
+WORKFLOW for a specific IDoc (e.g. 198025):
+  scan_idoc_errors(idoc_number="198025", status_filter="all")
+  → get_idoc_detail("198025")
+  → fix root cause
+  → bd87_select_and_reprocess(idoc_numbers=["198025"])
 """
 
 # ── Token / Rate-Limit Management ──────────────────────────────────────────────
