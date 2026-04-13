@@ -104,21 +104,31 @@ def go_to_transaction(tcode):
     return {"navigated_to": tcode, "screen": get_screen_text()}
 
 def discover_elements():
-    """Walk current screen; return up to 100 interactable elements with IDs."""
+    """Walk current screen; return up to 50 interactable input/button elements.
+    Skips GuiTree / GuiShell data-display controls to prevent hangs on
+    result screens (BD87, ST22, WE05, etc. which have hundreds of tree nodes)."""
     results = []
+    # These types are data-display containers — do NOT recurse into them
+    SKIP_RECURSE = {
+        "GuiShell", "GuiTree", "GuiGridView", "GuiTableControl",
+        "GuiContainerShell", "GuiSplitterContainer", "GuiCustomControl",
+    }
     def walk(comp, depth=0):
-        if depth > 7:
+        if depth > 5 or len(results) >= 50:
             return
         try:
             n = comp.Children.Count
         except Exception:
             return
         for i in range(n):
+            if len(results) >= 50:
+                return
             try:
                 child = comp.Children(i)
                 t = child.Type
-                if t in ("GuiTextField","GuiCTextField","GuiComboBox",
-                         "GuiRadioButton","GuiCheckBox","GuiButton","GuiTab"):
+                # collect interactable widgets
+                if t in ("GuiTextField", "GuiCTextField", "GuiComboBox",
+                         "GuiRadioButton", "GuiCheckBox", "GuiButton", "GuiTab"):
                     try:
                         results.append({
                             "id":      child.Id,
@@ -128,11 +138,13 @@ def discover_elements():
                         })
                     except Exception:
                         pass
-                walk(child, depth + 1)
+                # recurse into layout containers but NOT data shells/trees
+                if t not in SKIP_RECURSE:
+                    walk(child, depth + 1)
             except Exception:
                 pass
     walk(session.FindById("wnd[0]"))
-    return results[:100]
+    return results[:50]
 
 def set_field(element_id, value):
     try:
@@ -1947,65 +1959,255 @@ def create_partner_profile(partner_number, partner_type, direction,
         return {"error": str(e)}
 
 
-def bd87_reprocess_all(message_type="", date_from=None, date_to=None):
+def _bd87_find_tree():
+    """Locate the result tree/shell on a BD87 result screen."""
+    # Known container paths for different SAP versions
+    candidates = [
+        "wnd[0]/usr/sub:SAPLBD7H:0200/cntlBD87_CONT/shellcont/shell",
+        "wnd[0]/usr/cntlBD87_CONT/shellcont/shell",
+        "wnd[0]/usr/sub:SAPLBD7H:0100/cntlBD87_CONT/shellcont/shell",
+        "wnd[0]/usr/shellcont/shell",
+        "wnd[0]/usr/cntlGRID1/shellcont/shell",
+    ]
+    for cid in candidates:
+        try:
+            obj = session.FindById(cid, False)
+            if obj:
+                return obj
+        except Exception:
+            pass
+    # Fallback: walk tree looking for GuiTree or GuiShell
+    found = [None]
+    def _walk(comp, depth=0):
+        if found[0] or depth > 7:
+            return
+        try:
+            n = comp.Children.Count
+        except Exception:
+            return
+        for i in range(n):
+            try:
+                child = comp.Children(i)
+                if child.Type in ("GuiTree", "GuiShell"):
+                    found[0] = child
+                    return
+                _walk(child, depth + 1)
+            except Exception:
+                pass
+    _walk(session.FindById("wnd[0]"))
+    return found[0]
+
+
+def _bd87_fill_selection(df, dt, message_type, docnum_lo, docnum_hi):
+    """Fill BD87 selection screen fields. Works for all known field ID variants."""
+    field_sets = [
+        # (low_date, high_date, mestyp, docnum_lo, docnum_hi)
+        ("wnd[0]/usr/ctxtSEL_CREDAT-LOW",  "wnd[0]/usr/ctxtSEL_CREDAT-HIGH",
+         "wnd[0]/usr/ctxtSEL_MESTYP-LOW",  "wnd[0]/usr/ctxtSEL_DOCNUM-LOW",
+         "wnd[0]/usr/ctxtSEL_DOCNUM-HIGH"),
+        # sub-screen variant
+        ("wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_CREDAT-LOW",
+         "wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_CREDAT-HIGH",
+         "wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_MESTYP-LOW",
+         "wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_DOCNUM-LOW",
+         "wnd[0]/usr/sub:SAPLBD7H:0100/ctxtSEL_DOCNUM-HIGH"),
+    ]
+    for (flo, fhi, fmsg, fdlo, fdhi) in field_sets:
+        try:
+            session.FindById(flo).Text = df
+            session.FindById(fhi).Text = dt
+            if message_type:
+                try:
+                    session.FindById(fmsg).Text = message_type.upper()
+                except Exception:
+                    pass
+            if docnum_lo:
+                try:
+                    session.FindById(fdlo).Text = docnum_lo
+                    session.FindById(fdhi).Text = docnum_hi
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            pass
+    # Last resort: discover and fill by ID fragment
+    elems = discover_elements()
+    filled = False
+    for e in elems:
+        eid = e.get("id", "").upper()
+        try:
+            if "CREDAT" in eid and "LOW" in eid:
+                session.FindById(e["id"]).Text = df; filled = True
+            elif "CREDAT" in eid and "HIGH" in eid:
+                session.FindById(e["id"]).Text = dt
+            elif "MESTYP" in eid and "LOW" in eid and message_type:
+                session.FindById(e["id"]).Text = message_type.upper()
+            elif "DOCNUM" in eid and "LOW" in eid and docnum_lo:
+                session.FindById(e["id"]).Text = docnum_lo
+            elif "DOCNUM" in eid and "HIGH" in eid and docnum_hi:
+                session.FindById(e["id"]).Text = docnum_hi
+        except Exception:
+            pass
+    return filled
+
+
+def _bd87_select_all_and_process():
     """
-    Reprocess ALL failed IDocs of a given message type via BD87.
-    Leave message_type blank to reprocess all error IDocs.
+    After BD87 executes and shows a result tree, select all nodes and
+    press the Process/Reprocess button.  Tries 4 selection strategies
+    and 6 button candidates so it works across SAP versions.
+    Returns (selected_method, processed_ok).
+    """
+    tree = _bd87_find_tree()
+    selected = None
+
+    # ── Strategy 1: tree.SelectAll() ──────────────────────────────────────────
+    if tree and not selected:
+        try:
+            tree.SelectAll()
+            selected = "SelectAll()"
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    # ── Strategy 2: tree.ExpandSubTree + select all nodes manually ────────────
+    if tree and not selected:
+        try:
+            tree.ExpandSubTree(tree.GetAllNodeKeys()[0])
+            keys = tree.GetAllNodeKeys()
+            for k in keys:
+                try:
+                    tree.ChangeCheckBox(k, True)
+                except Exception:
+                    try:
+                        tree.SelectNode(k)
+                    except Exception:
+                        pass
+            selected = f"manual-select({len(keys)} nodes)"
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    # ── Strategy 3: Ctrl+A via window ─────────────────────────────────────────
+    if not selected:
+        try:
+            session.FindById("wnd[0]").SendVKey(16)   # Ctrl+A
+            selected = "SendVKey(16)"
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    # ── Strategy 4: Edit menu → Select All ────────────────────────────────────
+    if not selected:
+        for menu_path in (
+            "wnd[0]/mbar/menu[1]/menu[7]",
+            "wnd[0]/mbar/menu[1]/menu[6]",
+            "wnd[0]/mbar/menu[1]/menu[5]",
+        ):
+            try:
+                session.FindById(menu_path).Select()
+                selected = f"menu({menu_path})"
+                time.sleep(0.3)
+                break
+            except Exception:
+                pass
+
+    # ── Press the Process / Reprocess toolbar button ──────────────────────────
+    processed = False
+    for btn in (
+        "wnd[0]/tbar[1]/btn[8]",   # most common "Process" position
+        "wnd[0]/tbar[1]/btn[9]",
+        "wnd[0]/tbar[1]/btn[4]",
+        "wnd[0]/tbar[1]/btn[5]",
+        "wnd[0]/tbar[0]/btn[8]",
+    ):
+        try:
+            session.FindById(btn).Press()
+            processed = True
+            time.sleep(3)
+            break
+        except Exception:
+            pass
+
+    # Fallback vkeys: F9 (Process selected), then F8 (Execute)
+    if not processed:
+        for vk in (9, 8):
+            try:
+                session.FindById("wnd[0]").SendVKey(vk)
+                processed = True
+                time.sleep(3)
+                break
+            except Exception:
+                pass
+
+    # Dismiss any confirmation popup
+    try:
+        wnd1 = session.FindById("wnd[1]", False)
+        if wnd1:
+            session.FindById("wnd[1]").SendVKey(0)
+            time.sleep(2)
+    except Exception:
+        pass
+
+    return selected, processed
+
+
+def bd87_select_and_reprocess(idoc_numbers=None, message_type="",
+                               date_from=None, date_to=None):
+    """
+    BD87: filter by specific IDoc numbers (or date + message type),
+    select ALL matching IDocs in the result tree, and reprocess them.
+
+    idoc_numbers: list of IDoc number strings — if given, filters by
+                  DOCNUM range (min to max).  Pass None to process all
+                  IDocs matching date / message_type.
     """
     today = datetime.now().strftime("%d.%m.%Y")
     df = date_from or today
     dt = date_to   or today
 
+    docnum_lo = docnum_hi = ""
+    if idoc_numbers:
+        padded    = [str(n).zfill(16) for n in idoc_numbers]
+        docnum_lo = min(padded)
+        docnum_hi = max(padded)
+
     go_to_transaction("BD87")
     time.sleep(1.5)
     try:
-        # Set date
-        for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-LOW",
-                    "wnd[0]/usr/ctxtLOW_DATE"):
-            try:
-                session.FindById(fid).Text = df
-                break
-            except Exception:
-                pass
-        for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-HIGH",
-                    "wnd[0]/usr/ctxtHIGH_DATE"):
-            try:
-                session.FindById(fid).Text = dt
-                break
-            except Exception:
-                pass
-        if message_type:
-            for fid in ("wnd[0]/usr/ctxtSEL_MESTYP-LOW",
-                        "wnd[0]/usr/ctxtMESTYP"):
-                try:
-                    session.FindById(fid).Text = message_type.upper()
-                    break
-                except Exception:
-                    pass
-
+        _bd87_fill_selection(df, dt, message_type, docnum_lo, docnum_hi)
         session.FindById("wnd[0]").SendVKey(8)   # Execute
-        time.sleep(2.5)
+        time.sleep(3)
 
-        # Select all IDocs and trigger reprocessing
-        session.FindById("wnd[0]").SendVKey(16)  # Select all
-        time.sleep(0.5)
+        selected, processed = _bd87_select_all_and_process()
 
-        # Click Execute/Reprocess
-        try:
-            session.FindById("wnd[0]/tbar[1]/btn[9]").Press()
-            time.sleep(2)
-        except Exception:
-            session.FindById("wnd[0]").SendVKey(9)
-            time.sleep(2)
-
-        audit_log("IDOC_BATCH_REPROCESS",
-                  {"message_type": message_type or "ALL",
+        audit_log("BD87_SELECT_REPROCESS",
+                  {"idoc_numbers": idoc_numbers, "message_type": message_type,
+                   "docnum_lo": docnum_lo, "docnum_hi": docnum_hi,
                    "date_from": df, "date_to": dt},
-                  status="executed")
-        return {"ok": True, "message_type": message_type or "ALL",
-                "screen": get_screen_text()}
+                  status="executed" if processed else "attempted")
+
+        return {
+            "ok":           processed,
+            "selected_by":  selected,
+            "processed":    processed,
+            "idoc_numbers": idoc_numbers,
+            "message_type": message_type,
+            "screen":       get_screen_text(),
+        }
     except Exception as e:
         return {"error": str(e)}
+
+
+def bd87_reprocess_all(message_type="", date_from=None, date_to=None):
+    """Reprocess ALL failed IDocs (optionally filtered by message type).
+    Delegates to bd87_select_and_reprocess with no IDoc number filter."""
+    return bd87_select_and_reprocess(
+        idoc_numbers=None,
+        message_type=message_type,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
 
 # ── Purchase Order Error Resolution ──────────────────────────────────────────
@@ -5717,13 +5919,37 @@ TOOLS = [
         },
     },
     {
+        "name": "bd87_select_and_reprocess",
+        "description": (
+            "BD87: filter by specific IDoc numbers and/or date range, select ALL "
+            "matching IDocs in the result tree, and trigger reprocessing. "
+            "Use this when you have a list of specific IDoc numbers to reprocess. "
+            "Works by setting DOCNUM LOW/HIGH on the selection screen, executing, "
+            "then using SelectAll() on the result tree and pressing the Process button. "
+            "Preferred over bd87_reprocess_all when you know the IDoc numbers."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "idoc_numbers":  {"type":  "array",
+                                  "items": {"type": "string"},
+                                  "description": "List of IDoc numbers to reprocess (e.g. ['198025','198026']). Omit to process all matching."},
+                "message_type":  {"type": "string",
+                                  "description": "IDoc message type filter e.g. ORDERS (optional)"},
+                "date_from":     {"type": "string",
+                                  "description": "DD.MM.YYYY (defaults to today)"},
+                "date_to":       {"type": "string",
+                                  "description": "DD.MM.YYYY (defaults to today)"},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "bd87_reprocess_all",
         "description": (
-            "Batch reprocess ALL failed IDocs of a message type via BD87. "
-            "Leave message_type blank to reprocess all error IDocs. "
-            "Use after fixing the root cause (e.g. partner profile, posting period) "
-            "to reprocess the backlog in one shot. "
-            "REQUIRES human approval."
+            "Batch reprocess ALL failed IDocs (optionally filtered by message type) via BD87. "
+            "Use when you want to process all IDocs without specifying numbers. "
+            "Delegates to bd87_select_and_reprocess with no IDoc number filter."
         ),
         "input_schema": {
             "type": "object",
@@ -5939,6 +6165,13 @@ def dispatch(tool_name, tool_input):
             tool_input["message_type"],
             tool_input["process_code"],
             tool_input.get("func_module", ""),
+        )
+    if tool_name == "bd87_select_and_reprocess":
+        return bd87_select_and_reprocess(
+            tool_input.get("idoc_numbers"),
+            tool_input.get("message_type", ""),
+            tool_input.get("date_from"),
+            tool_input.get("date_to"),
         )
     if tool_name == "bd87_reprocess_all":
         return bd87_reprocess_all(
@@ -6756,7 +6989,10 @@ STEP 4  Execute fix for EACH IDoc:
         SYNTAX ERROR:
           → get_idoc_segments → edit_idoc_field to fix bad data → reprocess_idoc
         BATCH REPROCESS (same root cause for many IDocs):
-          → Fix root cause once → bd87_reprocess_all(message_type, date_from, date_to)
+          → Fix root cause once → bd87_select_and_reprocess(idoc_numbers=[...]) for specific IDocs
+          → OR bd87_reprocess_all(message_type, date_from, date_to) for all IDocs of a type
+        PREFER bd87_select_and_reprocess when you have specific IDoc numbers — it sets
+        the DOCNUM filter and uses SelectAll() on the result tree (reliable across SAP versions)
 
 STEP 5  Verify: scan_idoc_errors again to confirm count dropped to zero.
         Report: "Fixed X of Y IDocs. Remaining: [list with reasons]."
