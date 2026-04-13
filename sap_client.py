@@ -313,3 +313,120 @@ class SAPClient:
             }
         except Exception as e:
             raise SAPError(f"Cannot read status bar: {e}")
+
+    # ------------------------------------------------------------------
+    # VA01 — Create Sales Order
+    # ------------------------------------------------------------------
+
+    # Element IDs for standard SAP ECC / S/4HANA VA01
+    _VA01 = {
+        # Initial screen
+        "order_type":    "wnd[0]/usr/ctxtVBAK-AUART",
+        "sales_org":     "wnd[0]/usr/ctxtVBAK-VKORG",
+        "dist_channel":  "wnd[0]/usr/ctxtVBAK-VTWEG",
+        "division":      "wnd[0]/usr/ctxtVBAK-SPART",
+        # Overview / header (after Enter on initial screen)
+        "sold_to":       "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/subSUBSCREEN_HEADER2:SAPMV45A:4007/ctxtKUNAG-KUNNR",
+        "po_number":     "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/subSUBSCREEN_HEADER2:SAPMV45A:4007/ctxtVBAK-BSTNK",
+        "po_date":       "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/subSUBSCREEN_HEADER2:SAPMV45A:4007/ctxtVBAK-BSTDK",
+        "delivery_date": "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/subSUBSCREEN_HEADER2:SAPMV45A:4007/ctxtRV45A-KETDAT",
+        # Line item table columns (row appended at runtime)
+        "item_material": "wnd[0]/usr/subSUBSCREEN_BODY:SAPMV45A:4900/subSUBSCREEN_TC:SAPMV45A:4050/tblSAPMV45ATCTRL_U_ERF_AUFTRAG/ctxtRV45A-MABNR[0,{row}]",
+        "item_quantity":  "wnd[0]/usr/subSUBSCREEN_BODY:SAPMV45A:4900/subSUBSCREEN_TC:SAPMV45A:4050/tblSAPMV45ATCTRL_U_ERF_AUFTRAG/txtRV45A-KWMENG[1,{row}]",
+        "item_plant":    "wnd[0]/usr/subSUBSCREEN_BODY:SAPMV45A:4900/subSUBSCREEN_TC:SAPMV45A:4050/tblSAPMV45ATCTRL_U_ERF_AUFTRAG/ctxtVBAP-WERKS[2,{row}]",
+        # Buttons
+        "save":          "wnd[0]/tbar[0]/btn[11]",
+    }
+
+    def _dismiss_popup(self):
+        """Press Enter to dismiss any confirmation popup that may appear."""
+        try:
+            popup = self._session.FindById("wnd[1]")
+            popup.SendVKey(0)  # Enter
+        except Exception:
+            pass  # No popup — fine
+
+    def create_sales_order(
+        self,
+        order_type: str,
+        sales_org: str,
+        dist_channel: str,
+        division: str,
+        sold_to: str,
+        po_number: str,
+        po_date: str,
+        delivery_date: str,
+        items: list,
+    ) -> dict:
+        """
+        Create a sales order via VA01.
+
+        items: list of dicts with keys 'material', 'quantity', and optionally 'plant'
+        dates: DD.MM.YYYY format
+
+        Returns: {"order_number": "...", "status": "...", "message": "..."}
+        """
+        s = self._require_session()
+        ids = self._VA01
+
+        # 1. Navigate to VA01
+        s.StartTransaction("VA01")
+
+        # 2. Fill initial screen
+        s.FindById(ids["order_type"]).Text   = order_type.strip().upper()
+        s.FindById(ids["sales_org"]).Text    = sales_org.strip()
+        s.FindById(ids["dist_channel"]).Text = dist_channel.strip()
+        s.FindById(ids["division"]).Text     = division.strip()
+
+        # 3. Confirm initial screen → go to overview
+        s.FindById("wnd[0]").SendVKey(0)  # Enter
+        self._dismiss_popup()
+
+        # 4. Fill header fields
+        s.FindById(ids["sold_to"]).Text       = sold_to.strip()
+        s.FindById("wnd[0]").SendVKey(0)       # Enter to resolve customer name
+        self._dismiss_popup()
+
+        if po_number:
+            s.FindById(ids["po_number"]).Text  = po_number.strip()
+        if po_date:
+            s.FindById(ids["po_date"]).Text    = po_date.strip()
+        if delivery_date:
+            s.FindById(ids["delivery_date"]).Text = delivery_date.strip()
+
+        # 5. Fill line items
+        for row, item in enumerate(items):
+            material = item.get("material", "").strip()
+            quantity = str(item.get("quantity", "")).strip()
+            plant    = item.get("plant", "").strip()
+
+            if not material:
+                continue
+
+            s.FindById(ids["item_material"].format(row=row)).Text = material
+            if quantity:
+                s.FindById(ids["item_quantity"].format(row=row)).Text = quantity
+            if plant:
+                s.FindById(ids["item_plant"].format(row=row)).Text = plant
+
+        # 6. Save
+        s.FindById(ids["save"]).Press()
+        self._dismiss_popup()
+
+        # 7. Read result from status bar
+        bar = s.FindById("wnd[0]/sbar")
+        msg_type = self._safe_attr(bar, "MessageType")
+        msg_text = self._safe_attr(bar, "Text")
+
+        # Extract order number from message like "Standard Order 1234567 has been saved"
+        order_number = ""
+        import re
+        match = re.search(r"\b(\d{7,10})\b", msg_text)
+        if match:
+            order_number = match.group(1)
+
+        return {
+            "order_number": order_number,
+            "status": "success" if msg_type == "S" else "error",
+            "message": msg_text,
+        }

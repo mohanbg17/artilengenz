@@ -165,6 +165,57 @@ def take_screenshot() -> str:
     return _run(sap.take_screenshot)
 
 
+@mcp.tool()
+def create_sales_order(
+    order_type: str,
+    sales_org: str,
+    dist_channel: str,
+    division: str,
+    sold_to: str,
+    items: str,
+    po_number: str = "",
+    po_date: str = "",
+    delivery_date: str = "",
+) -> str:
+    """
+    Create a sales order in SAP via transaction VA01.
+
+    Args:
+        order_type:     SAP order type, e.g. 'OR' (standard order)
+        sales_org:      Sales organization, e.g. '1000'
+        dist_channel:   Distribution channel, e.g. '10'
+        division:       Division, e.g. '00'
+        sold_to:        Customer (sold-to party) number, e.g. '100023'
+        items:          JSON array of line items, each with:
+                          - material  (required): material number
+                          - quantity  (required): order quantity
+                          - plant     (optional): delivering plant
+                        Example: '[{"material":"MAT001","quantity":"10","plant":"1000"}]'
+        po_number:      Customer PO number (optional)
+        po_date:        Customer PO date, format DD.MM.YYYY (optional)
+        delivery_date:  Requested delivery date, format DD.MM.YYYY (optional)
+
+    Returns JSON with: order_number, status ('success'/'error'), message.
+    """
+    try:
+        parsed_items = json.loads(items)
+    except json.JSONDecodeError as e:
+        return f"ERROR: 'items' is not valid JSON — {e}"
+
+    return _run(
+        sap.create_sales_order,
+        order_type,
+        sales_org,
+        dist_channel,
+        division,
+        sold_to,
+        po_number,
+        po_date,
+        delivery_date,
+        parsed_items,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
