@@ -8420,13 +8420,15 @@ WORKFLOW for a specific IDoc (e.g. 198025):
 
 # Maximum chars stored per tool result in the messages list.
 # Full output is still printed to console; only the stored copy is capped.
-_TOOL_RESULT_CAP = 800
+_TOOL_RESULT_CAP = 300
 
 # When the messages list grows past this many entries, compress older exchanges.
-# Each tool call = 2 entries (assistant + user/tool_result), so 40 = ~20 calls.
-_MSG_COMPRESS_THRESHOLD = 40
+# Each tool call = 2 entries (assistant + user/tool_result), so 16 = ~8 calls.
+_MSG_COMPRESS_THRESHOLD = 16
 # How many of the most-recent messages to always keep intact
-_MSG_KEEP_RECENT = 20
+_MSG_KEEP_RECENT = 8
+# Max chars kept from a long assistant text block during compression
+_ASSISTANT_TEXT_CAP = 200
 
 
 def _cap_tool_result(content_str: str) -> str:
@@ -8436,6 +8438,34 @@ def _cap_tool_result(content_str: str) -> str:
     return content_str[:_TOOL_RESULT_CAP] + " ...[truncated]"
 
 
+def _trim_message_content(msg: dict) -> dict:
+    """
+    Return a copy of msg with long assistant text blocks trimmed to
+    _ASSISTANT_TEXT_CAP chars.  Tool-use blocks and tool-result blocks are
+    left untouched (tool results are already capped at storage time).
+    """
+    if msg["role"] != "assistant":
+        return msg
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return msg
+    new_blocks = []
+    for b in content:
+        btype = getattr(b, "type", None) or (b.get("type") if isinstance(b, dict) else None)
+        if btype == "text":
+            txt = getattr(b, "text", None) or (b.get("text", "") if isinstance(b, dict) else "")
+            if len(txt) > _ASSISTANT_TEXT_CAP:
+                trimmed = txt[:_ASSISTANT_TEXT_CAP] + " ...[trimmed]"
+                if isinstance(b, dict):
+                    new_blocks.append({**b, "text": trimmed})
+                else:
+                    # SDK object — convert to plain dict
+                    new_blocks.append({"type": "text", "text": trimmed})
+                continue
+        new_blocks.append(b)
+    return {**msg, "content": new_blocks}
+
+
 def _compress_messages(messages: list) -> list:
     """
     When the conversation thread grows very long, replace the oldest middle
@@ -8443,6 +8473,7 @@ def _compress_messages(messages: list) -> list:
     manageable.  Always preserves:
       • messages[0]  — original user query
       • last _MSG_KEEP_RECENT messages — most recent context
+    Long assistant text blocks in the kept section are also trimmed.
     """
     if len(messages) <= _MSG_COMPRESS_THRESHOLD:
         return messages
@@ -8470,7 +8501,10 @@ def _compress_messages(messages: list) -> list:
         ),
     }
 
-    compressed = [first, summary] + recent
+    # Trim long assistant text in the kept-recent window too
+    trimmed_recent = [_trim_message_content(m) for m in recent]
+
+    compressed = [first, summary] + trimmed_recent
     print(f"  [Context compressed: {len(messages)} → {len(compressed)} messages]")
     return compressed
 
@@ -8534,6 +8568,20 @@ def _api_call_with_retry(client, model, max_tokens, system, tools, messages,
                 tools      = _CACHED_TOOLS,
                 messages   = current_messages,
             )
+        except anthropic.BadRequestError as e:
+            # "prompt is too long: N tokens > 200000 maximum"
+            if "prompt is too long" in str(e) and attempt < max_retries:
+                print(f"\n  [Prompt too long — compressing context and retrying "
+                      f"(attempt {attempt + 1}/{max_retries})...]")
+                current_messages = _compress_messages(current_messages)
+                # If compression didn't shrink (already below threshold), force it
+                if len(current_messages) > _MSG_KEEP_RECENT + 2:
+                    # Keep only first + summary + last _MSG_KEEP_RECENT // 2
+                    keep = max(4, _MSG_KEEP_RECENT // 2)
+                    current_messages = [current_messages[0]] + current_messages[-keep:]
+                    print(f"  [Hard trim: kept {len(current_messages)} messages]")
+            else:
+                raise
         except anthropic.RateLimitError:
             if attempt == max_retries:
                 raise
