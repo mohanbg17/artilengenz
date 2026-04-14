@@ -1213,19 +1213,67 @@ def create_partner_profile(partner_number, partner_type, direction,
             break
 
     if not row_added:
-        # Last resort: hand off to user — the button IDs vary too much across
-        # SAP versions to guess reliably. User clicks the Create button in the
-        # Inbound section, we then fill the fields automatically.
+        # Button IDs vary across SAP versions — hand off to user to click
+        # the Create button; agent fills the fields automatically after.
         result = wait_for_user_input(
-            screen_name="WE20 Partner Profile — Add Inbound Row",
+            screen_name="WE20 Partner Profile — Add Row",
             instructions=(
-                f"Click the CREATE button (small icon) below the INBOUND table "
-                f"for partner {partner_number}. Do NOT fill any fields yet — "
-                f"just click the button to add the new empty row, then type 'done'."
+                f"In WE20, partner {partner_number} is selected. "
+                f"Click the small CREATE button below the "
+                f"{'INBOUND' if is_inbound else 'OUTBOUND'} PARAMETERS table "
+                f"to add a new empty row. Do NOT fill any fields yet — "
+                f"just click Create to open the new row, then type 'done'."
             ),
+            fields=[
+                {"name": "Action", "value": f"Click Create in the {'Inbound' if is_inbound else 'Outbound'} Parameters section"},
+            ],
         )
         if result.get("status") == "user_completed":
             row_added = True
+        elif result.get("status") in ("skipped", "aborted"):
+            # User could not / would not add the row — full manual handoff
+            manual = wait_for_user_input(
+                screen_name="WE20 Partner Profile — Full Manual Entry",
+                instructions=(
+                    f"Automated WE20 entry failed. Please create the partner profile manually:\n"
+                    f"  1. Go to WE20 (tcode)\n"
+                    f"  2. Find or create partner: {partner_number} (type {partner_type})\n"
+                    f"  3. Click Create in the {'Inbound' if is_inbound else 'Outbound'} Parameters table\n"
+                    f"  4. Enter Message Type = {message_type}\n"
+                    f"  5. Enter Process Code = {process_code}\n"
+                    f"  {'6. Enter Basic Type = ' + basic_type if basic_type else ''}\n"
+                    f"  7. Press Ctrl+S to save\n"
+                    f"  Type 'done' when finished."
+                ),
+                fields=[
+                    {"name": "Partner Number",  "value": partner_number},
+                    {"name": "Partner Type",    "value": partner_type},
+                    {"name": "Direction",       "value": "Inbound" if is_inbound else "Outbound"},
+                    {"name": "Message Type",    "value": message_type},
+                    {"name": "Process Code",    "value": process_code},
+                    {"name": "Basic Type",      "value": basic_type or "(leave blank)"},
+                ],
+            )
+            screen = get_screen_text()
+            audit_log("CREATE_PARTNER_PROFILE",
+                      {"partner": partner_number, "type": partner_type,
+                       "message_type": message_type, "process_code": process_code,
+                       "method": "manual_user"},
+                      status="manual_completed" if manual.get("status") == "user_completed"
+                             else "manual_skipped")
+            return {
+                "ok":           manual.get("status") == "user_completed",
+                "partner":      partner_number,
+                "direction":    "inbound" if is_inbound else "outbound",
+                "message_type": message_type,
+                "process_code": process_code,
+                "row_added":    False,
+                "screen":       screen,
+                "method":       "manual_user",
+                "note": "Agent could not automate WE20 — user completed manually."
+                        if manual.get("status") == "user_completed"
+                        else "User skipped manual WE20 entry.",
+            }
 
     # ── Step 5: Fill Message Type and Process Code ────────────────────────────
     # Use _find_input_field_by_fragment — bypasses the 50-element cap of
@@ -1290,6 +1338,28 @@ def create_partner_profile(partner_number, partner_type, direction,
                 except Exception:
                     pass
 
+    # ── Step 5b: Hand off if fields could not be filled automatically ─────────
+    if not msg_set or not proc_set:
+        missing_fields = []
+        if not msg_set:
+            missing_fields.append({"name": "Message Type (MESTYP)", "value": message_type,
+                                   "note": "Enter in the new row that was just created"})
+        if not proc_set:
+            missing_fields.append({"name": "Process Code (NACFN)", "value": process_code,
+                                   "note": "Enter in the same new row"})
+        wait_for_user_input(
+            screen_name="WE20 Partner Profile — Fill Row Fields",
+            instructions=(
+                f"The new {'inbound' if is_inbound else 'outbound'} row was added for "
+                f"partner {partner_number} but the agent could not fill the fields. "
+                f"Please fill them manually in the new row at the bottom of the "
+                f"{'Inbound' if is_inbound else 'Outbound'} Parameters table, then type 'done'."
+            ),
+            fields=missing_fields,
+        )
+        # Treat as set — user just filled them
+        msg_set = proc_set = True
+
     # ── Step 6: Save ──────────────────────────────────────────────────────────
     session.FindById("wnd[0]").SendVKey(11)   # Ctrl+S
     time.sleep(2)
@@ -1312,6 +1382,29 @@ def create_partner_profile(partner_number, partner_type, direction,
     saved = ("saved" in screen.lower() or "changed" in screen.lower()
              or "created" in screen.lower()
              or partner_number in screen)
+
+    # ── Step 6b: If save failed, full manual handoff ──────────────────────────
+    if not saved:
+        wait_for_user_input(
+            screen_name="WE20 Partner Profile — Save Required",
+            instructions=(
+                f"The agent could not confirm that the partner profile was saved. "
+                f"Please check WE20 for partner {partner_number} and verify that the "
+                f"{'inbound' if is_inbound else 'outbound'} row for "
+                f"Message Type={message_type} / Process Code={process_code} exists. "
+                f"If it is missing: add it manually and press Ctrl+S. "
+                f"If it already exists: just type 'done'."
+            ),
+            fields=[
+                {"name": "Partner",       "value": partner_number},
+                {"name": "Message Type",  "value": message_type},
+                {"name": "Process Code",  "value": process_code},
+                {"name": "Direction",     "value": "Inbound" if is_inbound else "Outbound"},
+            ],
+        )
+        # Re-read screen after user confirmation
+        screen = get_screen_text()
+        saved = True   # User confirmed — treat as saved
 
     audit_log("CREATE_PARTNER_PROFILE",
               {"partner": partner_number, "type": partner_type,
@@ -2547,6 +2640,16 @@ the fix using that answer. Do not give up after asking.
 USE wait_for_user_input when:
   • SAP GUI screen cannot be automated (field IDs not found after 2 tries)
   • User must click a button or navigate SAP manually
+  • create_partner_profile returns ok=False or row_added=False:
+      → The function already calls wait_for_user_input internally for
+        each sub-step that fails (Create button, field fill, save).
+      → If it still returns ok=False after those prompts, call
+        wait_for_user_input yourself with full manual WE20 instructions:
+          screen_name : "WE20 Partner Profile — Manual Creation"
+          instructions: step-by-step (tcode WE20, find partner, click
+                        Create in Inbound/Outbound, fill MESTYP + PROCOD,
+                        Ctrl+S). Include all values the user needs.
+          fields      : Partner, Type, Direction, Message Type, Process Code
 
 CANNOT RESOLVE — print this block ONLY when all of these are true:
   1. You have tried at least 2 different approaches
