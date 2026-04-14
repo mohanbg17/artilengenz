@@ -755,7 +755,9 @@ def get_idoc_detail(idoc_number):
                 rows = _read_shell_rows(
                     shell,
                     ["DOCNUM","STATUS","LOGDAT","LOGTIM","STAMQU",
-                     "STATXT","UNAME","REPID","STAPA1","STAPA2"],
+                     "STATXT","STATYP","UNAME","REPID",
+                     "MSGID","MSGNO","MSGTY","MSGV1","MSGV2","MSGV3","MSGV4",
+                     "STAPA1","STAPA2","STAPA3","STAPA4"],
                     max_rows=200,
                 )
                 # Only keep rows that match our IDoc number
@@ -765,17 +767,66 @@ def get_idoc_detail(idoc_number):
                 if not matching:
                     matching = rows  # accept all if filter is unclear
 
+                seen_msgs = set()
                 for row in matching:
                     statxt = row.get("STATXT","").strip()
-                    if statxt and statxt != "&, &, &, &":
+                    msgid  = row.get("MSGID","").strip()
+                    msgno  = row.get("MSGNO","").strip()
+                    msgty  = (row.get("MSGTY","") or row.get("STATYP","")).strip()
+                    v1     = row.get("MSGV1","") or row.get("STAPA1","")
+                    v2     = row.get("MSGV2","") or row.get("STAPA2","")
+                    v3     = row.get("MSGV3","") or row.get("STAPA3","")
+                    v4     = row.get("MSGV4","") or row.get("STAPA4","")
+
+                    # Resolve T100 template and substitute variables
+                    t100_template = ""
+                    t100_text     = ""
+                    if msgid and msgno:
+                        t100_template = _t100_lookup(msgid, msgno)
+                        if t100_template:
+                            t100_text = _substitute_msg_vars(
+                                t100_template, v1, v2, v3, v4)
+
+                    # Prefer T100-resolved text over raw STATXT if available
+                    display_text = t100_text or statxt or ""
+                    if display_text and display_text != "&, &, &, &":
+                        row["_display_text"]   = display_text
+                        row["_t100_template"]  = t100_template
+                        row["_t100_resolved"]  = t100_text
                         detail["status_records"].append(row)
-                        if any(kw in statxt.lower() for kw in [
+
+                    # Collect structured error details for error-type rows
+                    is_error = (
+                        msgty in ("E", "A") or
+                        any(kw in display_text.lower() for kw in [
                             "error","fehler","not found","nicht","invalid",
                             "missing","exception","fail","partner","profile",
                             "function module","posting period","cannot"
-                        ]):
-                            if statxt not in detail["error_messages"]:
-                                detail["error_messages"].append(statxt)
+                        ])
+                    )
+                    if is_error and display_text not in seen_msgs:
+                        seen_msgs.add(display_text)
+                        if display_text not in detail["error_messages"]:
+                            detail["error_messages"].append(display_text)
+                        # Add fully-structured record to error_details
+                        if "error_details" not in detail:
+                            detail["error_details"] = []
+                        detail["error_details"].append({
+                            "message_class":       msgid,
+                            "message_number":      msgno,
+                            "message_type":        msgty,
+                            "message_variable_1":  v1,
+                            "message_variable_2":  v2,
+                            "message_variable_3":  v3,
+                            "message_variable_4":  v4,
+                            "t100_template":       t100_template,
+                            "message_text":        display_text,
+                            "status_text_raw":     statxt,
+                            "program":             row.get("REPID",""),
+                            "date":                row.get("LOGDAT",""),
+                            "time":                row.get("LOGTIM",""),
+                        })
+
                 detail["edids_source"] = (
                     f"EDIDS WHERE clause: {len(matching)} rows (total {len(rows)})")
                 if detail["status_records"]:
@@ -928,18 +979,37 @@ def get_idoc_detail(idoc_number):
         detail["process_code"] = ""
         detail["process_code_source"] = "unknown"
 
+    # ── Promote the most-recent error_detail fields to the top level ──────────
+    primary_err = {}
+    if detail.get("error_details"):
+        # Take the last error record (most recent in the log)
+        primary_err = detail["error_details"][-1]
+
     # Summary for easy reading
     detail["summary"] = {
-        "idoc":          str(idoc_number),
-        "status":        _ctrl.get("STATUS","?"),
-        "status_desc":   detail.get("status_desc",""),
-        "message_type":  msg_type,
-        "partner":       _ctrl.get("SNDPRN",""),
-        "partner_type":  _ctrl.get("SNDPRT",""),
-        "direction":     direction,
-        "process_code":  detail.get("process_code",""),
-        "error_count":   len(detail["error_messages"]),
-        "errors":        detail["error_messages"][:5],
+        "idoc":            str(idoc_number),
+        "status":          _ctrl.get("STATUS","?"),
+        "status_desc":     detail.get("status_desc",""),
+        "message_type":    msg_type,
+        "partner":         _ctrl.get("SNDPRN",""),
+        "partner_type":    _ctrl.get("SNDPRT",""),
+        "direction":       direction,
+        "process_code":    detail.get("process_code",""),
+        "error_count":     len(detail.get("error_details", detail["error_messages"])),
+        # Structured error root-cause fields
+        "root_cause": {
+            "message_class":   primary_err.get("message_class",""),
+            "message_number":  primary_err.get("message_number",""),
+            "message_type":    primary_err.get("message_type",""),
+            "t100_template":   primary_err.get("t100_template",""),
+            "message_text":    primary_err.get("message_text",""),
+            "variable_1":      primary_err.get("message_variable_1",""),
+            "variable_2":      primary_err.get("message_variable_2",""),
+            "variable_3":      primary_err.get("message_variable_3",""),
+            "variable_4":      primary_err.get("message_variable_4",""),
+            "program":         primary_err.get("program",""),
+        },
+        "all_errors":      detail.get("error_details", [])[:10],
     }
 
     return detail
@@ -1127,6 +1197,86 @@ _PROCESS_CODE_MAP = {
 
 # Cache to avoid re-querying WE64 for the same message type in one run
 _we64_cache: dict = {}
+
+
+_t100_cache: dict = {}   # (MSGID, MSGNO) → raw T100 text template
+
+def _t100_lookup(msgid: str, msgno: str) -> str:
+    """
+    Look up the SAP message text template from table T100.
+
+    T100 fields used:
+      SPRSL — language key  (we try 'E' then 'D')
+      ARBGB — message class (= MSGID from EDIDS)
+      MSGNR — message number, 3-digit zero-padded (= MSGNO from EDIDS)
+      TEXT  — message text template (& = placeholder for variable substitution)
+
+    Returns the raw template string, or "" when not found.
+    """
+    if not msgid or not msgno:
+        return ""
+    key = (msgid.upper().strip(), msgno.strip().zfill(3))
+    if key in _t100_cache:
+        return _t100_cache[key]
+
+    template = ""
+    try:
+        go_to_transaction("SE16N")
+        time.sleep(1.2)
+
+        for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/txtGD-TAB",
+                    "wnd[0]/usr/ctxtDATABROWSE-TABLENAME"):
+            try:
+                session.FindById(fid).Text = "T100"
+                session.FindById("wnd[0]").SendVKey(0)
+                time.sleep(1.2)
+                break
+            except Exception:
+                pass
+
+        # Filter by ARBGB (message class) and MSGNR (message number)
+        _set_se16n_filter("ARBGB", key[0])
+        _set_se16n_filter("MSGNR", key[1])
+        # Language EN first; if empty we keep whatever comes back
+        _set_se16n_filter("SPRSL", "E")
+
+        for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
+            try:
+                session.FindById(fid).Text = "5"
+            except Exception:
+                pass
+
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(1.5)
+
+        text = _se16n_read_column("TEXT")
+        if not text:
+            # Try reading any TEXT-like column
+            for col in ("TEXT", "METEXT", "TXTEXT"):
+                text = _se16n_read_column(col)
+                if text:
+                    break
+        template = text.strip()
+
+    except Exception:
+        pass
+
+    _t100_cache[key] = template
+    return template
+
+
+def _substitute_msg_vars(template: str, v1: str, v2: str,
+                          v3: str, v4: str) -> str:
+    """
+    Replace the & placeholders in a T100 template with the actual message
+    variable values (MSGV1..MSGV4).  SAP uses & as the placeholder.
+    """
+    result = template
+    for val in (v1, v2, v3, v4):
+        if "&" not in result:
+            break
+        result = result.replace("&", val.strip() if val else "?", 1)
+    return result
 
 
 def _we64_lookup_process_code(message_type: str, direction: str = "1") -> str:
@@ -3475,7 +3625,7 @@ MAX_SAME_TOOL_TOTAL   = 6    # if same tool called N times total → force stop 
 # Per-tool result caps (chars stored in conversation).
 # Full output always printed to screen; these control what Claude sees next turn.
 _TOOL_RESULT_CAPS = {
-    "get_idoc_detail":          1200,   # all decision data lives here — needs room
+    "get_idoc_detail":          2000,   # richer now: error_details + T100 lookups
     "get_idoc_segments":         800,
     "scan_idoc_errors":          600,
     "check_partner_profile":     600,
