@@ -2615,44 +2615,259 @@ def check_partner_profile(partner_number, direction="1", message_type=""):
 
 
 def create_partner_profile(partner_number, partner_type, direction,
-                            message_type, process_code, func_module=""):
+                            message_type, process_code, basic_type="",
+                            func_module=""):
     """
-    Create or fix a partner profile entry in WE20.
-    partner_type: LS=Logical system, KU=Customer, LI=Vendor
-    direction: 1=Inbound, 2=Outbound
-    process_code: e.g. ORDE, DELVRY, INVOIC, DESADV
+    Add an inbound or outbound message-type entry to a partner profile in WE20.
+
+    Handles two cases:
+      • Partner already exists → navigate to it in the tree, add the new
+        inbound/outbound row.  (Most common case — e.g. S4HANA2023 exists
+        but is missing MATMAS inbound.)
+      • Partner does not exist → create the partner header first, then add row.
+
+    partner_type : LS=Logical system, KU=Customer, LI=Vendor
+    direction    : '1' or 'inbound'  /  '2' or 'outbound'
+    process_code : e.g. MATM (for MATMAS inbound), ORDE, DELVRY, BAPI …
+    basic_type   : e.g. MATMAS01 (leave blank to use SAP default)
     """
+    is_inbound = str(direction) in ("1", "inbound", "INBOUND")
+
     go_to_transaction("WE20")
-    time.sleep(1.5)
-    try:
-        # Click Create / New
-        for fid in ("wnd[0]/tbar[1]/btn[8]",
-                    "wnd[0]/tbar[0]/btn[3]"):
+    time.sleep(2)
+
+    # ── Step 1: Find S4HANA2023 (or any partner) in the WE20 tree ────────────
+    partner_on_screen = False
+    tree = _find_gui_tree_anywhere()
+
+    if tree:
+        try:
+            # Expand all nodes so the target partner becomes visible
+            all_keys = []
+            try:
+                all_keys = list(tree.GetAllNodeKeys() or [])
+            except Exception:
+                pass
+            for k in all_keys:
+                try:
+                    tree.ExpandNode(k)
+                except Exception:
+                    pass
+            time.sleep(0.5)
+            # Refresh key list after expansion
+            try:
+                all_keys = list(tree.GetAllNodeKeys() or [])
+            except Exception:
+                pass
+            # Click the node whose text matches the partner number
+            for k in all_keys:
+                try:
+                    node_text = tree.GetNodeText(k) or ""
+                    if partner_number.upper() in node_text.upper():
+                        tree.EnsureVisibleHorizontalItem(k, "")
+                        tree.ClickNode(k)
+                        time.sleep(1.5)
+                        partner_on_screen = True
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Fallback: type partner number into WE20's filter/search field
+    if not partner_on_screen:
+        for fid in ("wnd[0]/usr/ctxtWE20-PARNR", "wnd[0]/usr/txtWE20-PARNR",
+                    "wnd[0]/usr/ctxtPARTNR"):
+            try:
+                session.FindById(fid).Text = partner_number
+                session.FindById("wnd[0]").SendVKey(0)
+                time.sleep(1.5)
+                partner_on_screen = True
+                break
+            except Exception:
+                pass
+
+    screen = get_screen_text()
+    partner_exists = partner_number in screen
+
+    # ── Step 2: If partner doesn't exist, create the header first ─────────────
+    if not partner_exists:
+        # Press "Create" toolbar button
+        for fid in ("wnd[0]/tbar[1]/btn[8]", "wnd[0]/tbar[0]/btn[3]",
+                    "wnd[0]/tbar[1]/btn[3]"):
             try:
                 session.FindById(fid).Press()
                 time.sleep(1)
                 break
             except Exception:
                 pass
-
+        # Fill partner number and type
         elems = discover_elements()
-        field_map = {
-            "PARNR": partner_number,
-            "PARVW": partner_type,
-        }
-        for field, val in field_map.items():
-            for e in elems:
-                if field in e.get("id","").upper():
-                    set_field(e["id"], val)
+        for e in elems:
+            eid = e.get("id", "").upper()
+            if "PARNR" in eid or "PARTNER_NO" in eid:
+                try:
+                    session.FindById(e["id"]).Text = partner_number
                     break
+                except Exception:
+                    pass
+        for e in elems:
+            eid = e.get("id", "").upper()
+            if "PARVW" in eid or "PARTYP" in eid or "PARTNER_TYPE" in eid:
+                try:
+                    session.FindById(e["id"]).Text = partner_type
+                    break
+                except Exception:
+                    pass
+        session.FindById("wnd[0]").SendVKey(0)
+        time.sleep(1.5)
 
-        session.FindById("wnd[0]").SendVKey(0)   # Enter
-        time.sleep(1)
+    # ── Step 3: Switch to Change mode if currently in Display mode ────────────
+    screen = get_screen_text()
+    if "Display" in screen:
+        for fid in ("wnd[0]/tbar[1]/btn[4]", "wnd[0]/tbar[0]/btn[4]"):
+            try:
+                session.FindById(fid).Press()
+                time.sleep(1)
+                break
+            except Exception:
+                pass
+        # Also try Ctrl+F1 (change mode toggle) or F5
+        try:
+            session.FindById("wnd[0]").SendVKey(4)
+            time.sleep(1)
+        except Exception:
+            pass
 
-        return {"ok": True, "partner": partner_number,
-                "type": partner_type, "screen": get_screen_text()}
-    except Exception as e:
-        return {"error": str(e)}
+    # ── Step 4: Add the new inbound or outbound row ───────────────────────────
+    # The WE20 Inbound / Outbound tables each have a row of 4 buttons below
+    # them.  Button positions in SAP WE20 (typical):
+    #   btn[0]=detail/navigate  btn[1]=copy  btn[2]=create  btn[3]=delete
+    # Sub-screen IDs vary by SAP version — try multiple paths.
+    SUBSCREENS = [
+        "wnd[0]/usr/subSUBSCREEN_BODY:SAPLWEDC:0100/",
+        "wnd[0]/usr/subSUBSCREEN_BODY:SAPLWEDC:0200/",
+        "wnd[0]/usr/sub:SAPLWEDC:0100/",
+        "wnd[0]/usr/",
+    ]
+    section = "IN" if is_inbound else "OUT"
+
+    row_added = False
+    for pfx in SUBSCREENS:
+        for btn_suffix in (
+            f"btnBT_{section}_CREATE",
+            f"btnBT_{section}BOUND_CREATE",
+            f"tblSAPLWEDCTC_{section}/btnCREATE",
+            f"btnCREATE_{section}BOUND",
+            f"btnCREATE_{section}",
+        ):
+            try:
+                session.FindById(pfx + btn_suffix).Press()
+                time.sleep(0.8)
+                row_added = True
+                break
+            except Exception:
+                pass
+        if row_added:
+            break
+
+    if not row_added:
+        # Fallback: use keyboard Insert on the table
+        elems = discover_elements()
+        for e in elems:
+            eid = e.get("id", "").upper()
+            section_kw = "INBOUND" if is_inbound else "OUTBOUND"
+            if section_kw in eid or f"TC_{section}" in eid:
+                try:
+                    session.FindById(e["id"]).SetFocus()
+                    session.FindById("wnd[0]").SendVKey(83)  # Insert row
+                    time.sleep(0.5)
+                    row_added = True
+                    break
+                except Exception:
+                    pass
+
+    # ── Step 5: Fill in Message Type and Process Code ─────────────────────────
+    time.sleep(0.5)
+    elems = discover_elements()
+
+    # Message Type — find first empty MESTYP field
+    for e in elems:
+        eid = e.get("id", "").upper()
+        cur = (e.get("text") or "").strip()
+        if "MESTYP" in eid and not cur:
+            try:
+                session.FindById(e["id"]).Text = message_type
+                break
+            except Exception:
+                pass
+
+    # Process Code — find first empty PROCOD / PROCESS field
+    for e in elems:
+        eid = e.get("id", "").upper()
+        cur = (e.get("text") or "").strip()
+        if ("PROCOD" in eid or "PRZNR" in eid) and not cur:
+            try:
+                session.FindById(e["id"]).Text = process_code
+                break
+            except Exception:
+                pass
+
+    # Basic Type (optional)
+    if basic_type:
+        for e in elems:
+            eid = e.get("id", "").upper()
+            cur = (e.get("text") or "").strip()
+            if ("BASIC" in eid or "IDOCTP" in eid or "MESTYP" not in eid
+                    and "DOCTYP" in eid) and not cur:
+                try:
+                    session.FindById(e["id"]).Text = basic_type
+                    break
+                except Exception:
+                    pass
+
+    # ── Step 6: Save ──────────────────────────────────────────────────────────
+    session.FindById("wnd[0]").SendVKey(11)   # Ctrl+S
+    time.sleep(2)
+
+    # Dismiss any transport / local-object popup
+    for _ in range(3):
+        try:
+            wnd1 = session.FindById("wnd[1]", False)
+            if wnd1:
+                # Press "Local Object" if visible, else Enter
+                try:
+                    session.FindById("wnd[1]/usr/btnSPOPLI-SELFLAG").Press()
+                except Exception:
+                    session.FindById("wnd[1]").SendVKey(0)
+                time.sleep(1)
+        except Exception:
+            break
+
+    screen = get_screen_text()
+    saved = ("saved" in screen.lower() or "changed" in screen.lower()
+             or "created" in screen.lower()
+             or partner_number in screen)
+
+    audit_log("CREATE_PARTNER_PROFILE",
+              {"partner": partner_number, "type": partner_type,
+               "direction": "inbound" if is_inbound else "outbound",
+               "message_type": message_type, "process_code": process_code,
+               "basic_type": basic_type},
+              status="saved" if saved else "attempted")
+
+    return {
+        "ok":           saved,
+        "partner":      partner_number,
+        "partner_type": partner_type,
+        "direction":    "inbound" if is_inbound else "outbound",
+        "message_type": message_type,
+        "process_code": process_code,
+        "row_added":    row_added,
+        "screen":       screen,
+        "note": (f"Added {message_type}/{process_code} {'inbound' if is_inbound else 'outbound'} "
+                 f"to partner {partner_number}/{partner_type}."),
+    }
 
 
 def _bd87_find_tree():
@@ -6827,28 +7042,33 @@ TOOLS = [
     {
         "name": "create_partner_profile",
         "description": (
-            "Create or fix a partner profile entry in WE20. "
-            "Use when IDoc fails with 'partner not found' or 'no partner agreement'. "
-            "partner_type: LS=Logical system, KU=Customer, LI=Vendor. "
-            "REQUIRES human approval."
+            "Add an inbound or outbound message-type entry to a WE20 partner profile. "
+            "Works whether the partner already exists (adds a row to existing profile) "
+            "or doesn't exist yet (creates the header first). "
+            "For IDoc 198025: partner_number='S4HANA2023', partner_type='LS', "
+            "direction='1' (inbound), message_type='MATMAS', process_code='MATM'. "
+            "Use when IDoc error is 'Inbound partner profile does not exist' or "
+            "'partner not found'."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "partner_number": {"type": "string",
-                                   "description": "Partner number"},
+                                   "description": "Partner number e.g. S4HANA2023"},
                 "partner_type":   {"type": "string",
-                                   "enum": ["LS", "KU", "LI", "KR"],
-                                   "description": "Partner type: LS=Logical system, KU=Customer, LI=Vendor"},
+                                   "enum": ["LS", "KU", "LI", "KR", "B", "GP", "BP"],
+                                   "description": "LS=Logical system, KU=Customer, LI=Vendor"},
                 "direction":      {"type": "string",
                                    "enum": ["1", "2"],
                                    "description": "1=Inbound, 2=Outbound"},
                 "message_type":   {"type": "string",
-                                   "description": "IDoc message type e.g. ORDERS, INVOIC"},
+                                   "description": "IDoc message type e.g. MATMAS, ORDERS, INVOIC"},
                 "process_code":   {"type": "string",
-                                   "description": "Process code e.g. ORDE, DELVRY, INVOIC"},
+                                   "description": "Process code: MATM for MATMAS, ORDE for ORDERS, BAPI for BAPI-based, etc."},
+                "basic_type":     {"type": "string",
+                                   "description": "IDoc basic type e.g. MATMAS01 (optional, SAP sets default)"},
                 "func_module":    {"type": "string",
-                                   "description": "Function module (optional)"},
+                                   "description": "Function module (optional, rarely needed)"},
             },
             "required": ["partner_number", "partner_type", "direction",
                          "message_type", "process_code"],
@@ -7134,6 +7354,7 @@ def dispatch(tool_name, tool_input):
             tool_input["direction"],
             tool_input["message_type"],
             tool_input["process_code"],
+            tool_input.get("basic_type", ""),
             tool_input.get("func_module", ""),
         )
     if tool_name == "bd87_select_and_reprocess":
