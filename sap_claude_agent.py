@@ -1948,6 +1948,70 @@ def ask_user_question(question: str, context: str, options: list = None) -> dict
     return {"answer": answer, "question": question, "context": context}
 
 
+# Classification labels and colours (console only — no ANSI needed, use text markers)
+_CLASS_LABEL = {
+    "SOLVED_BY_AGENT":    "SOLVED BY AGENT       ✓",
+    "HUMAN_THEN_AGENT":   "HUMAN + AGENT         ✓",
+    "CANNOT_SOLVE":       "CANNOT SOLVE          ✗",
+}
+_CLASS_BOX = {
+    "SOLVED_BY_AGENT":    "═",
+    "HUMAN_THEN_AGENT":   "═",
+    "CANNOT_SOLVE":       "═",
+}
+
+# Session-level list so the main loop can print a final summary table
+_session_resolutions: list = []
+
+
+def set_idoc_resolution(idoc_number: str, classification: str,
+                         reason: str, what_was_done: str = "",
+                         next_steps: str = "") -> dict:
+    """
+    Record and display the final classification for an IDoc processing attempt.
+
+    classification must be one of:
+      SOLVED_BY_AGENT   — fixed entirely by the agent, no human help needed
+      HUMAN_THEN_AGENT  — human performed a manual step; agent completed the rest
+      CANNOT_SOLVE      — IDoc is still in error; explain why and what is needed
+    """
+    label = _CLASS_LABEL.get(classification, classification)
+    w = 66
+
+    print(f"\n{'╔' + '═'*w + '╗'}", flush=True)
+    print(f"║  IDoc {idoc_number}  —  {label:<{w - len(idoc_number) - 8}}║",
+          flush=True)
+    print(f"{'╠' + '═'*w + '╣'}", flush=True)
+
+    def _row(key, val):
+        val = str(val)
+        while val:
+            chunk, val = val[:w - len(key) - 4], val[w - len(key) - 4:]
+            print(f"║  {key:<14}: {chunk:<{w - len(key) - 4}}║", flush=True)
+            key = ""   # only print key on first line
+
+    if reason:
+        _row("Reason", reason)
+    if what_was_done:
+        _row("Done", what_was_done)
+    if next_steps:
+        _row("Next steps", next_steps)
+
+    print(f"{'╚' + '═'*w + '╝'}", flush=True)
+
+    entry = {
+        "idoc_number":    idoc_number,
+        "classification": classification,
+        "reason":         reason,
+        "what_was_done":  what_was_done,
+        "next_steps":     next_steps,
+        "timestamp":      datetime.now().isoformat(),
+    }
+    _session_resolutions.append(entry)
+    audit_log("IDOC_RESOLUTION", entry, status=classification)
+    return {"ok": True, "classification": classification, "idoc_number": idoc_number}
+
+
 # ── Tool Definitions for Claude ────────────────────────────────────────────────
 TOOLS = [
     # ── READ ────────────────────────────────────────────────────────────────────
@@ -2409,6 +2473,66 @@ TOOLS = [
             "required": ["question", "context"],
         },
     },
+
+    # ── RESOLUTION CLASSIFICATION ─────────────────────────────────────────────
+    {
+        "name": "set_idoc_resolution",
+        "description": (
+            "MANDATORY — call this as the FINAL step after processing every IDoc. "
+            "Records and displays the outcome classification in a clear box on screen. "
+            "Choose exactly one classification:\n\n"
+            "  SOLVED_BY_AGENT   — IDoc fixed entirely by the agent with no human help. "
+            "Final status is 53 or equivalent success. "
+            "Set reason=what the root cause was, what_was_done=what the agent did.\n\n"
+            "  HUMAN_THEN_AGENT  — IDoc fixed, but human had to perform at least one "
+            "manual step (e.g. clicked Create button in WE20, filled a field). "
+            "Agent completed the reprocess after the human step. "
+            "Set reason=what required human help, what_was_done=what human did + agent did.\n\n"
+            "  CANNOT_SOLVE      — IDoc is still in error state. Either the agent "
+            "exhausted all options, or the user confirmed the fix should not be done, "
+            "or it requires action outside the agent's capability (e.g. finance team "
+            "must open a fiscal period, an authorisation grant is needed). "
+            "Set reason=exact blocking cause, next_steps=what must be done manually."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "idoc_number": {
+                    "type": "string",
+                    "description": "The IDoc number being classified, e.g. '198025'",
+                },
+                "classification": {
+                    "type": "string",
+                    "enum": ["SOLVED_BY_AGENT", "HUMAN_THEN_AGENT", "CANNOT_SOLVE"],
+                    "description": "One of: SOLVED_BY_AGENT, HUMAN_THEN_AGENT, CANNOT_SOLVE",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Concise explanation. For SOLVED/HUMAN: what the root cause was. "
+                        "For CANNOT_SOLVE: exact reason why it cannot be fixed."
+                    ),
+                },
+                "what_was_done": {
+                    "type": "string",
+                    "description": (
+                        "What actions were taken (agent and/or human). "
+                        "E.g. 'Created partner profile S4HANA2023/MATMAS in WE20, "
+                        "reprocessed via BD87 — status changed 56→53.'"
+                    ),
+                },
+                "next_steps": {
+                    "type": "string",
+                    "description": (
+                        "Only for CANNOT_SOLVE: what the user or team must do next. "
+                        "Include tcode and exact values needed. "
+                        "Leave blank for SOLVED_BY_AGENT and HUMAN_THEN_AGENT."
+                    ),
+                },
+            },
+            "required": ["idoc_number", "classification", "reason"],
+        },
+    },
 ]
 
 # ── IRREVERSIBLE operations — the ONLY ones that still confirm ────────────────
@@ -2523,6 +2647,16 @@ def dispatch(tool_name, tool_input):
             tool_input.get("options"),
         )
 
+    # ── Resolution classification ──────────────────────────────────────────────
+    if tool_name == "set_idoc_resolution":
+        return set_idoc_resolution(
+            tool_input["idoc_number"],
+            tool_input["classification"],
+            tool_input["reason"],
+            tool_input.get("what_was_done", ""),
+            tool_input.get("next_steps", ""),
+        )
+
     return {"error": f"Unknown tool: {tool_name}"}
 
 # ── System Prompt ──────────────────────────────────────────────────────────────
@@ -2595,20 +2729,43 @@ uses SelectAll(), and presses Process. Do not call any other
 reprocess tool unless bd87_select_and_reprocess fails.
 
 ──────────────────────────────────────────────────────────
-STEP 4 — SHOW FINAL RESULT
+STEP 4 — VERIFY RESULT
 ──────────────────────────────────────────────────────────
 Call: get_idoc_detail(idoc_number)
-
-Then print EXACTLY this block:
-  ┌─────────────────────────────────────────┐
-  │ RESULT — IDoc <number>
-  │ Before : <old status code> — <old text>
-  │ After  : <new status code> — <new text>
-  │ Outcome: FIXED ✓  /  FAILED ✗  /  PARTIAL
-  └─────────────────────────────────────────┘
+Read the new status code (compare to status from Step 1).
 
 Status codes: 53=Posted OK  51=Not posted  56=With errors
               26=Syntax err  64=Ready  68=No further processing
+
+──────────────────────────────────────────────────────────
+STEP 5 — CLASSIFY (MANDATORY — always the last call)
+──────────────────────────────────────────────────────────
+Call: set_idoc_resolution(idoc_number, classification, reason,
+                           what_was_done, next_steps)
+
+Classification rules — pick exactly one:
+
+  SOLVED_BY_AGENT
+    When: agent fixed it with no human involvement
+          AND final status = 53 or error is gone
+    reason       : what the root cause was
+    what_was_done: what the agent did (tcode, action, result)
+    next_steps   : (leave blank)
+
+  HUMAN_THEN_AGENT
+    When: wait_for_user_input was called at any point
+          AND IDoc is now fixed (human + agent together)
+    reason       : what required human help and why agent couldn't do it
+    what_was_done: what human did + what agent did after
+    next_steps   : (leave blank)
+
+  CANNOT_SOLVE
+    When: IDoc is still in error state after all attempts, OR
+          user confirmed the fix should not be done, OR
+          fix requires action outside agent capability
+    reason       : exact blocking cause (be specific)
+    what_was_done: what was tried
+    next_steps   : exact manual steps + tcode + values the user needs
 
 ═══════════════════════════════════════════════════════════
  WHEN STUCK — ASK THE USER, NEVER SILENTLY GIVE UP
@@ -2677,8 +2834,8 @@ CANNOT RESOLVE — print this block ONLY when all of these are true:
 • Use high-level tools first; fall back to manual navigation only
   when no dedicated tool exists.
 • Keep all output SHORT — one line per action, one line per result.
-• NEVER end without either: fixing the IDoc, asking the user a
-  specific question, or printing the CANNOT RESOLVE block.
+• NEVER end without calling set_idoc_resolution — it is the mandatory
+  last step for every IDoc, regardless of outcome.
 """
 
 # ── Token / Rate-Limit Management ──────────────────────────────────────────────
@@ -2884,6 +3041,7 @@ _TOOL_LABELS = {
     "read_screen":              "Reading current SAP screen",
     "wait_for_user_input":      "Waiting for manual user input in SAP",
     "ask_user_question":        "Agent is asking you a question — input required",
+    "set_idoc_resolution":      "Recording IDoc resolution classification",
 }
 
 def _ts():
@@ -3012,6 +3170,22 @@ def run_agent(user_query, api_key, messages=None):
     print(f"\n[{_ts()}] Agent finished  ({call_num} tool calls, {round_num} rounds)",
           flush=True)
     print("─" * 68, flush=True)
+
+    # Print session classification summary if any resolutions were recorded
+    if _session_resolutions:
+        solved   = [r for r in _session_resolutions if r["classification"] == "SOLVED_BY_AGENT"]
+        human    = [r for r in _session_resolutions if r["classification"] == "HUMAN_THEN_AGENT"]
+        unsolved = [r for r in _session_resolutions if r["classification"] == "CANNOT_SOLVE"]
+        print(f"\n{'═'*68}", flush=True)
+        print(f"  SESSION SUMMARY", flush=True)
+        print(f"{'─'*68}", flush=True)
+        print(f"  Solved by agent        : {len(solved):>3}  "
+              + (", ".join(r['idoc_number'] for r in solved) or "—"), flush=True)
+        print(f"  Human + agent          : {len(human):>3}  "
+              + (", ".join(r['idoc_number'] for r in human) or "—"), flush=True)
+        print(f"  Cannot solve           : {len(unsolved):>3}  "
+              + (", ".join(r['idoc_number'] for r in unsolved) or "—"), flush=True)
+        print(f"{'═'*68}", flush=True)
 
     # ── Save session report ────────────────────────────────────────────────────
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3170,6 +3344,8 @@ if __name__ == "__main__":
             f"(3) bd87_select_and_reprocess(idoc_numbers=[\"{idoc_number}\"]), "
             f"(4) get_idoc_detail(\"{idoc_number}\") and print final status."
         )
+
+        _session_resolutions.clear()   # fresh classification list per IDoc run
 
         print(f"\n{'═'*68}", flush=True)
         print(f"  IDoc {idoc_number}  —  started at {datetime.now().strftime('%H:%M:%S')}", flush=True)
