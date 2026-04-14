@@ -99,6 +99,205 @@ def get_screen_text():
     except Exception as e:
         return f"Error: {e}"
 
+# GUI field types that accept text input
+_INPUT_TYPES = {
+    "GuiTextField", "GuiCTextField", "GuiNumericTextField",
+    "GuiPasswordField", "GuiComboBox",
+}
+
+
+def _find_field_by_label(label_texts: list):
+    """Walk the current SAP screen GUI tree and find an input field that sits
+    immediately after a GuiLabel whose text matches one of *label_texts*.
+    Returns (field_object, field_id) or (None, None)."""
+    upper_labels = [t.upper() for t in label_texts]
+    found_obj = [None]
+    found_id  = [None]
+
+    def _walk(parent, depth=0):
+        if depth > 9:
+            return
+        try:
+            count = parent.Children.Count
+        except Exception:
+            return
+        kids = []
+        for i in range(count):
+            try:
+                kids.append(parent.Children(i))
+            except Exception:
+                kids.append(None)
+
+        for i, child in enumerate(kids):
+            if child is None:
+                continue
+            try:
+                ctype = child.Type
+            except Exception:
+                continue
+            if ctype == "GuiLabel":
+                try:
+                    ltext = child.Text.strip().upper()
+                except Exception:
+                    ltext = ""
+                if any(ul and (ul in ltext or ltext in ul) for ul in upper_labels):
+                    # Look at the next few siblings for an input field
+                    for j in range(i + 1, min(i + 5, len(kids))):
+                        sib = kids[j]
+                        if sib is None:
+                            continue
+                        try:
+                            if sib.Type in _INPUT_TYPES:
+                                found_obj[0] = sib
+                                found_id[0]  = sib.Id
+                                return
+                        except Exception:
+                            continue
+            _walk(child, depth + 1)
+            if found_obj[0] is not None:
+                return
+
+    try:
+        _walk(session.FindById("wnd[0]"))
+    except Exception:
+        pass
+    return found_obj[0], found_id[0]
+
+
+def _screen_texts() -> list:
+    """Return a flat list of all visible text strings on the current SAP screen."""
+    texts = []
+
+    def _walk(parent, depth=0):
+        if depth > 6:
+            return
+        try:
+            count = parent.Children.Count
+        except Exception:
+            return
+        for i in range(count):
+            try:
+                child = parent.Children(i)
+                t = getattr(child, "Text", "") or ""
+                if t.strip():
+                    texts.append(t.strip())
+                _walk(child, depth + 1)
+            except Exception:
+                pass
+
+    try:
+        _walk(session.FindById("wnd[0]"))
+    except Exception:
+        pass
+    return texts
+
+
+# ── Human screen input pause ───────────────────────────────────────────────────
+def _human_screen_pause(tcode: str, purpose: str, fields: list,
+                         notes: str = "") -> dict:
+    """
+    Called immediately after the agent navigates to *tcode*.
+    Prints a clear banner listing every field + value the human should enter,
+    then shows the live SAP screen elements so the user can map values to fields.
+    Waits for the user to type 'done' (fields filled + action executed in SAP)
+    before the agent reads the result.
+
+    fields : list of dicts with keys  name, value, note (optional)
+    notes  : extra step instructions (default prompts user to press F8 / Ctrl+S)
+    Returns: dict with 'status': 'user_completed' | 'skipped' | 'aborted'
+    """
+    # Collect the live input fields currently visible on the SAP screen
+    live_inputs = []
+    try:
+        for el in discover_elements():
+            if el.get("type") in ("GuiTextField", "GuiCTextField",
+                                   "GuiNumericTextField", "GuiComboBox"):
+                live_inputs.append(el)
+    except Exception:
+        pass
+
+    W = 70
+    print("\n" + "█" * W, flush=True)
+    print(f"  HUMAN INPUT REQUIRED — Transaction: {tcode}", flush=True)
+    print("█" * W, flush=True)
+    print(f"  Purpose  : {purpose}", flush=True)
+    print(f"  Screen   : {get_screen_text()}", flush=True)
+
+    # ── Required field values ──────────────────────────────────────────────────
+    if fields:
+        print(f"\n  ┌─ Enter these values {'─' * (W - 23)}┐", flush=True)
+        for fld in fields:
+            if isinstance(fld, dict):
+                name  = str(fld.get("name",  ""))
+                value = str(fld.get("value", ""))
+                note  = str(fld.get("note",  ""))
+            else:
+                name, value, note = str(fld), "", ""
+            suffix = f"  ← {note}" if note else ""
+            print(f"  │  {name:<28} : {value:<22}{suffix}", flush=True)
+        print(f"  └{'─' * (W - 2)}┘", flush=True)
+
+    # ── Live screen fields ─────────────────────────────────────────────────────
+    if live_inputs:
+        print(f"\n  ┌─ Fields on SAP screen right now {'─' * (W - 35)}┐", flush=True)
+        for el in live_inputs[:25]:
+            tip   = el.get("tooltip") or ""
+            el_id = el.get("id", "").split("/")[-1]
+            label = (tip or el_id)[:42]
+            cur   = repr(el.get("value") or "")
+            print(f"  │  {label:<42} = {cur}", flush=True)
+        print(f"  └{'─' * (W - 2)}┘", flush=True)
+
+    # ── Instructions ──────────────────────────────────────────────────────────
+    extra = notes or "Fill the fields above in SAP, then press Execute (F8) or Save (Ctrl+S)."
+    print(f"\n  {extra}", flush=True)
+    print(f"\n  done  → I have filled and executed — agent will read the result",
+          flush=True)
+    print(f"  skip  → skip this step entirely", flush=True)
+    print(f"  abort → stop the agent", flush=True)
+    print("─" * W, flush=True)
+
+    while True:
+        try:
+            response = input("  [done / skip / abort]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  [Interrupted — aborting]", flush=True)
+            return {"status": "aborted", "screen": get_screen_text(),
+                    "note": "Interrupted during human screen input."}
+
+        if response in ("done", "ok", "yes", "d", "y", "go",
+                        "continue", "proceed", ""):
+            time.sleep(1.0)   # brief pause so SAP result screen settles
+            screen = get_screen_text()
+            texts  = _screen_texts()
+            audit_log("HUMAN_SCREEN_INPUT",
+                      {"tcode": tcode, "purpose": purpose},
+                      status="completed", approved_by=CURRENT_USER)
+            print(f"  [Agent] Screen read after your input: {screen}", flush=True)
+            return {
+                "status":       "user_completed",
+                "screen":       screen,
+                "screen_texts": texts[:30],
+            }
+
+        elif response in ("skip", "s"):
+            audit_log("HUMAN_SCREEN_INPUT",
+                      {"tcode": tcode, "purpose": purpose},
+                      status="skipped", approved_by=CURRENT_USER)
+            return {"status": "skipped",
+                    "note": f"User skipped {tcode} screen input."}
+
+        elif response in ("abort", "stop", "exit", "quit"):
+            audit_log("HUMAN_SCREEN_INPUT",
+                      {"tcode": tcode, "purpose": purpose},
+                      status="aborted", approved_by=CURRENT_USER)
+            return {"status": "aborted",
+                    "note": f"User aborted at {tcode} screen."}
+
+        else:
+            print("  Please type 'done', 'skip', or 'abort'.", flush=True)
+
+
 def go_to_transaction(tcode):
     session.StartTransaction(str(tcode).strip())
     time.sleep(1.5)
@@ -347,82 +546,42 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
     go_to_transaction("WE05")
     time.sleep(1.5)
 
-    # ── Set selection fields ───────────────────────────────────────────────────
-    for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-LOW", "wnd[0]/usr/ctxtLOW_DATE",
-                "wnd[0]/usr/ctxtCREDAT-LOW"):
-        try: session.FindById(fid).Text = df; break
-        except Exception: pass
-    for fid in ("wnd[0]/usr/ctxtSEL_CREDAT-HIGH", "wnd[0]/usr/ctxtHIGH_DATE",
-                "wnd[0]/usr/ctxtCREDAT-HIGH"):
-        try: session.FindById(fid).Text = dt; break
-        except Exception: pass
-
-    if direction == "inbound":
-        for fid in ("wnd[0]/usr/radRB_DIRECT_1", "wnd[0]/usr/radINBOUND"):
-            try: session.FindById(fid).Select(); break
-            except Exception: pass
-    elif direction == "outbound":
-        for fid in ("wnd[0]/usr/radRB_DIRECT_2", "wnd[0]/usr/radOUTBOUND"):
-            try: session.FindById(fid).Select(); break
-            except Exception: pass
-
-    # Put status codes into the selection screen if there's a field for it
-    if statuses:
-        for fid in ("wnd[0]/usr/ctxtSEL_STATUS-LOW", "wnd[0]/usr/ctxtSTATUS"):
-            try: session.FindById(fid).Text = statuses[0]; break
-            except Exception: pass
-
-    # ── Set DOCNUM filter when a specific IDoc number is requested ────────────
+    # ── Human fills the WE05 selection screen ─────────────────────────────────
+    dir_label = {"inbound": "Inbound (select Inbound radio button)",
+                 "outbound": "Outbound (select Outbound radio button)"}.get(
+                     direction, "Both (leave direction radio buttons as-is)")
+    we05_fields = [
+        {"name": "Date From (Created on)",
+         "value": df,
+         "note": "CREDAT LOW field"},
+        {"name": "Date To (Created on)",
+         "value": dt,
+         "note": "CREDAT HIGH field"},
+        {"name": "Direction",
+         "value": dir_label},
+        {"name": "Status (optional)",
+         "value": statuses[0] if statuses else "(leave blank for all)",
+         "note": "Status code e.g. 51=error"},
+    ]
     if docnum_padded:
-        docnum_set = False
+        we05_fields.insert(0, {
+            "name":  "IDoc Number LOW + HIGH",
+            "value": docnum_padded,
+            "note":  "Paste same value into both LOW and HIGH",
+        })
 
-        # Tier 1: both ctxt and txt variants
-        for fid in (
-            "wnd[0]/usr/ctxtS_DOCNUM-LOW",   "wnd[0]/usr/txtS_DOCNUM-LOW",
-            "wnd[0]/usr/ctxtSEL_DOCNUM-LOW", "wnd[0]/usr/txtSEL_DOCNUM-LOW",
-            "wnd[0]/usr/ctxtDOCNUM-LOW",     "wnd[0]/usr/txtDOCNUM-LOW",
-            "wnd[0]/usr/ctxtDOCNUM",         "wnd[0]/usr/txtDOCNUM",
-        ):
-            try:
-                session.FindById(fid).Text = docnum_padded
-                docnum_set = True
-                # Mirror to HIGH
-                hi = fid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
-                try: session.FindById(hi).Text = docnum_padded
-                except Exception: pass
-                break
-            except Exception:
-                pass
+    pause_result = _human_screen_pause(
+        tcode="WE05",
+        purpose="Find error IDocs — fill selection criteria then press Execute (F8)",
+        fields=we05_fields,
+        notes="Fill the fields above, then press F8 (Execute). "
+              "The IDoc list will appear. Type 'done' once the list is shown.",
+    )
+    if pause_result.get("status") != "user_completed":
+        return {"error": f"WE05 input {pause_result.get('status')} by user.",
+                "note": pause_result.get("note", "")}
 
-        # Tier 2: fragment scan
-        if not docnum_set:
-            for frag in ("S_DOCNUM-LOW", "DOCNUM-LOW", "DOCNUM"):
-                obj, oid = _find_input_field_by_fragment(frag)
-                if obj:
-                    try:
-                        obj.Text = docnum_padded
-                        docnum_set = True
-                        hi = oid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
-                        if hi != oid:
-                            try: session.FindById(hi).Text = docnum_padded
-                            except Exception: pass
-                    except Exception:
-                        pass
-                    break
-
-        # Tier 3: label-based search
-        if not docnum_set:
-            obj, _ = _find_field_by_label(
-                ["IDoc Number", "IDoc-Nummer", "IDoc Nummer", "Doc.Number"])
-            if obj:
-                try:
-                    obj.Text = docnum_padded
-                    docnum_set = True
-                except Exception:
-                    pass
-
-    session.FindById("wnd[0]").SendVKey(8)
-    time.sleep(2.5)
+    time.sleep(1.5)   # let ALV grid render
 
     idocs = []
     method_used = "none"
@@ -450,80 +609,29 @@ def scan_idoc_errors(date_from=None, date_to=None, direction="both",
                 idocs.append(row)
         method_used = "alv_grid"
 
-    # ── Strategy 2: EDIDC table fallback ─────────────────────────────────────
+    # ── Strategy 2: ask human to use SE16N if WE05 ALV was empty ────────────────
     if not idocs:
-        try:
-            go_to_transaction("SE16N")
-            time.sleep(1)
-            for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/ctxtTABLE"):
-                try: session.FindById(fid).Text = "EDIDC"; break
-                except Exception: pass
-            session.FindById("wnd[0]").SendVKey(0)
-            time.sleep(1.5)
-
-            elems = discover_elements()
-            # Set CREDAT (creation date) filter
-            for e in elems:
-                eid = e.get("id","").upper()
-                if "CREDAT" in eid and "LOW" in eid:
-                    try: session.FindById(e["id"]).Text = df_sap; break
-                    except Exception: pass
-            for e in elems:
-                eid = e.get("id","").upper()
-                if "CREDAT" in eid and "HIGH" in eid:
-                    try: session.FindById(e["id"]).Text = dt_sap; break
-                    except Exception: pass
-
-            # Set STATUS filter (first code only — SE16N single value)
-            if statuses:
-                for e in elems:
-                    eid = e.get("id","").upper()
-                    if "STATUS" in eid and "LOW" in eid:
-                        try: session.FindById(e["id"]).Text = statuses[0]; break
-                        except Exception: pass
-
-            # Set DOCNUM filter when a specific IDoc number is requested
-            if docnum_padded:
-                for e in elems:
-                    eid = e.get("id","").upper()
-                    if "DOCNUM" in eid and "LOW" in eid:
-                        try: session.FindById(e["id"]).Text = docnum_padded; break
-                        except Exception: pass
-                for e in elems:
-                    eid = e.get("id","").upper()
-                    if "DOCNUM" in eid and "HIGH" in eid:
-                        try: session.FindById(e["id"]).Text = docnum_padded; break
-                        except Exception: pass
-
-            # Max rows
-            for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
-                try: session.FindById(fid).Text = "1000"; break
-                except Exception: pass
-
-            session.FindById("wnd[0]").SendVKey(8)
-            time.sleep(2.5)
-
-            edidc_shell = _find_shell_anywhere([
-                "wnd[0]/usr/cntlGRID1/shellcont/shell",
-                "wnd[0]/usr/cntlGRID/shellcont/shell",
-            ])
-            if edidc_shell:
-                edidc_cols = ["DOCNUM","STATUS","DIRECT","MESTYP","SNDPRT",
-                              "SNDPRN","RCVPRT","RCVPRN","CREDAT","CRETIM"]
-                rows_data = _read_shell_rows(edidc_shell, edidc_cols, max_rows=1000)
-                for row in rows_data:
-                    if not row.get("DOCNUM"):
-                        continue
-                    row["status_desc"] = IDOC_STATUS.get(row.get("STATUS",""), "Unknown")
-                    # Apply direction filter
-                    if direction == "inbound"  and row.get("DIRECT","") != "1": continue
-                    if direction == "outbound" and row.get("DIRECT","") != "2": continue
-                    # Apply status filter
-                    if status_filter == "all" or row.get("STATUS","") in statuses:
-                        idocs.append(row)
-                method_used = "edidc_table"
-        except Exception:
-            pass
+        se16_fields = [
+            {"name": "Table", "value": "EDIDC"},
+            {"name": "CREDAT LOW",  "value": df_sap,         "note": "creation date from (YYYYMMDD)"},
+            {"name": "CREDAT HIGH", "value": dt_sap,         "note": "creation date to  (YYYYMMDD)"},
+            {"name": "STATUS LOW",  "value": statuses[0] if statuses else "",
+             "note": "e.g. 51"},
+        ]
+        if docnum_padded:
+            se16_fields.append({"name": "DOCNUM LOW + HIGH",
+                                 "value": docnum_padded,
+                                 "note": "paste same value in both LOW and HIGH"})
+        p2 = _human_screen_pause(
+            tcode="SE16N",
+            purpose="WE05 returned no rows — query EDIDC table directly as fallback",
+            fields=se16_fields,
+            notes="Go to SE16N, enter table EDIDC, set the filter fields above, "
+                  "set Max. Rows to 1000, then press F8. "
+                  "When results are shown type 'done'.",
+        )
+        if p2.get("status") == "user_completed":
+            method_used = "edidc_table_human"
 
     idoc_filter_note = (f" (DOCNUM filter: {idoc_number})" if idoc_number else "")
     result = {
@@ -1167,68 +1275,35 @@ def check_partner_profile(partner_number, direction="1", message_type=""):
     """
     go_to_transaction("WE20")
     time.sleep(1.5)
-    try:
-        elems = discover_elements()
 
-        # Fill the partner number field using whatever ID is on screen
-        parnr_ids = [
-            "wnd[0]/usr/ctxtWE20-PARNR",
-            "wnd[0]/usr/ctxtPARTNER_NO",
-        ]
-        filled = False
-        for fid in parnr_ids:
-            try:
-                session.FindById(fid).Text = str(partner_number)
-                filled = True
-                break
-            except Exception:
-                pass
+    # ── Human navigates to the partner in WE20 ────────────────────────────────
+    dir_label = "Inbound" if str(direction) in ("1", "inbound") else "Outbound"
+    pause_result = _human_screen_pause(
+        tcode="WE20",
+        purpose=f"Check partner profile for {partner_number} — navigate to the partner",
+        fields=[
+            {"name": "Partner Number", "value": str(partner_number),
+             "note": "type in the filter/search field or find in the left tree"},
+            {"name": "Direction to check", "value": dir_label},
+            {"name": "Message Type",       "value": message_type or "(any)"},
+        ],
+        notes="In WE20: type the partner number in the search field and press "
+              "Enter or F8, or expand the partner tree on the left and click "
+              "the partner. Once the partner detail is visible, type 'done'.",
+    )
+    if pause_result.get("status") != "user_completed":
+        return {"error": f"WE20 check {pause_result.get('status')} by user.",
+                "partner": str(partner_number)}
 
-        if not filled:
-            # Fallback: find any ctxt/txt field whose ID contains PARNR or PARTNER
-            for e in elems:
-                eid = e.get("id", "").upper()
-                if any(k in eid for k in ("PARNR", "PARTNER")) and e.get("type") in ("GuiCTextField", "GuiTextField"):
-                    try:
-                        session.FindById(e["id"]).Text = str(partner_number)
-                        filled = True
-                        break
-                    except Exception:
-                        pass
-
-        # Execute the search — try F8, then Enter, then toolbar Execute button
-        executed = False
-        for vkey in (8, 0):
-            try:
-                session.FindById("wnd[0]").SendVKey(vkey)
-                time.sleep(1.5)
-                executed = True
-                break
-            except Exception:
-                pass
-        if not executed:
-            # Try toolbar execute button
-            for btn in ("wnd[0]/tbar[1]/btn[8]", "wnd[0]/tbar[0]/btn[0]"):
-                try:
-                    session.FindById(btn).Press()
-                    time.sleep(1.5)
-                    break
-                except Exception:
-                    pass
-
-        screen = get_screen_text()
-        exists = (str(partner_number) in screen or
-                  "partner" in screen.lower())
-
-        return {
-            "partner":  str(partner_number),
-            "exists":   exists,
-            "direction": direction,
-            "screen":   screen,
-            "elements": discover_elements()[:40],
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    screen = get_screen_text()
+    exists = (str(partner_number) in screen or "partner" in screen.lower())
+    return {
+        "partner":   str(partner_number),
+        "exists":    exists,
+        "direction": direction,
+        "screen":    screen,
+        "elements":  discover_elements()[:40],
+    }
 
 
 def create_partner_profile(partner_number, partner_type, direction,
@@ -1270,7 +1345,88 @@ def create_partner_profile(partner_number, partner_type, direction,
     go_to_transaction("WE20")
     time.sleep(2)
 
-    # ── Step 1: Find S4HANA2023 (or any partner) in the WE20 tree ────────────
+    # ── Human creates the partner profile entry ────────────────────────────────
+    dir_label = "Inbound" if is_inbound else "Outbound"
+    pp_fields = [
+        {"name": "Partner Number",  "value": partner_number,
+         "note": "find or create in the left tree"},
+        {"name": "Partner Type",    "value": partner_type,
+         "note": "LS=Logical System, KU=Customer, LI=Vendor"},
+        {"name": "Direction",       "value": dir_label,
+         "note": "expand the correct section below the partner"},
+        {"name": "Message Type",    "value": message_type,
+         "note": "e.g. MATMAS"},
+        {"name": "Process Code",    "value": process_code,
+         "note": "e.g. MATM — looked up from WE64"},
+        {"name": "Basic Type",      "value": basic_type or "(leave blank = SAP default)",
+         "note": "e.g. MATMAS01"},
+    ]
+    if func_module:
+        pp_fields.append({"name": "Function Module",
+                           "value": func_module, "note": "optional"})
+
+    pause_result = _human_screen_pause(
+        tcode="WE20",
+        purpose=f"Create partner profile: {partner_number} / {message_type} / {dir_label}",
+        fields=pp_fields,
+        notes=(
+            f"In WE20:\n"
+            f"  1. Find partner '{partner_number}' in the left tree "
+            f"(or click Create to add a new partner).\n"
+            f"  2. Click the partner row to select it.\n"
+            f"  3. Click the CREATE button below the {dir_label.upper()} PARAMETERS table.\n"
+            f"  4. Enter Message Type = {message_type}\n"
+            f"  5. Enter Process Code = {process_code}\n"
+            f"  {'6. Enter Basic Type = ' + basic_type if basic_type else '6. Leave Basic Type blank (SAP default).'}\n"
+            f"  7. Press Ctrl+S to save.\n"
+            f"  Type 'done' once the entry is saved."
+        ),
+    )
+
+    screen = get_screen_text()
+    saved = pause_result.get("status") == "user_completed"
+
+    if not saved:
+        audit_log("CREATE_PARTNER_PROFILE",
+                  {"partner": partner_number, "type": partner_type,
+                   "message_type": message_type, "process_code": process_code},
+                  status=pause_result.get("status", "unknown"))
+        return {
+            "ok":           False,
+            "partner":      partner_number,
+            "direction":    "inbound" if is_inbound else "outbound",
+            "message_type": message_type,
+            "process_code": process_code,
+            "screen":       screen,
+            "note":         f"WE20 input {pause_result.get('status')} by user.",
+        }
+
+    audit_log("CREATE_PARTNER_PROFILE",
+              {"partner": partner_number, "type": partner_type,
+               "direction": "inbound" if is_inbound else "outbound",
+               "message_type": message_type, "process_code": process_code,
+               "basic_type": basic_type},
+              status="saved")
+
+    return {
+        "ok":           True,
+        "partner":      partner_number,
+        "partner_type": partner_type,
+        "direction":    "inbound" if is_inbound else "outbound",
+        "message_type": message_type,
+        "process_code": process_code,
+        "screen":       screen,
+        "note": (f"Human created {message_type}/{process_code} {dir_label.lower()} "
+                 f"entry for partner {partner_number} in WE20."),
+    }
+
+
+def _create_partner_profile_OLD_AUTOMATION_UNUSED(partner_number, partner_type,
+                                                   direction, message_type,
+                                                   process_code, basic_type="",
+                                                   func_module=""):
+    """Old fully-automated WE20 code — kept for reference, not called."""
+    is_inbound = str(direction) in ("1", "inbound", "INBOUND")
     partner_on_screen = False
     tree = _find_gui_tree_anywhere()
 
@@ -1866,87 +2022,37 @@ def _we09_navigate_to_idoc(idoc_number) -> dict:
     go_to_transaction("WE09")
     time.sleep(2)
 
-    # Clear selection screen
-    _clear_selection_screen()
-    time.sleep(0.3)
+    # ── Human fills the WE09 selection screen ─────────────────────────────────
+    pause_result = _human_screen_pause(
+        tcode="WE09",
+        purpose=f"Search for IDoc {idoc_number} — fill the DOCNUM field and execute",
+        fields=[
+            {"name": "IDoc Number LOW",  "value": docnum_padded,
+             "note": "paste into the LOW field of the DOCNUM selection"},
+            {"name": "IDoc Number HIGH", "value": docnum_padded,
+             "note": "paste same value into the HIGH field"},
+        ],
+        notes=f"Enter {docnum_padded} in both DOCNUM LOW and HIGH, then press F8 "
+              f"(Execute). If a list appears, double-click the IDoc row to open "
+              f"the IDoc detail screen. Type 'done' when the detail screen is open.",
+    )
+    if pause_result.get("status") != "user_completed":
+        return {"on_detail": False, "docnum": docnum_padded,
+                "screen": get_screen_text(), "docnum_set": False,
+                "note": f"WE09 input {pause_result.get('status')} by user."}
 
-    # Set DOCNUM field — same three-tier strategy as WE02/WE05
-    docnum_set = False
-
-    # Tier 1: ctxt + txt variants
-    for fid in (
-        "wnd[0]/usr/ctxtS_DOCNUM-LOW",   "wnd[0]/usr/txtS_DOCNUM-LOW",
-        "wnd[0]/usr/ctxtSEL_DOCNUM-LOW", "wnd[0]/usr/txtSEL_DOCNUM-LOW",
-        "wnd[0]/usr/ctxtDOCNUM-LOW",     "wnd[0]/usr/txtDOCNUM-LOW",
-        "wnd[0]/usr/ctxtDOCNUM",         "wnd[0]/usr/txtDOCNUM",
-        "wnd[0]/usr/ctxtS_DOCNUM",       "wnd[0]/usr/txtS_DOCNUM",
-    ):
-        try:
-            session.FindById(fid).Text = docnum_padded
-            docnum_set = True
-            hi = fid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
-            try: session.FindById(hi).Text = docnum_padded
-            except Exception: pass
-            break
-        except Exception:
-            pass
-
-    # Tier 2: fragment scan
-    if not docnum_set:
-        for frag in ("S_DOCNUM-LOW", "DOCNUM-LOW", "DOCNUM"):
-            obj, oid = _find_input_field_by_fragment(frag)
-            if obj:
-                try:
-                    obj.Text = docnum_padded
-                    docnum_set = True
-                    hi = oid.replace("-LOW", "-HIGH").replace("_LOW", "_HIGH")
-                    if hi != oid:
-                        try: session.FindById(hi).Text = docnum_padded
-                        except Exception: pass
-                except Exception:
-                    pass
-                break
-
-    # Tier 3: label-based search
-    if not docnum_set:
-        obj, _ = _find_field_by_label(
-            ["IDoc Number", "IDoc-Nummer", "IDoc Nummer", "Doc.Number"])
-        if obj:
-            try:
-                obj.Text = docnum_padded
-                docnum_set = True
-            except Exception:
-                pass
-
-    # Execute
-    session.FindById("wnd[0]").SendVKey(8)
-    time.sleep(3)
-
+    time.sleep(1.0)
     screen = get_screen_text()
     on_detail = ("IDoc Display:" in screen or "IDoc-Anzeige:" in screen
                  or docnum_padded.lstrip("0") in screen)
-
-    if not on_detail:
-        # List screen — enter the first row
-        for vkey in (2, 0, 13):
-            try:
-                session.FindById("wnd[0]").SendVKey(vkey)
-                time.sleep(1.5)
-                screen = get_screen_text()
-                if ("IDoc Display:" in screen or "IDoc-Anzeige:" in screen
-                        or docnum_padded.lstrip("0") in screen):
-                    on_detail = True
-                    break
-            except Exception:
-                pass
 
     return {
         "on_detail":   on_detail,
         "docnum":      docnum_padded,
         "screen":      screen,
-        "docnum_set":  docnum_set,
         "note": ("WE09: IDoc detail screen reached." if on_detail
-                 else "WE09: could not reach IDoc detail — check screen."),
+                 else "WE09: IDoc list or selection screen visible — "
+                      "double-click the IDoc row if needed."),
     }
 
 
@@ -1980,29 +2086,63 @@ def bd87_select_and_reprocess(idoc_numbers=None, message_type="",
 
     go_to_transaction("BD87")
     time.sleep(1.5)
-    try:
-        _bd87_fill_selection(df, dt, message_type, docnum_lo, docnum_hi)
-        session.FindById("wnd[0]").SendVKey(8)   # Execute
-        time.sleep(3)
 
-        selected, processed = _bd87_select_all_and_process()
+    # ── Human fills the BD87 selection screen and reprocesses ─────────────────
+    bd87_fields = [
+        {"name": "Date From",     "value": df,
+         "note": "Created on — FROM date (DD.MM.YYYY)"},
+        {"name": "Date To",       "value": dt,
+         "note": "Created on — TO date (DD.MM.YYYY)"},
+        {"name": "Message Type",  "value": message_type or "(leave blank for all)"},
+    ]
+    if docnum_lo:
+        bd87_fields.append({"name": "IDoc Number LOW",
+                             "value": docnum_lo,
+                             "note": "paste into DOCNUM FROM field"})
+        bd87_fields.append({"name": "IDoc Number HIGH",
+                             "value": docnum_hi,
+                             "note": "paste into DOCNUM TO field"})
 
-        audit_log("BD87_SELECT_REPROCESS",
-                  {"idoc_numbers": idoc_numbers, "message_type": message_type,
-                   "docnum_lo": docnum_lo, "docnum_hi": docnum_hi,
-                   "date_from": df, "date_to": dt},
-                  status="executed" if processed else "attempted")
+    pause_result = _human_screen_pause(
+        tcode="BD87",
+        purpose=(
+            f"Reprocess IDoc(s) {idoc_numbers or 'all'} — "
+            f"fill selection, execute, select errors, then reprocess"
+        ),
+        fields=bd87_fields,
+        notes=(
+            "In BD87:\n"
+            f"  1. Set Date From = {df}  and  Date To = {dt}\n"
+            + (f"  2. Set IDoc Number FROM = {docnum_lo}  and  TO = {docnum_hi}\n"
+               if docnum_lo else "")
+            + (f"  {'3' if docnum_lo else '2'}. Set Message Type = {message_type}\n"
+               if message_type else "")
+            + "  3. Press F8 (Execute) — the error IDoc tree will appear.\n"
+              "  4. In the result tree: select the IDoc(s) (check the checkbox "
+              "or use Edit→Select All).\n"
+              "  5. Click the 'Process' or 'Reprocess Selected' button.\n"
+              "  6. Wait for the status message (green = success).\n"
+              "  Type 'done' when reprocessing is complete."
+        ),
+    )
 
-        return {
-            "ok":           processed,
-            "selected_by":  selected,
-            "processed":    processed,
-            "idoc_numbers": idoc_numbers,
-            "message_type": message_type,
-            "screen":       get_screen_text(),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    screen = get_screen_text()
+    ok = pause_result.get("status") == "user_completed"
+
+    audit_log("BD87_SELECT_REPROCESS",
+              {"idoc_numbers": idoc_numbers, "message_type": message_type,
+               "docnum_lo": docnum_lo, "docnum_hi": docnum_hi,
+               "date_from": df, "date_to": dt},
+              status="human_completed" if ok else pause_result.get("status", "unknown"))
+
+    return {
+        "ok":           ok,
+        "idoc_numbers": idoc_numbers,
+        "message_type": message_type,
+        "screen":       screen,
+        "note": ("Human completed BD87 reprocessing." if ok
+                 else f"BD87 input {pause_result.get('status')} by user."),
+    }
 
 
 def bd87_reprocess_all(message_type="", date_from=None, date_to=None):
@@ -3327,11 +3467,26 @@ CANNOT RESOLVE — print this block ONLY when all of these are true:
   last step for every IDoc, regardless of outcome.
 """
 
-# ── Token / Rate-Limit Management ──────────────────────────────────────────────
+# ── Agent loop guards ──────────────────────────────────────────────────────────
+MAX_ROUNDS            = 20   # absolute ceiling — break after this many API calls
+MAX_SAME_TOOL_ROW     = 3    # if same (tool, input) seen N times in a row → force stop
+MAX_SAME_TOOL_TOTAL   = 6    # if same tool called N times total → force stop (any input)
 
-# Maximum chars stored per tool result in the messages list.
-# Full output is still printed to console; only the stored copy is capped.
-_TOOL_RESULT_CAP = 300
+# Per-tool result caps (chars stored in conversation).
+# Full output always printed to screen; these control what Claude sees next turn.
+_TOOL_RESULT_CAPS = {
+    "get_idoc_detail":          1200,   # all decision data lives here — needs room
+    "get_idoc_segments":         800,
+    "scan_idoc_errors":          600,
+    "check_partner_profile":     600,
+    "create_partner_profile":    400,
+    "bd87_select_and_reprocess": 400,
+    "bd87_reprocess_all":        400,
+    "set_idoc_resolution":       300,
+    "ask_user_question":         300,
+    "wait_for_user_input":       300,
+}
+_TOOL_RESULT_CAP_DEFAULT = 300   # all other tools
 
 # When the messages list grows past this many entries, compress older exchanges.
 # Each tool call = 2 entries (assistant + user/tool_result), so 16 = ~8 calls.
@@ -3342,11 +3497,12 @@ _MSG_KEEP_RECENT = 8
 _ASSISTANT_TEXT_CAP = 200
 
 
-def _cap_tool_result(content_str: str) -> str:
-    """Truncate a tool result string to _TOOL_RESULT_CAP chars."""
-    if len(content_str) <= _TOOL_RESULT_CAP:
+def _cap_tool_result(content_str: str, tool_name: str = "") -> str:
+    """Truncate a tool result to its per-tool cap (or the default)."""
+    cap = _TOOL_RESULT_CAPS.get(tool_name, _TOOL_RESULT_CAP_DEFAULT)
+    if len(content_str) <= cap:
         return content_str
-    return content_str[:_TOOL_RESULT_CAP] + " ...[truncated]"
+    return content_str[:cap] + f" ...[truncated — {len(content_str)-cap} chars omitted]"
 
 
 def _trim_message_content(msg: dict) -> dict:
@@ -3574,31 +3730,50 @@ def _print_tool_result(tool_name, result_json, elapsed_ms):
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
 def run_agent(user_query, api_key, messages=None):
     """
-    Run the ARTILEGENZ agent.
-
-    Pass messages=None to start a fresh conversation.
-    Pass an existing messages list to continue.
-    Returns (messages, last_text).
+    Run the ARTILEGENZ agent with loop guards:
+      - MAX_ROUNDS hard ceiling
+      - Consecutive same-tool detection (same tool+input N times in a row)
+      - Per-tool same-tool total cap
+      - Auto force-stop with CANNOT_SOLVE classification on loop detection
     """
+    import re as _re
+
     client    = anthropic.Anthropic(api_key=api_key, max_retries=0)
     last_text = ""
-    call_num  = 0      # counts tool calls for display
-    round_num = 0      # counts API round-trips
+    call_num  = 0
+    round_num = 0
+    force_stop = False
+
+    # Loop detection state
+    last_tool_sig   = None   # (tool_name, input_hash) of previous call
+    consecutive_same = 0     # how many times that same sig appeared in a row
+    tool_call_counts = {}    # tool_name → total times called this run
+    resolution_called = False
+
+    # Extract IDoc number from query for force-stop classification
+    _m = _re.search(r'\b(\d{5,16})\b', str(user_query))
+    idoc_for_stop = _m.group(1) if _m else "unknown"
 
     if messages is None:
         messages = [{"role": "user", "content": user_query}]
     else:
         messages = list(messages) + [{"role": "user", "content": user_query}]
 
-    print(f"\n[{_ts()}] ARTILEGENZ started", flush=True)
+    print(f"\n[{_ts()}] ARTILEGENZ started  (max {MAX_ROUNDS} rounds)", flush=True)
     print("─" * 68, flush=True)
 
     while True:
+        # ── Hard ceiling ──────────────────────────────────────────────────────
+        if round_num >= MAX_ROUNDS:
+            print(f"\n[{_ts()}] *** MAX ROUNDS ({MAX_ROUNDS}) reached — forcing stop ***",
+                  flush=True)
+            force_stop = True
+            break
+
         messages  = _compress_messages(messages)
         round_num += 1
 
-        # ── Show "thinking" indicator before every API call ────────────────────
-        print(f"\n[{_ts()}] Thinking (round {round_num})...", flush=True)
+        print(f"\n[{_ts()}] Thinking (round {round_num}/{MAX_ROUNDS})...", flush=True)
 
         t0       = time.time()
         response = _api_call_with_retry(
@@ -3613,7 +3788,6 @@ def run_agent(user_query, api_key, messages=None):
         print(f"[{_ts()}] Claude responded in {api_ms}ms  "
               f"(stop={response.stop_reason})", flush=True)
 
-        # ── Print any narrative text Claude produced ───────────────────────────
         for block in response.content:
             if hasattr(block, "text") and block.text.strip():
                 last_text = block.text
@@ -3629,6 +3803,37 @@ def run_agent(user_query, api_key, messages=None):
             for block in response.content:
                 if block.type != "tool_use":
                     continue
+
+                # ── Loop detection ─────────────────────────────────────────
+                tool_sig = (block.name,
+                            json.dumps(block.input, sort_keys=True)[:200])
+                tool_call_counts[block.name] = tool_call_counts.get(block.name, 0) + 1
+
+                if tool_sig == last_tool_sig:
+                    consecutive_same += 1
+                else:
+                    consecutive_same  = 0
+                    last_tool_sig     = tool_sig
+
+                if block.name == "set_idoc_resolution":
+                    resolution_called = True
+
+                loop_reason = None
+                if consecutive_same >= MAX_SAME_TOOL_ROW:
+                    loop_reason = (f"same tool '{block.name}' called "
+                                   f"{consecutive_same + 1} times in a row "
+                                   f"with identical input")
+                elif tool_call_counts.get(block.name, 0) > MAX_SAME_TOOL_TOTAL:
+                    loop_reason = (f"tool '{block.name}' called "
+                                   f"{tool_call_counts[block.name]} times total "
+                                   f"(limit {MAX_SAME_TOOL_TOTAL})")
+
+                if loop_reason:
+                    print(f"\n[{_ts()}] *** LOOP DETECTED: {loop_reason} ***",
+                          flush=True)
+                    force_stop = True
+                    # Still execute this call so Claude gets a result, then stop
+                    # (handled after the tool_results block below)
 
                 call_num += 1
                 _print_tool_header(block.name, block.input, call_num)
@@ -3646,17 +3851,43 @@ def run_agent(user_query, api_key, messages=None):
                 tool_results.append({
                     "type":        "tool_result",
                     "tool_use_id": block.id,
-                    "content":     _cap_tool_result(full_content),
+                    "content":     _cap_tool_result(full_content, block.name),
                 })
 
             messages.append({"role": "user", "content": tool_results})
+
+            if force_stop:
+                break
+
+            if resolution_called:
+                # set_idoc_resolution was called — workflow complete, one more
+                # round for Claude's closing text then exit
+                print(f"\n[{_ts()}] Resolution recorded — finishing up...", flush=True)
         else:
             break
 
-    # Append the final assistant turn
-    if response.stop_reason == "end_turn":
+    # ── Force-stop: auto-classify if no resolution was recorded ───────────────
+    if force_stop and not resolution_called:
+        tried = ", ".join(
+            f"{t}×{n}" for t, n in sorted(tool_call_counts.items())
+        )
+        set_idoc_resolution(
+            idoc_number    = idoc_for_stop,
+            classification = "CANNOT_SOLVE",
+            reason         = (f"Agent entered a loop and was force-stopped after "
+                              f"{round_num} rounds / {call_num} tool calls."),
+            what_was_done  = f"Tools called: {tried}",
+            next_steps     = ("Review the tool output above to find the stuck step. "
+                              "Check SAP screen state manually and retry."),
+        )
+
+    # Append final assistant turn if clean exit
+    if not force_stop and response.stop_reason == "end_turn":
         messages.append({"role": "assistant", "content": response.content})
-    print(f"\n[{_ts()}] Agent finished  ({call_num} tool calls, {round_num} rounds)",
+
+    print(f"\n[{_ts()}] Agent finished  "
+          f"({call_num} tool calls, {round_num} rounds"
+          f"{', FORCE STOPPED' if force_stop else ''})",
           flush=True)
     print("─" * 68, flush=True)
 
