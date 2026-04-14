@@ -811,7 +811,7 @@ def get_idoc_detail(idoc_number):
                         # Add fully-structured record to error_details
                         if "error_details" not in detail:
                             detail["error_details"] = []
-                        detail["error_details"].append({
+                        err_entry = {
                             "message_class":       msgid,
                             "message_number":      msgno,
                             "message_type":        msgty,
@@ -825,7 +825,13 @@ def get_idoc_detail(idoc_number):
                             "program":             row.get("REPID",""),
                             "date":                row.get("LOGDAT",""),
                             "time":                row.get("LOGTIM",""),
-                        })
+                        }
+                        # Resolve exact resolution guidance for this message
+                        resolution = _lookup_msg_resolution(
+                            msgid, msgno, v1, v2, v3, v4)
+                        if resolution:
+                            err_entry["resolution"] = resolution
+                        detail["error_details"].append(err_entry)
 
                 detail["edids_source"] = (
                     f"EDIDS WHERE clause: {len(matching)} rows (total {len(rows)})")
@@ -1008,6 +1014,8 @@ def get_idoc_detail(idoc_number):
             "variable_3":      primary_err.get("message_variable_3",""),
             "variable_4":      primary_err.get("message_variable_4",""),
             "program":         primary_err.get("program",""),
+            # Resolution guidance resolved from (MSGID, MSGNO)
+            "resolution":      primary_err.get("resolution", {}),
         },
         "all_errors":      detail.get("error_details", [])[:10],
     }
@@ -2439,6 +2447,590 @@ _CLASS_LABEL = {
 # Session-level list so the main loop can print a final summary table
 _session_resolutions: list = []
 
+# ── Exact resolution map keyed by (MSGID, MSGNO) ──────────────────────────────
+# Values in "description" and "steps" may contain {v1}..{v4} placeholders which
+# are substituted with the actual MSGV1..MSGV4 values at lookup time.
+#
+# classification:
+#   SOLVED_BY_AGENT      — agent can fix automatically via its tools
+#   HUMAN_THEN_AGENT     — human does config step, agent reprocesses
+#   CANNOT_SOLVE         — needs specialist team, agent cannot fix
+#
+_MSG_RESOLUTION_MAP: dict = {
+
+    # ── ED: IDoc / EDI Basis ────────────────────────────────────────────────
+    ("ED", "008"): {
+        "description":    "Partner '{v1}' (type '{v2}') not found — partner profile missing in WE20",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "WE20",
+        "team":           "Basis / EDI team",
+        "urgency":        "high",
+        "steps": [
+            "Open WE20",
+            "Expand the partner type '{v2}' node in the left tree",
+            "If partner '{v1}' is missing: click Create, enter partner number={v1} and type={v2}",
+            "Click the partner row to select it and switch to Change mode (pencil icon)",
+            "In Inbound Parameters: click Create, enter Message Type and Process Code",
+            "Save with Ctrl+S",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": ["check_partner_profile", "create_partner_profile",
+                        "bd87_select_and_reprocess"],
+    },
+    ("ED", "010"): {
+        "description":    "No inbound process code for partner '{v1}' / message type '{v2}' (code '{v3}', function '{v4}')",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "WE20 / WE64",
+        "team":           "Basis / EDI team",
+        "urgency":        "high",
+        "steps": [
+            "Open WE64 and look up process code for message type '{v2}', direction Inbound",
+            "Open WE20 and find partner '{v1}'",
+            "In Inbound Parameters: click Create",
+            "  Enter Message Type = {v2}",
+            "  Enter Process Code = (value from WE64 lookup above)",
+            "  Enter Message Code = {v3} (if not blank)",
+            "  Enter Message Function = {v4} (if not blank)",
+            "Save with Ctrl+S",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": ["check_partner_profile", "create_partner_profile",
+                        "bd87_select_and_reprocess"],
+    },
+    ("ED", "011"): {
+        "description":    "No outbound process code for partner '{v1}' / message type '{v2}' (code '{v3}', function '{v4}')",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "WE20 / WE64",
+        "team":           "Basis / EDI team",
+        "urgency":        "high",
+        "steps": [
+            "Open WE64 and look up process code for message type '{v2}', direction Outbound",
+            "Open WE20 and find partner '{v1}'",
+            "In Outbound Parameters: click Create",
+            "  Enter Message Type = {v2}",
+            "  Enter Process Code = (value from WE64 lookup above)",
+            "Save with Ctrl+S",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": ["check_partner_profile", "create_partner_profile",
+                        "bd87_select_and_reprocess"],
+    },
+    ("ED", "016"): {
+        "description":    "Error in inbound function module '{v1}' for message type '{v2}'",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "SE37 / WE64 / ST22",
+        "team":           "ABAP / EDI team",
+        "urgency":        "high",
+        "steps": [
+            "Open ST22 and find the short dump from function module '{v1}'",
+            "Note the exact error class and line number in the dump",
+            "Open SE37 and check function module '{v1}' — is it active and complete?",
+            "Open WE64 to verify the process code → FM mapping for message type '{v2}'",
+            "If FM has a bug: ABAP team needs to fix and activate it",
+            "If FM is assigned incorrectly: correct the WE64 entry",
+            "After fix: reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    ("ED", "017"): {
+        "description":    "Function module '{v1}' not found for message type '{v2}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "WE64 / SE37",
+        "team":           "ABAP / Basis team",
+        "urgency":        "high",
+        "steps": [
+            "Open WE64 and find message type '{v2}' direction Inbound",
+            "Check the process code → function module mapping",
+            "Open SE37 and verify that function module '{v1}' exists and is active",
+            "If FM is missing: ABAP team must create it, or re-point WE64 to a standard FM",
+            "After correction: reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    ("ED", "018"): {
+        "description":    "Logical system '{v1}' is not defined in this SAP system",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "SALE / BD54",
+        "team":           "Basis team",
+        "urgency":        "critical",
+        "steps": [
+            "Open SALE → Basic Settings → Logical Systems → Define Logical System (or BD54 directly)",
+            "Create logical system '{v1}'",
+            "Assign it to the correct client: SALE → Assign Logical System to Client",
+            "Review RFC destination in SM59 pointing to the sending system",
+            "Update WE20 partner profile partner number to match '{v1}'",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    ("ED", "019"): {
+        "description":    "Port '{v1}' is not defined",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "WE21",
+        "team":           "Basis / EDI team",
+        "urgency":        "high",
+        "steps": [
+            "Open WE21",
+            "Select the port type for your interface: RFC / File / TRFC / ABAP-PI",
+            "Create port named '{v1}'",
+            "  For RFC port: enter the RFC destination (SM59 destination name)",
+            "  For File port: enter the physical path and file name pattern",
+            "Save port definition",
+            "Update WE20 partner profile to reference port '{v1}'",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    ("ED", "022"): {
+        "description":    "IDoc status error: {v1} / {v2}",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "WE02 / BD87",
+        "team":           "EDI team",
+        "urgency":        "medium",
+        "steps": [
+            "Open WE02 and review status records for the IDoc",
+            "Check the status history to understand the sequence of events",
+            "Correct the root cause indicated in the status text",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": ["get_idoc_detail", "bd87_select_and_reprocess"],
+    },
+
+    # ── EI: EDI Inbound (application-level) ─────────────────────────────────
+    ("EI", "001"): {
+        "description":    "Inbound IDoc application error: {v1} {v2}",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "WE02 / BD87",
+        "team":           "EDI / Application team",
+        "urgency":        "high",
+        "steps": [
+            "Review error text: {v1} {v2}",
+            "Check partner profile completeness in WE20",
+            "Verify inbound process code and function module in WE64",
+            "Correct configuration and reprocess via BD87",
+        ],
+        "agent_tools": ["check_partner_profile", "bd87_select_and_reprocess"],
+    },
+
+    # ── BD: ALE Distribution ─────────────────────────────────────────────────
+    ("BD", "007"): {
+        "description":    "IDoc type '{v1}' not defined in this system",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "WE30 / WE31",
+        "team":           "ABAP / Basis team",
+        "urgency":        "high",
+        "steps": [
+            "Open WE30 to check whether IDoc type '{v1}' exists",
+            "If missing: import the standard SAP IDoc type from delivery (WE30 → Extras → Import)",
+            "  Or contact ABAP team to define / activate the IDoc type",
+            "Open WE31 to verify all segment types are defined",
+            "Reprocess IDoc via BD87 once type is defined",
+        ],
+        "agent_tools": [],
+    },
+    ("BD", "069"): {
+        "description":    "ALE distribution model: no receiver found for message type '{v1}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "BD64 / SALE",
+        "team":           "Basis / ALE team",
+        "urgency":        "high",
+        "steps": [
+            "Open BD64 (Distribution Model)",
+            "Add message type '{v1}' for the sending and receiving logical systems",
+            "Activate the model: BD64 → Edit → Model View → Activate",
+            "Distribute model to receivers: BD64 → Edit → Model View → Distribute",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+
+    # ── M3: MM — General ─────────────────────────────────────────────────────
+    ("M3", "800"): {
+        "description":    "Material '{v1}' does not exist in plant '{v2}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "MMSC / MM01",
+        "team":           "Material master / master data team",
+        "urgency":        "medium",
+        "steps": [
+            "Check whether material '{v1}' should be extended to plant '{v2}'",
+            "Open MMSC → enter material '{v1}' and plant '{v2}' → select required views",
+            "  Or open MM01 and create material directly for plant '{v2}'",
+            "Save and reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+
+    # ── M7: MM — Inventory Management (goods movements) ──────────────────────
+    ("M7", "021"): {
+        "description":    "Posting period {v1}/{v2} not open for company code '{v3}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "MMPV / MMRV",
+        "team":           "MM Administrator",
+        "urgency":        "high",
+        "steps": [
+            "Open MMPV (Close Material Management Periods)",
+            "Enter Company Code = {v3}, Period = {v1}, Year = {v2}",
+            "Execute to open/advance the period",
+            "Or open MMRV to allow posting to a previous period (with approval)",
+            "Reprocess IDoc via BD87 after the period is open",
+        ],
+        "agent_tools": [],
+    },
+    ("M7", "022"): {
+        "description":    "Goods movement not possible: plant '{v1}' / storage location '{v2}' error",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "OX10 / OX09",
+        "team":           "Logistics / MM master data team",
+        "urgency":        "medium",
+        "steps": [
+            "Open OX10 to verify plant '{v1}' is defined",
+            "Open OX09 to verify storage location '{v2}' exists under plant '{v1}'",
+            "If missing: create plant (SPRO → Enterprise Structure → Definition → Logistics)",
+            "  Create storage location under the plant",
+            "Reprocess IDoc via BD87 after correcting master data",
+        ],
+        "agent_tools": [],
+    },
+
+    # ── F5: FI — Document Posting ────────────────────────────────────────────
+    ("F5", "354"): {
+        "description":    "Period {v1} {v2} is not open in company code '{v3}' for account type '{v4}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "OB52",
+        "team":           "Finance controller",
+        "urgency":        "high",
+        "steps": [
+            "Open OB52 (Open and Close Posting Periods)",
+            "Find the posting period variant assigned to company code '{v3}'",
+            "For account type '{v4}': open period {v1} of fiscal year {v2}",
+            "Save",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    ("F5", "808"): {
+        "description":    "G/L account '{v1}' does not exist in company code '{v2}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "FS00",
+        "team":           "Finance team",
+        "urgency":        "medium",
+        "steps": [
+            "Open FS00",
+            "Enter G/L account = {v1}, Company Code = {v2}",
+            "Create with: account group, short + long text, balance sheet / P&L indicator",
+            "Add company code data: reconciliation account, tax category, field status group",
+            "Save",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    ("F5", "002"): {
+        "description":    "Account '{v1}' not defined in company code '{v2}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "FS00",
+        "team":           "Finance team",
+        "urgency":        "medium",
+        "steps": [
+            "Open FS00 → enter account '{v1}', company code '{v2}'",
+            "If account does not exist: create it with the correct account group",
+            "If it exists but not for this company code: extend the account (FS00 → Company Code data)",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+
+    # ── VL: SD — Deliveries ──────────────────────────────────────────────────
+    ("VL", "001"): {
+        "description":    "Delivery '{v1}' error: {v2}",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "VL02N",
+        "team":           "SD / Logistics team",
+        "urgency":        "medium",
+        "steps": [
+            "Open VL02N for delivery '{v1}'",
+            "Review error: {v2}",
+            "Correct the delivery data as indicated (quantity, material, plant, dates)",
+            "Save the delivery",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+
+    # ── ME: MM — Purchasing ──────────────────────────────────────────────────
+    ("ME", "001"): {
+        "description":    "Purchase order error: {v1} {v2}",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "ME22N",
+        "team":           "MM Purchasing team",
+        "urgency":        "medium",
+        "steps": [
+            "Open ME22N for the purchase order",
+            "Review error: {v1} {v2}",
+            "Correct purchasing data (vendor, material, quantity, price, delivery date)",
+            "Save",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+
+    # ── MM: Materials Management ─────────────────────────────────────────────
+    ("MM", "013"): {
+        "description":    "Material '{v1}' does not exist in plant '{v2}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "MMSC / MM01",
+        "team":           "Material master / master data team",
+        "urgency":        "medium",
+        "steps": [
+            "Verify whether material '{v1}' should exist for plant '{v2}'",
+            "If yes: open MMSC → enter material '{v1}', plant '{v2}' → select views → save",
+            "  Or open MM01 to create the material from scratch",
+            "If no: mark IDoc as no further processing in WE02 (right-click → Set status → 68)",
+            "Reprocess IDoc via BD87 if material was created/extended",
+        ],
+        "agent_tools": [],
+    },
+
+    # ── HR: Human Resources ──────────────────────────────────────────────────
+    ("HR", "504"): {
+        "description":    "Employee '{v1}' does not exist on date '{v2}'",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "PA30 / PA40",
+        "team":           "HR master data team",
+        "urgency":        "medium",
+        "steps": [
+            "Open PA30 for employee '{v1}' and check the hire date and employment period",
+            "Verify that IDoc date '{v2}' falls within the valid employment period",
+            "If employee is missing: open PA40 (Personnel Actions) to hire / create the employee",
+            "Reprocess IDoc via BD87 after master data is correct",
+        ],
+        "agent_tools": [],
+    },
+
+    # ── WS: Workflow ─────────────────────────────────────────────────────────
+    ("WS", "001"): {
+        "description":    "Workflow error: {v1} {v2}",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "SWI1 / SWIA",
+        "team":           "Basis / Workflow team",
+        "urgency":        "medium",
+        "steps": [
+            "Open SWI1 to find the failed workflow instance",
+            "Review the work item and error details",
+            "Open SWIA to restart or terminate the work item",
+            "Correct the underlying data and reprocess",
+        ],
+        "agent_tools": [],
+    },
+}
+
+# ── Message-class fallback (when MSGNO is not in _MSG_RESOLUTION_MAP) ──────────
+_MSG_CLASS_RESOLUTION: dict = {
+    "ED": {
+        "description":    "IDoc/EDI basis error (class ED) — check partner profile and process code",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "WE20 / WE64 / WE21",
+        "team":           "Basis / EDI team",
+        "urgency":        "high",
+        "steps": [
+            "Open WE02 and review the full status record log for the IDoc",
+            "Check partner profile in WE20 for the sending or receiving partner",
+            "Verify process code → function module mapping in WE64",
+            "Check port definition in WE21 (for outbound IDocs)",
+            "Correct the configuration and reprocess via BD87",
+        ],
+        "agent_tools": ["check_partner_profile", "bd87_select_and_reprocess"],
+    },
+    "EI": {
+        "description":    "EDI inbound processing error (class EI)",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "WE20 / WE64 / BD87",
+        "team":           "EDI / Integration team",
+        "urgency":        "high",
+        "steps": [
+            "Check inbound partner profile in WE20",
+            "Verify process code for the message type in WE64",
+            "Correct and reprocess via BD87",
+        ],
+        "agent_tools": ["check_partner_profile", "bd87_select_and_reprocess"],
+    },
+    "EO": {
+        "description":    "EDI outbound processing error (class EO)",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "WE20 / WE21 / SM59",
+        "team":           "Basis / EDI team",
+        "urgency":        "high",
+        "steps": [
+            "Check outbound partner profile in WE20",
+            "Verify port definition in WE21",
+            "Check RFC destination in SM59 is reachable",
+            "Correct and reprocess via BD87",
+        ],
+        "agent_tools": ["check_partner_profile", "bd87_select_and_reprocess"],
+    },
+    "BD": {
+        "description":    "ALE distribution layer error (class BD)",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "SALE / BD64 / SM59",
+        "team":           "Basis / ALE team",
+        "urgency":        "high",
+        "steps": [
+            "Open SALE to check the ALE distribution model",
+            "Verify logical systems (BD54) and RFC destinations (SM59)",
+            "Check distribution model receivers in BD64",
+            "Correct and reprocess via BD87",
+        ],
+        "agent_tools": [],
+    },
+    "M7": {
+        "description":    "MM inventory management error (class M7) — period / plant / movement",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "MMPV / OX10 / MMSC",
+        "team":           "MM Administrator",
+        "urgency":        "medium",
+        "steps": [
+            "Review EDIDS error for exact field values (period, plant, storage location)",
+            "Check/open posting period in MMPV",
+            "Verify plant and storage location in OX10 / OX09",
+            "Reprocess IDoc via BD87 after correction",
+        ],
+        "agent_tools": [],
+    },
+    "F5": {
+        "description":    "FI document posting error (class F5) — period / account / tax",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "OB52 / FS00 / FTXP",
+        "team":           "Finance controller",
+        "urgency":        "high",
+        "steps": [
+            "Review EDIDS error for account, period, or company code values",
+            "Open OB52 to check and open posting periods",
+            "Open FS00 to verify the G/L account exists",
+            "Reprocess IDoc via BD87 after correction",
+        ],
+        "agent_tools": [],
+    },
+    "VL": {
+        "description":    "SD / Logistics delivery error (class VL)",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "VL02N",
+        "team":           "SD / Logistics team",
+        "urgency":        "medium",
+        "steps": [
+            "Open VL02N and review the delivery document",
+            "Correct the data as indicated in the error message",
+            "Save and reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    "ME": {
+        "description":    "MM purchasing error (class ME)",
+        "classification": "HUMAN_THEN_AGENT",
+        "tcode":          "ME22N",
+        "team":           "MM Purchasing team",
+        "urgency":        "medium",
+        "steps": [
+            "Review purchase order in ME22N",
+            "Correct purchasing data as indicated",
+            "Save and reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    "MM": {
+        "description":    "Materials management error (class MM) — material / plant",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "MM01 / MMSC",
+        "team":           "Material master team",
+        "urgency":        "medium",
+        "steps": [
+            "Review error for material number and plant",
+            "Extend or create material via MMSC / MM01",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    "M3": {
+        "description":    "Material master error (class M3)",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "MM01 / MMSC",
+        "team":           "Material master team",
+        "urgency":        "medium",
+        "steps": [
+            "Review error for material and organisational levels",
+            "Create or extend material via MM01 / MMSC",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    "HR": {
+        "description":    "HR / HCM master data error (class HR)",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "PA30 / PA40",
+        "team":           "HR master data team",
+        "urgency":        "medium",
+        "steps": [
+            "Review employee master data in PA30",
+            "Check hire date and employment period match the IDoc date",
+            "Create employee if missing via PA40",
+            "Reprocess IDoc via BD87",
+        ],
+        "agent_tools": [],
+    },
+    "WS": {
+        "description":    "SAP Workflow error (class WS)",
+        "classification": "CANNOT_SOLVE",
+        "tcode":          "SWI1 / SWIA",
+        "team":           "Basis / Workflow team",
+        "urgency":        "medium",
+        "steps": [
+            "Open SWI1 to find the failed workflow instance",
+            "Review the work item and error details",
+            "Open SWIA to restart or correct the work item",
+        ],
+        "agent_tools": [],
+    },
+}
+
+
+def _lookup_msg_resolution(msgid: str, msgno: str,
+                            v1: str = "", v2: str = "",
+                            v3: str = "", v4: str = "") -> dict:
+    """
+    Return a resolution guidance dict for a structured SAP error message.
+
+    Lookup order:
+      1. Exact (MSGID, MSGNO) match in _MSG_RESOLUTION_MAP  (most specific)
+      2. Message-class (MSGID only) match in _MSG_CLASS_RESOLUTION (fallback)
+      3. Empty dict if nothing found
+
+    Placeholders {v1}..{v4} in 'description' and 'steps' are substituted
+    with the actual MSGV1..MSGV4 values before returning.
+    """
+    def _sub(text: str) -> str:
+        return (text.replace("{v1}", v1 or "—")
+                    .replace("{v2}", v2 or "—")
+                    .replace("{v3}", v3 or "—")
+                    .replace("{v4}", v4 or "—"))
+
+    mid = (msgid or "").upper().strip()
+    mno = (msgno or "").strip().zfill(3)
+
+    rec = (
+        _MSG_RESOLUTION_MAP.get((mid, mno)) or
+        _MSG_RESOLUTION_MAP.get((mid, msgno.strip())) or   # unpadded fallback
+        _MSG_CLASS_RESOLUTION.get(mid)
+    )
+    if not rec:
+        return {}
+
+    result = dict(rec)   # shallow copy — do NOT mutate the map
+    result["description"] = _sub(result.get("description", ""))
+    result["steps"]       = [_sub(s) for s in result.get("steps", [])]
+    result["msgid"]       = mid
+    result["msgno"]       = mno
+    result["variables"]   = {"v1": v1, "v2": v2, "v3": v3, "v4": v4}
+    return result
+
+
 # ── Next-steps guidance keyed by IDoc error type ───────────────────────────────
 # Each entry: patterns (substrings to match in error text, case-insensitive),
 # title, tcode, team, urgency, steps (list of strings).
@@ -2687,11 +3279,38 @@ _CANNOT_SOLVE_GUIDANCE = [
 ]
 
 
-def _lookup_guidance(reason: str, what_was_done: str = "") -> dict | None:
+def _lookup_guidance(reason: str, what_was_done: str = "",
+                     msgid: str = "", msgno: str = "",
+                     v1: str = "", v2: str = "",
+                     v3: str = "", v4: str = "") -> dict | None:
     """
-    Match the reason/error text against _CANNOT_SOLVE_GUIDANCE patterns.
-    Returns the first matching guidance entry, or None if no match.
+    Return resolution guidance for an IDoc error.
+
+    Priority:
+      1. Exact (MSGID, MSGNO) lookup in _MSG_RESOLUTION_MAP   ← most precise
+      2. Message-class (MSGID) lookup in _MSG_CLASS_RESOLUTION
+      3. Keyword pattern matching against _CANNOT_SOLVE_GUIDANCE ← legacy fallback
+
+    Returns a dict with at minimum: title/description, tcode, team, urgency, steps.
+    Returns None if nothing matches.
     """
+    # ── 1+2: structured message-code lookup ───────────────────────────────────
+    if msgid or msgno:
+        rec = _lookup_msg_resolution(msgid, msgno, v1, v2, v3, v4)
+        if rec:
+            return {
+                "title":          rec.get("description", ""),
+                "tcode":          rec.get("tcode", ""),
+                "team":           rec.get("team", ""),
+                "urgency":        rec.get("urgency", ""),
+                "steps":          rec.get("steps", []),
+                "classification": rec.get("classification", ""),
+                "agent_tools":    rec.get("agent_tools", []),
+                "source":         f"MSG_RESOLUTION_MAP ({msgid}/{msgno})",
+                "variables":      rec.get("variables", {}),
+            }
+
+    # ── 3: keyword fallback ────────────────────────────────────────────────────
     text = (reason + " " + what_was_done).lower()
     for entry in _CANNOT_SOLVE_GUIDANCE:
         for pat in entry["patterns"]:
@@ -2707,20 +3326,29 @@ def _lookup_guidance(reason: str, what_was_done: str = "") -> dict | None:
 
 def set_idoc_resolution(idoc_number: str, classification: str,
                          reason: str, what_was_done: str = "",
-                         next_steps: str = "") -> dict:
+                         next_steps: str = "",
+                         msgid: str = "", msgno: str = "",
+                         msgv1: str = "", msgv2: str = "",
+                         msgv3: str = "", msgv4: str = "") -> dict:
     """
     Record and display the final classification for an IDoc processing attempt.
 
-    For CANNOT_SOLVE, automatically appends structured next-step guidance
-    based on the error type, even if next_steps is not provided by the agent.
+    For CANNOT_SOLVE / HUMAN_THEN_AGENT, automatically appends structured
+    next-step guidance resolved from (MSGID, MSGNO) if provided, else by
+    keyword-matching the reason text against _CANNOT_SOLVE_GUIDANCE.
+
+    msgid / msgno / msgv1-4 — pass the values from get_idoc_detail so the
+    exact resolution map entry is used instead of fuzzy keyword matching.
     """
     label = _CLASS_LABEL.get(classification, classification)
     w = 66
 
-    # For CANNOT_SOLVE, look up structured guidance automatically
+    # Look up structured guidance for all non-SOLVED classifications
     guidance = None
-    if classification == "CANNOT_SOLVE":
-        guidance = _lookup_guidance(reason, what_was_done)
+    if classification in ("CANNOT_SOLVE", "HUMAN_THEN_AGENT"):
+        guidance = _lookup_guidance(reason, what_was_done,
+                                    msgid=msgid, msgno=msgno,
+                                    v1=msgv1, v2=msgv2, v3=msgv3, v4=msgv4)
 
     print(f"\n{'╔' + '═'*w + '╗'}", flush=True)
     print(f"║  IDoc {idoc_number}  —  {label:<{w - len(idoc_number) - 8}}║",
@@ -2741,14 +3369,25 @@ def set_idoc_resolution(idoc_number: str, classification: str,
     if next_steps:
         _row("Next steps", next_steps)
 
-    # ── Structured guidance block (CANNOT_SOLVE only) ─────────────────────────
+    # ── Structured guidance block ─────────────────────────────────────────────
     if guidance:
+        title = guidance.get("title") or guidance.get("description") or ""
+        source = guidance.get("source", "keyword match")
         print(f"{'╠' + '═'*w + '╣'}", flush=True)
-        print(f"║  SUGGESTED NEXT STEPS — {guidance['title']:<{w-26}}║", flush=True)
+        print(f"║  RESOLUTION GUIDANCE  [{source}]{'':>{w-32-len(source)}}║", flush=True)
+        if title:
+            _row("Issue", title)
+        if msgid or msgno:
+            _row("Msg Class", msgid)
+            _row("Msg Number", msgno)
+            if msgv1: _row("Variable 1", msgv1)
+            if msgv2: _row("Variable 2", msgv2)
+            if msgv3: _row("Variable 3", msgv3)
+            if msgv4: _row("Variable 4", msgv4)
         print(f"{'╠' + '─'*w + '╣'}", flush=True)
-        _row("Tcode",   guidance["tcode"])
-        _row("Team",    guidance["team"])
-        _row("Urgency", guidance["urgency"])
+        _row("Tcode",   guidance.get("tcode",""))
+        _row("Team",    guidance.get("team",""))
+        _row("Urgency", guidance.get("urgency",""))
         print(f"║  {'Steps':<14}:{'':>{w-16}}║", flush=True)
         for i, step in enumerate(guidance["steps"], 1):
             # Wrap long steps
@@ -3303,6 +3942,37 @@ TOOLS = [
                         "Leave blank for SOLVED_BY_AGENT and HUMAN_THEN_AGENT."
                     ),
                 },
+                "msgid": {
+                    "type": "string",
+                    "description": (
+                        "SAP message class from EDIDS (e.g. 'ED', 'M7', 'F5'). "
+                        "Copy from get_idoc_detail summary.root_cause.message_class. "
+                        "Enables exact resolution lookup — always pass if available."
+                    ),
+                },
+                "msgno": {
+                    "type": "string",
+                    "description": (
+                        "SAP message number from EDIDS (e.g. '008', '010', '354'). "
+                        "Copy from get_idoc_detail summary.root_cause.message_number."
+                    ),
+                },
+                "msgv1": {
+                    "type": "string",
+                    "description": "Message variable 1 (MSGV1) — e.g. partner number. Copy from root_cause.variable_1.",
+                },
+                "msgv2": {
+                    "type": "string",
+                    "description": "Message variable 2 (MSGV2) — e.g. partner type. Copy from root_cause.variable_2.",
+                },
+                "msgv3": {
+                    "type": "string",
+                    "description": "Message variable 3 (MSGV3). Copy from root_cause.variable_3.",
+                },
+                "msgv4": {
+                    "type": "string",
+                    "description": "Message variable 4 (MSGV4). Copy from root_cause.variable_4.",
+                },
             },
             "required": ["idoc_number", "classification", "reason"],
         },
@@ -3429,6 +4099,12 @@ def dispatch(tool_name, tool_input):
             tool_input["reason"],
             tool_input.get("what_was_done", ""),
             tool_input.get("next_steps", ""),
+            tool_input.get("msgid", ""),
+            tool_input.get("msgno", ""),
+            tool_input.get("msgv1", ""),
+            tool_input.get("msgv2", ""),
+            tool_input.get("msgv3", ""),
+            tool_input.get("msgv4", ""),
         )
 
     return {"error": f"Unknown tool: {tool_name}"}
