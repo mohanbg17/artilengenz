@@ -1797,6 +1797,64 @@ def wait_for_user_input(screen_name, instructions, fields=None):
                   "'abort' to stop.")
 
 
+def ask_user_question(question: str, context: str, options: list = None) -> dict:
+    """
+    Ask the user an interactive question when the agent is stuck and needs
+    information it cannot look up in SAP automatically.
+
+    Prints a clear question block with context and waits for typed input.
+    Returns the user's answer to the agent so it can continue.
+    """
+    print("\n" + "╔" + "═" * 66 + "╗", flush=True)
+    print("║  AGENT QUESTION — input required to continue" + " " * 20 + "║", flush=True)
+    print("╠" + "═" * 66 + "╣", flush=True)
+    print(f"║  Why   : {context[:63]:<63}║", flush=True)
+    if len(context) > 63:
+        # Wrap long context
+        remaining = context[63:]
+        while remaining:
+            chunk = remaining[:63]
+            print(f"║          {chunk:<63}║", flush=True)
+            remaining = remaining[63:]
+    print("║" + "─" * 66 + "║", flush=True)
+    print(f"║  Q     : {question[:63]:<63}║", flush=True)
+    if len(question) > 63:
+        remaining = question[63:]
+        while remaining:
+            chunk = remaining[:63]
+            print(f"║          {chunk:<63}║", flush=True)
+            remaining = remaining[63:]
+    if options:
+        print("║" + "─" * 66 + "║", flush=True)
+        print(f"║  Options:", flush=True)
+        for i, opt in enumerate(options, 1):
+            print(f"║    {i}. {opt[:60]:<60}║", flush=True)
+    print("╚" + "═" * 66 + "╝", flush=True)
+
+    while True:
+        try:
+            answer = input("  Your answer: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+            print("\n  [No answer given — agent will try to proceed without it]",
+                  flush=True)
+            break
+        if answer:
+            break
+        print("  Please type an answer (or press Enter to skip).", flush=True)
+        try:
+            answer = input("  Your answer (Enter to skip): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        break
+
+    print(f"  [Answer recorded: {answer[:80]}]", flush=True)
+    audit_log("ASK_USER_QUESTION",
+              {"question": question, "context": context, "answer": answer},
+              status="answered", approved_by=CURRENT_USER)
+    return {"answer": answer, "question": question, "context": context}
+
+
 # ── Tool Definitions for Claude ────────────────────────────────────────────────
 TOOLS = [
     # ── READ ────────────────────────────────────────────────────────────────────
@@ -2205,6 +2263,59 @@ TOOLS = [
             "required": ["screen_name", "instructions"],
         },
     },
+
+    # ── INTERACTIVE Q&A ───────────────────────────────────────────────────────
+    {
+        "name": "ask_user_question",
+        "description": (
+            "Ask the user an interactive question when the agent CANNOT proceed "
+            "automatically and needs information or a decision from the user. "
+            "Use this tool (NOT wait_for_user_input) for:\n"
+            "  • The root cause requires business context only the user knows "
+            "(e.g. 'Should this material be created or was it deleted deliberately?')\n"
+            "  • Multiple fix paths exist and only the user can choose "
+            "(e.g. 'Company code 1000 is missing — create it or use 2000?')\n"
+            "  • An error message is ambiguous and the user must clarify intent\n"
+            "  • A posting period is closed and user must decide whether to open it\n"
+            "  • Master data (material/customer/vendor) does not exist and user "
+            "must confirm whether to create it\n"
+            "ALWAYS fill 'context' with: what error you found, what you already tried, "
+            "and exactly what information you need. Never ask vague questions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "The specific question for the user. Be precise. "
+                        "Example: 'Material TG-100 does not exist in MM03. "
+                        "Should I create it (yes/no) or is this IDoc invalid?'"
+                    ),
+                },
+                "context": {
+                    "type": "string",
+                    "description": (
+                        "Why the agent is stuck. Include: the IDoc error text, "
+                        "what fix was attempted, and why it failed or is ambiguous. "
+                        "Example: 'IDoc 198025 error: Material TG-100 not found. "
+                        "Checked MM03 — material does not exist in plant 1000.'"
+                    ),
+                },
+                "options": {
+                    "type": "array",
+                    "description": (
+                        "Optional list of choices the user can pick from. "
+                        "Example: ['Yes, create the material', "
+                        "'No, this IDoc is invalid — mark for deletion', "
+                        "'Use substitute material TG-200 instead']"
+                    ),
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["question", "context"],
+        },
+    },
 ]
 
 # ── IRREVERSIBLE operations — the ONLY ones that still confirm ────────────────
@@ -2311,6 +2422,14 @@ def dispatch(tool_name, tool_input):
             tool_input.get("fields"),
         )
 
+    # ── Interactive Q&A ────────────────────────────────────────────────────────
+    if tool_name == "ask_user_question":
+        return ask_user_question(
+            tool_input["question"],
+            tool_input["context"],
+            tool_input.get("options"),
+        )
+
     return {"error": f"Unknown tool: {tool_name}"}
 
 # ── System Prompt ──────────────────────────────────────────────────────────────
@@ -2399,6 +2518,52 @@ Status codes: 53=Posted OK  51=Not posted  56=With errors
               26=Syntax err  64=Ready  68=No further processing
 
 ═══════════════════════════════════════════════════════════
+ WHEN STUCK — ASK THE USER, NEVER SILENTLY GIVE UP
+═══════════════════════════════════════════════════════════
+You have full SAP_ALL authorization. Most errors CAN be fixed.
+But some require a business decision only the user can make.
+
+RULE: Before giving up on any IDoc, you MUST either:
+  a) Ask the user a specific question using ask_user_question, OR
+  b) Print a CANNOT RESOLVE block (see below) with full explanation.
+  NEVER just stop without one of these two actions.
+
+USE ask_user_question when:
+  • Error text is ambiguous — you do not know which fix to apply
+    Example: "Segment E1MARAM missing" — ask "Should I edit the segment
+    data or mark IDoc for deletion?"
+  • Master data missing — material/customer/vendor does not exist
+    Ask: "Material X does not exist. Create it or reject this IDoc?"
+  • Multiple valid fix paths — user must choose
+    Ask: "Company code 1000 missing. Create it, or change IDoc to use 2000?"
+  • Posting period closed — user must decide whether to open it
+    Ask: "Fiscal period 03/2025 is closed. Shall I open it via OB52?"
+  • Fix requires a value you cannot determine from SAP
+    Ask the specific question with the context of what you found.
+
+After ask_user_question returns the user's answer, continue
+the fix using that answer. Do not give up after asking.
+
+USE wait_for_user_input when:
+  • SAP GUI screen cannot be automated (field IDs not found after 2 tries)
+  • User must click a button or navigate SAP manually
+
+CANNOT RESOLVE — print this block ONLY when all of these are true:
+  1. You have tried at least 2 different approaches
+  2. You have asked the user and their answer still does not enable a fix
+  3. The fix is genuinely outside the agent's capability
+     (e.g. user confirmed the material should NOT be created)
+
+  ┌─────────────────────────────────────────────────────┐
+  │ CANNOT RESOLVE — IDoc <number>
+  │ Error     : <exact error text from SAP>
+  │ Tried     : <list what was attempted, one line each>
+  │ Blocked by: <exact reason — be specific>
+  │ Action    : <what the user must do manually>
+  │ Tcode     : <which SAP transaction the user should go to>
+  └─────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════
  RULES
 ═══════════════════════════════════════════════════════════
 • Execute fixes immediately — no approval, no confirmation.
@@ -2409,6 +2574,8 @@ Status codes: 53=Posted OK  51=Not posted  56=With errors
 • Use high-level tools first; fall back to manual navigation only
   when no dedicated tool exists.
 • Keep all output SHORT — one line per action, one line per result.
+• NEVER end without either: fixing the IDoc, asking the user a
+  specific question, or printing the CANNOT RESOLVE block.
 """
 
 # ── Token / Rate-Limit Management ──────────────────────────────────────────────
@@ -2613,6 +2780,7 @@ _TOOL_LABELS = {
     "handle_transport_request": "Handling transport request popup",
     "read_screen":              "Reading current SAP screen",
     "wait_for_user_input":      "Waiting for manual user input in SAP",
+    "ask_user_question":        "Agent is asking you a question — input required",
 }
 
 def _ts():
