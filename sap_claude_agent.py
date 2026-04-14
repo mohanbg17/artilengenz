@@ -22,6 +22,7 @@ import anthropic
 import time
 import json
 import os
+import sys
 import getpass
 from datetime import datetime
 
@@ -2589,30 +2590,99 @@ def _api_call_with_retry(client, model, max_tokens, system, tools, messages,
             raise
 
 
+# ── Progress display helpers ────────────────────────────────────────────────────
+
+# Human-readable label for each tool call shown on screen
+_TOOL_LABELS = {
+    "get_idoc_detail":          "Analysing IDoc — reading WE02 detail & error messages",
+    "get_idoc_segments":        "Reading IDoc segments",
+    "view_idoc_in_we09":        "Opening IDoc in WE09",
+    "scan_idoc_errors":         "Scanning IDoc errors in WE05",
+    "check_partner_profile":    "Checking partner profile in WE20",
+    "create_partner_profile":   "Creating / updating partner profile in WE20",
+    "reprocess_idoc":           "Reprocessing IDoc via WE19",
+    "edit_idoc_field":          "Editing IDoc segment field",
+    "bd87_select_and_reprocess":"Reprocessing via BD87 — select & execute",
+    "bd87_reprocess_all":       "Reprocessing all matching IDocs via BD87",
+    "go_to_transaction":        "Navigating to SAP transaction",
+    "discover_screen_elements": "Reading SAP screen elements",
+    "set_field_value":          "Setting field value on SAP screen",
+    "press_button":             "Pressing button on SAP screen",
+    "send_vkey":                "Sending keyboard shortcut to SAP",
+    "handle_popup":             "Handling SAP popup dialog",
+    "handle_transport_request": "Handling transport request popup",
+    "read_screen":              "Reading current SAP screen",
+    "wait_for_user_input":      "Waiting for manual user input in SAP",
+}
+
+def _ts():
+    """Return current time as HH:MM:SS string."""
+    return datetime.now().strftime("%H:%M:%S")
+
+def _print_tool_header(tool_name, tool_input, call_num):
+    """Print a clear, readable header line before each tool call."""
+    label = _TOOL_LABELS.get(tool_name, f"Calling {tool_name}")
+    # Summarise the key input in one short string
+    hint = ""
+    if "idoc_number" in tool_input:
+        hint = f"  IDoc={tool_input['idoc_number']}"
+    elif "idoc_numbers" in tool_input:
+        nums = tool_input["idoc_numbers"]
+        hint = f"  IDocs={nums}"
+    elif "tcode" in tool_input:
+        hint = f"  tcode={tool_input['tcode']}"
+    elif "element_id" in tool_input:
+        hint = f"  field={tool_input['element_id']}  value={tool_input.get('value','')}"
+    elif "partner_number" in tool_input:
+        hint = f"  partner={tool_input['partner_number']}  msg={tool_input.get('message_type','')}"
+
+    print(f"\n[{_ts()}] #{call_num:02d}  {label}{hint}", flush=True)
+    print(f"         Tool   : {tool_name}", flush=True)
+    inp_preview = json.dumps(tool_input)
+    if len(inp_preview) > 120:
+        inp_preview = inp_preview[:120] + "..."
+    print(f"         Input  : {inp_preview}", flush=True)
+
+def _print_tool_result(tool_name, result_json, elapsed_ms):
+    """Print the tool result in a readable way."""
+    # Show up to 1200 chars on screen (stored copy is still capped at 300)
+    preview = result_json[:1200]
+    if len(result_json) > 1200:
+        preview += f"  ...[+{len(result_json)-1200} chars]"
+    print(f"         Result : {preview}", flush=True)
+    print(f"         Time   : {elapsed_ms}ms", flush=True)
+
+
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
 def run_agent(user_query, api_key, messages=None):
     """
     Run the ARTILEGENZ agent.
 
     Pass messages=None to start a fresh conversation.
-    Pass an existing messages list to continue (e.g. after user approves [A/R]).
-    Returns (messages, last_text) so the caller can resume the conversation.
+    Pass an existing messages list to continue.
+    Returns (messages, last_text).
     """
-    # max_retries=0 disables the Anthropic SDK's own retry logic so our
-    # _api_call_with_retry handler controls all retry/backoff behaviour.
     client    = anthropic.Anthropic(api_key=api_key, max_retries=0)
     last_text = ""
+    call_num  = 0      # counts tool calls for display
+    round_num = 0      # counts API round-trips
 
     if messages is None:
         messages = [{"role": "user", "content": user_query}]
     else:
         messages = list(messages) + [{"role": "user", "content": user_query}]
 
-    print("\nARTILEGENZ agent running...\n")
+    print(f"\n[{_ts()}] ARTILEGENZ started", flush=True)
+    print("─" * 68, flush=True)
 
     while True:
-        messages = _compress_messages(messages)
+        messages  = _compress_messages(messages)
+        round_num += 1
 
+        # ── Show "thinking" indicator before every API call ────────────────────
+        print(f"\n[{_ts()}] Thinking (round {round_num})...", flush=True)
+
+        t0       = time.time()
         response = _api_call_with_retry(
             client,
             model      = "claude-opus-4-6",
@@ -2621,12 +2691,15 @@ def run_agent(user_query, api_key, messages=None):
             tools      = TOOLS,
             messages   = messages,
         )
+        api_ms = int((time.time() - t0) * 1000)
+        print(f"[{_ts()}] Claude responded in {api_ms}ms  "
+              f"(stop={response.stop_reason})", flush=True)
 
-        # Show narrative text and capture last assistant text for continuity detection
+        # ── Print any narrative text Claude produced ───────────────────────────
         for block in response.content:
             if hasattr(block, "text") and block.text.strip():
                 last_text = block.text
-                print(f"\n[Claude]\n{block.text}")
+                print(f"\n[{_ts()}] [Agent]\n{block.text}", flush=True)
 
         if response.stop_reason == "end_turn":
             break
@@ -2639,22 +2712,22 @@ def run_agent(user_query, api_key, messages=None):
                 if block.type != "tool_use":
                     continue
 
-                print(f"\n>> Tool : {block.name}")
-                print(f"   Input: {json.dumps(block.input)[:200]}")
+                call_num += 1
+                _print_tool_header(block.name, block.input, call_num)
 
+                t1 = time.time()
                 try:
                     result = dispatch(block.name, block.input)
                 except Exception as exc:
                     result = {"error": str(exc)}
+                elapsed = int((time.time() - t1) * 1000)
 
                 full_content = json.dumps(result, ensure_ascii=False)
-                # Print more to console than we store in the thread
-                print(f"   Out  : {full_content[:400]}")
+                _print_tool_result(block.name, full_content, elapsed)
 
                 tool_results.append({
                     "type":        "tool_result",
                     "tool_use_id": block.id,
-                    # Cap stored content to keep tokens under control
                     "content":     _cap_tool_result(full_content),
                 })
 
@@ -2662,9 +2735,12 @@ def run_agent(user_query, api_key, messages=None):
         else:
             break
 
-    # Append the final assistant turn to messages so the caller has full context
+    # Append the final assistant turn
     if response.stop_reason == "end_turn":
         messages.append({"role": "assistant", "content": response.content})
+    print(f"\n[{_ts()}] Agent finished  ({call_num} tool calls, {round_num} rounds)",
+          flush=True)
+    print("─" * 68, flush=True)
 
     # ── Save session report ────────────────────────────────────────────────────
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2824,5 +2900,10 @@ if __name__ == "__main__":
             f"(4) get_idoc_detail(\"{idoc_number}\") and print final status."
         )
 
-        print(f"\n  Processing IDoc {idoc_number}...")
+        print(f"\n{'═'*68}", flush=True)
+        print(f"  IDoc {idoc_number}  —  started at {datetime.now().strftime('%H:%M:%S')}", flush=True)
+        print(f"{'═'*68}", flush=True)
         run_agent(query, API_KEY)
+        print(f"\n{'═'*68}", flush=True)
+        print(f"  IDoc {idoc_number}  —  completed at {datetime.now().strftime('%H:%M:%S')}", flush=True)
+        print(f"{'═'*68}\n", flush=True)
