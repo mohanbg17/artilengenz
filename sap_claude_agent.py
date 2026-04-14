@@ -3603,7 +3603,7 @@ def run_agent(user_query, api_key, messages=None):
         t0       = time.time()
         response = _api_call_with_retry(
             client,
-            model      = "claude-opus-4-6",
+            model      = "claude-haiku-4-5-20251001",
             max_tokens = 8192,
             system     = SYSTEM_PROMPT,
             tools      = TOOLS,
