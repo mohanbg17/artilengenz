@@ -804,15 +804,32 @@ def get_idoc_detail(idoc_number):
         detail["fix_hints"] = [{"note": "No known IDOC_FIX_MAP pattern matched. "
                                          "Review status_records / error_messages."}]
 
+    # ── Look up the correct process code from WE64/EDIFCT ────────────────────
+    msg_type  = _ctrl.get("MESTYP", "")
+    direction = _ctrl.get("DIRECT", "1")
+    if msg_type:
+        procod = _we64_lookup_process_code(msg_type, direction)
+        detail["process_code"] = procod
+        detail["process_code_source"] = (
+            "WE64/EDIFCT" if procod not in _PROCESS_CODE_MAP.values()
+                             and procod != msg_type.upper()[:8]
+            else ("hardcoded_map" if _PROCESS_CODE_MAP.get(msg_type.upper()) == procod
+                  else "fallback")
+        )
+    else:
+        detail["process_code"] = ""
+        detail["process_code_source"] = "unknown"
+
     # Summary for easy reading
     detail["summary"] = {
         "idoc":          str(idoc_number),
         "status":        _ctrl.get("STATUS","?"),
         "status_desc":   detail.get("status_desc",""),
-        "message_type":  _ctrl.get("MESTYP",""),
+        "message_type":  msg_type,
         "partner":       _ctrl.get("SNDPRN",""),
         "partner_type":  _ctrl.get("SNDPRT",""),
-        "direction":     _ctrl.get("DIRECT",""),
+        "direction":     direction,
+        "process_code":  detail.get("process_code",""),
         "error_count":   len(detail["error_messages"]),
         "errors":        detail["error_messages"][:5],
     }
@@ -985,6 +1002,163 @@ def edit_idoc_field(idoc_number, segment_name, field_name, new_value):
             "new_value": new_value, "screen": get_screen_text()}
 
 
+# ── WE64 / EDIFCT process-code lookup ─────────────────────────────────────────
+
+# Hardcoded fallback map — used only when WE64 lookup fails or returns nothing.
+_PROCESS_CODE_MAP = {
+    "MATMAS":  "MATM",  "MATMAS01": "MATM",
+    "ORDERS":  "ORDE",  "ORDERS05": "ORDE",
+    "INVOIC":  "INVL",  "INVOIC01": "INVL",
+    "DEBMAS":  "DEBM",  "DEBMAS06": "DEBM",
+    "CREMAS":  "CREM",  "CREMAS05": "CREM",
+    "DESADV":  "DELS",  "DELVRY":   "DELS",
+    "PORDCR":  "PORD",  "PORDCH":   "PORD",
+    "SHPORD":  "SHPORD","WMMBID":   "WMMBID",
+    "HRMD_A":  "HRMD",  "PEXR2":    "PEXR",
+}
+
+# Cache to avoid re-querying WE64 for the same message type in one run
+_we64_cache: dict = {}
+
+
+def _we64_lookup_process_code(message_type: str, direction: str = "1") -> str:
+    """
+    Look up the inbound (direction=1) or outbound (direction=2) process code
+    for a given message type by querying SAP table EDIFCT via SE16N.
+
+    Falls back to _PROCESS_CODE_MAP, then to message_type.upper() if nothing found.
+
+    EDIFCT key fields:
+      DIRECT  — direction (1=inbound, 2=outbound)
+      MESTYP  — message type (e.g. MATMAS)
+      MESCOD  — message code  (usually blank)
+      MESFCT  — message function (usually blank)
+      PROCOD  — process code (what we want)
+    """
+    cache_key = f"{message_type}:{direction}"
+    if cache_key in _we64_cache:
+        return _we64_cache[cache_key]
+
+    procod = ""
+
+    try:
+        go_to_transaction("SE16N")
+        time.sleep(1.5)
+
+        # Enter table name
+        for fid in ("wnd[0]/usr/ctxtGD-TAB", "wnd[0]/usr/txtGD-TAB",
+                    "wnd[0]/usr/ctxtDATABROWSE-TABLENAME"):
+            try:
+                session.FindById(fid).Text = "EDIFCT"
+                session.FindById("wnd[0]").SendVKey(0)   # Enter
+                time.sleep(1.5)
+                break
+            except Exception:
+                pass
+
+        # Set DIRECT filter
+        _set_se16n_filter("DIRECT", str(direction))
+        # Set MESTYP filter
+        _set_se16n_filter("MESTYP", message_type.upper())
+        # Set max hits to 10 (we only need the first match)
+        for fid in ("wnd[0]/usr/txtGD-MAX_LINES",):
+            try:
+                session.FindById(fid).Text = "10"
+            except Exception:
+                pass
+
+        # Execute (F8)
+        session.FindById("wnd[0]").SendVKey(8)
+        time.sleep(2)
+
+        # Read the result grid — look for PROCOD column value
+        procod = _se16n_read_column("PROCOD")
+
+    except Exception:
+        pass
+
+    # Fallback chain
+    if not procod:
+        procod = _PROCESS_CODE_MAP.get(message_type.upper(), "")
+    if not procod:
+        # Use message type itself as last resort (SAP convention for many types)
+        procod = message_type.upper()[:8]
+
+    _we64_cache[cache_key] = procod
+    return procod
+
+
+def _set_se16n_filter(field_name: str, value: str):
+    """
+    In an open SE16N selection screen, find the filter row for field_name
+    and set its Low value.  Tries known ID patterns first, then walks the tree.
+    """
+    # SE16N filter rows have IDs like: wnd[0]/usr/tblSAPLSE16NSELFIELDS_TC/ctxtSELFIELDS-LOW[X,Y]
+    # but the position varies. Use fragment search.
+    obj, _ = _find_input_field_by_fragment(field_name)
+    if obj:
+        try:
+            obj.Text = value
+            return
+        except Exception:
+            pass
+
+    # If not found on screen, try typing the field name into the search/position field
+    for fid in ("wnd[0]/usr/txtGD-FNAM",):
+        try:
+            session.FindById(fid).Text = field_name
+            session.FindById("wnd[0]").SendVKey(0)
+            time.sleep(0.5)
+            # Now try the Low field again
+            obj2, _ = _find_input_field_by_fragment("LOW")
+            if obj2:
+                obj2.Text = value
+            return
+        except Exception:
+            pass
+
+
+def _se16n_read_column(column_name: str) -> str:
+    """
+    After SE16N executes and shows a result grid (GuiShell/GuiGridView),
+    read the first row value of the named column.
+    """
+    try:
+        # Try GuiGridView (ALV grid)
+        grid = session.FindById("wnd[0]/usr/cntlRESULT_LIST/shellcont/shell", False)
+        if not grid:
+            grid = session.FindById("wnd[0]/usr/cntlGRID1/shellcont/shell", False)
+        if grid:
+            # Get column index
+            col_count = grid.ColumnCount
+            for ci in range(col_count):
+                try:
+                    col_key = grid.GetColumnKey(ci)
+                    if column_name.upper() in col_key.upper():
+                        val = grid.GetCellValue(0, col_key)
+                        return (val or "").strip()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Fallback: read screen text and parse
+    try:
+        texts = _screen_texts()
+        found_col = False
+        for t in texts:
+            t = t.strip()
+            if column_name.upper() in t.upper():
+                found_col = True
+                continue
+            if found_col and t and not t.startswith("-"):
+                return t.strip()
+    except Exception:
+        pass
+
+    return ""
+
+
 def check_partner_profile(partner_number, direction="1", message_type=""):
     """
     Check WE20 partner profile for a specific partner.
@@ -1071,10 +1245,27 @@ def create_partner_profile(partner_number, partner_type, direction,
 
     partner_type : LS=Logical system, KU=Customer, LI=Vendor
     direction    : '1' or 'inbound'  /  '2' or 'outbound'
-    process_code : e.g. MATM (for MATMAS inbound), ORDE, DELVRY, BAPI …
+    process_code : e.g. MATM — if blank or unknown, looked up in WE64/EDIFCT
     basic_type   : e.g. MATMAS01 (leave blank to use SAP default)
     """
     is_inbound = str(direction) in ("1", "inbound", "INBOUND")
+    dir_code   = "1" if is_inbound else "2"
+
+    # ── Resolve process code via WE64 if not provided or not in hardcoded map ──
+    if not process_code or process_code.upper() == message_type.upper():
+        looked_up = _we64_lookup_process_code(message_type, dir_code)
+        if looked_up:
+            print(f"  [WE64] Process code for {message_type} dir={dir_code}: {looked_up}",
+                  flush=True)
+            process_code = looked_up
+    else:
+        # Validate the supplied code against WE64; warn if mismatch
+        we64_code = _we64_lookup_process_code(message_type, dir_code)
+        if we64_code and we64_code != process_code:
+            print(f"  [WE64] Warning: supplied process_code={process_code} "
+                  f"but WE64 says {we64_code} for {message_type}. "
+                  f"Using WE64 value.", flush=True)
+            process_code = we64_code
 
     go_to_transaction("WE20")
     time.sleep(2)
@@ -3001,10 +3192,11 @@ PARTNER TYPE lookup (for create_partner_profile):
   SE16N → LFB1  (LIFNR  = partner) → exists → type=LI
   SE16N → KNB1  (KUNNR  = partner) → exists → type=KU
 
-PROCESS CODE mappings:
-  MATMAS → MATM   ORDERS/ORDERS05 → ORDE   INVOIC/INVOIC01 → INVL
-  DEBMAS → DEBM   CREMAS → CREM           DESADV/DELVRY → DELS
-  PORDCR/PORDCH → PORD   Unknown → same as message type (uppercase)
+PROCESS CODE — always use the value from get_idoc_detail result:
+  The summary["process_code"] field is looked up live from WE64/EDIFCT
+  (table EDIFCT, DIRECT+MESTYP filter) before returning. Use that value
+  directly — do NOT guess or use the hardcoded map. The hardcoded map
+  is only a fallback inside the Python code when WE64 returns nothing.
 
 DIRECTION: status 51/56/26/68 = always INBOUND (direction=1)
 
