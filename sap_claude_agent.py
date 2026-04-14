@@ -1184,7 +1184,7 @@ def _we02_navigate_to_idoc(docnum_padded: str) -> bool:
 
 
 def _find_gui_tree_anywhere():
-    """Walk the current screen and return the first GuiTree object found."""
+    """Walk the current screen and return the first GuiTree or tree-capable GuiShell."""
     found = [None]
     def _walk(comp, depth=0):
         if found[0] or depth > 7:
@@ -1196,7 +1196,7 @@ def _find_gui_tree_anywhere():
         for i in range(n):
             try:
                 child = comp.Children(i)
-                if child.Type == "GuiTree":
+                if child.Type in ("GuiTree", "GuiShell"):
                     found[0] = child
                     return
                 _walk(child, depth + 1)
@@ -2722,22 +2722,20 @@ def create_partner_profile(partner_number, partner_type, direction,
         session.FindById("wnd[0]").SendVKey(0)
         time.sleep(1.5)
 
-    # ── Step 3: Switch to Change mode if currently in Display mode ────────────
+    # ── Step 3: Ensure Change mode ────────────────────────────────────────────
+    # WE20 opens in change mode automatically when you click a partner in the
+    # tree — no explicit toggle needed.  But if somehow in display mode (e.g.
+    # opened via a read-only path), try the standard Ctrl+F1 pencil button.
     screen = get_screen_text()
-    if "Display" in screen:
-        for fid in ("wnd[0]/tbar[1]/btn[4]", "wnd[0]/tbar[0]/btn[4]"):
+    if any(w in screen for w in ("Display", "Anzeige")):
+        for fid in ("wnd[0]/tbar[1]/btn[4]", "wnd[0]/tbar[0]/btn[4]",
+                    "wnd[0]/tbar[1]/btn[1]"):
             try:
                 session.FindById(fid).Press()
                 time.sleep(1)
                 break
             except Exception:
                 pass
-        # Also try Ctrl+F1 (change mode toggle) or F5
-        try:
-            session.FindById("wnd[0]").SendVKey(4)
-            time.sleep(1)
-        except Exception:
-            pass
 
     # ── Step 4: Add the new inbound or outbound row ───────────────────────────
     # The WE20 Inbound / Outbound tables each have a row of 4 buttons below
@@ -2772,57 +2770,80 @@ def create_partner_profile(partner_number, partner_type, direction,
             break
 
     if not row_added:
-        # Fallback: use keyboard Insert on the table
-        elems = discover_elements()
-        for e in elems:
-            eid = e.get("id", "").upper()
-            section_kw = "INBOUND" if is_inbound else "OUTBOUND"
-            if section_kw in eid or f"TC_{section}" in eid:
-                try:
-                    session.FindById(e["id"]).SetFocus()
-                    session.FindById("wnd[0]").SendVKey(83)  # Insert row
-                    time.sleep(0.5)
-                    row_added = True
-                    break
-                except Exception:
-                    pass
+        # Last resort: hand off to user — the button IDs vary too much across
+        # SAP versions to guess reliably. User clicks the Create button in the
+        # Inbound section, we then fill the fields automatically.
+        result = wait_for_user_input(
+            screen_name="WE20 Partner Profile — Add Inbound Row",
+            instructions=(
+                f"Click the CREATE button (small icon) below the INBOUND table "
+                f"for partner {partner_number}. Do NOT fill any fields yet — "
+                f"just click the button to add the new empty row, then type 'done'."
+            ),
+        )
+        if result.get("status") == "user_completed":
+            row_added = True
 
-    # ── Step 5: Fill in Message Type and Process Code ─────────────────────────
+    # ── Step 5: Fill Message Type and Process Code ────────────────────────────
+    # Use _find_input_field_by_fragment — bypasses the 50-element cap of
+    # discover_elements(), which would miss the new row added at the bottom.
     time.sleep(0.5)
-    elems = discover_elements()
 
-    # Message Type — find first empty MESTYP field
-    for e in elems:
-        eid = e.get("id", "").upper()
-        cur = (e.get("text") or "").strip()
-        if "MESTYP" in eid and not cur:
+    msg_set = proc_set = False
+
+    # MESTYP — find first empty field (new row will be blank)
+    for frag in ("MESTYP", "MESTYPE", "MSG_TYPE"):
+        obj, _ = _find_input_field_by_fragment(frag)
+        if obj:
             try:
-                session.FindById(e["id"]).Text = message_type
-                break
-            except Exception:
-                pass
-
-    # Process Code — find first empty PROCOD / PROCESS field
-    for e in elems:
-        eid = e.get("id", "").upper()
-        cur = (e.get("text") or "").strip()
-        if ("PROCOD" in eid or "PRZNR" in eid) and not cur:
-            try:
-                session.FindById(e["id"]).Text = process_code
-                break
-            except Exception:
-                pass
-
-    # Basic Type (optional)
-    if basic_type:
-        for e in elems:
-            eid = e.get("id", "").upper()
-            cur = (e.get("text") or "").strip()
-            if ("BASIC" in eid or "IDOCTP" in eid or "MESTYP" not in eid
-                    and "DOCTYP" in eid) and not cur:
-                try:
-                    session.FindById(e["id"]).Text = basic_type
+                cur = (obj.Text or "").strip()
+                if not cur:          # use the empty (new) row
+                    obj.Text = message_type
+                    msg_set = True
                     break
+            except Exception:
+                pass
+    if not msg_set:
+        # No empty MESTYP found — set the last one (the new row is always last)
+        obj, _ = _find_input_field_by_fragment("MESTYP")
+        if obj:
+            try:
+                obj.Text = message_type
+                msg_set = True
+            except Exception:
+                pass
+
+    # PROCOD — process code field
+    for frag in ("PROCOD", "PRZNR", "PROCESS_CODE", "PROC_CODE"):
+        obj, _ = _find_input_field_by_fragment(frag)
+        if obj:
+            try:
+                cur = (obj.Text or "").strip()
+                if not cur:
+                    obj.Text = process_code
+                    proc_set = True
+                    break
+            except Exception:
+                pass
+    if not proc_set:
+        obj, _ = _find_input_field_by_fragment("PROCOD")
+        if obj:
+            try:
+                obj.Text = process_code
+                proc_set = True
+            except Exception:
+                pass
+
+    # Basic Type (optional) — IDOCTP field
+    if basic_type:
+        for frag in ("IDOCTP", "BASIC_TYPE", "BASICTYPE"):
+            obj, _ = _find_input_field_by_fragment(frag)
+            if obj:
+                try:
+                    cur = (obj.Text or "").strip()
+                    if not cur:
+                        obj.Text = basic_type
+                        break
                 except Exception:
                     pass
 
@@ -8326,7 +8347,7 @@ HOW TO USE wait_for_user_input:
      • instructions: exactly what the user must enter, e.g.
        "Enter: Company Code=1000, Name=SAP IDES DE, Country=DE, Currency=EUR.
         Then press Save (Ctrl+S) and click Local Object if a transport popup appears."
-     • fields: list of {name, value, note} for clear field-by-field guidance
+     • fields: list of {{name, value, note}} for clear field-by-field guidance
   2. The tool pauses and prompts the user in the console.
   3. User fills the screen in SAP, then types 'done'.
   4. Tool returns screen state — continue with the next step.
