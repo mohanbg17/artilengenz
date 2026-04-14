@@ -1948,20 +1948,280 @@ def ask_user_question(question: str, context: str, options: list = None) -> dict
     return {"answer": answer, "question": question, "context": context}
 
 
-# Classification labels and colours (console only — no ANSI needed, use text markers)
+# Classification labels
 _CLASS_LABEL = {
-    "SOLVED_BY_AGENT":    "SOLVED BY AGENT       ✓",
-    "HUMAN_THEN_AGENT":   "HUMAN + AGENT         ✓",
-    "CANNOT_SOLVE":       "CANNOT SOLVE          ✗",
-}
-_CLASS_BOX = {
-    "SOLVED_BY_AGENT":    "═",
-    "HUMAN_THEN_AGENT":   "═",
-    "CANNOT_SOLVE":       "═",
+    "SOLVED_BY_AGENT":  "SOLVED BY AGENT       ✓",
+    "HUMAN_THEN_AGENT": "HUMAN + AGENT         ✓",
+    "CANNOT_SOLVE":     "CANNOT SOLVE          ✗",
 }
 
 # Session-level list so the main loop can print a final summary table
 _session_resolutions: list = []
+
+# ── Next-steps guidance keyed by IDoc error type ───────────────────────────────
+# Each entry: patterns (substrings to match in error text, case-insensitive),
+# title, tcode, team, urgency, steps (list of strings).
+# The first matching entry is used.
+_CANNOT_SOLVE_GUIDANCE = [
+    {
+        "patterns": ["partner profile does not exist", "no inbound partner profile",
+                     "no outbound partner profile", "partner.*not found in we20",
+                     "kein.*partnerprofil", "inbound partner profile"],
+        "title":    "Missing Partner Profile",
+        "tcode":    "WE20",
+        "team":     "Basis / EDI team",
+        "urgency":  "High — IDoc will not post until profile exists",
+        "steps": [
+            "Open tcode WE20",
+            "In the left tree, expand the partner type node (LS / KU / LI)",
+            "Find partner <PARTNER> — if missing, click Create and enter partner number + type",
+            "Select the partner, switch to Change mode (pencil icon)",
+            "In the Inbound Parameters table, click Create (small icon in toolbar)",
+            "Enter: Message Type = <MESTYP>, Process Code = <PROCOD>",
+            "Optionally enter Basic Type = <BASIC_TYPE>",
+            "Press Ctrl+S to save",
+            "Return here and reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["posting period", "period not open", "fiscal period",
+                     "buchungsperiode", "period.*closed", "closed.*period",
+                     "period.*not allowed", "no open period"],
+        "title":    "Posting Period Not Open",
+        "tcode":    "OB52 (FI)  or  MMPV / MMRV (MM)",
+        "team":     "Finance controller / MM administrator",
+        "urgency":  "High — posting will fail until period is opened",
+        "steps": [
+            "For FI (financial documents): open tcode OB52",
+            "  → Find the posting period variant for company code",
+            "  → Open the relevant period (From/To period, From/To year)",
+            "  → Save",
+            "For MM (material documents): open tcode MMPV",
+            "  → Enter company code, period, year → Execute",
+            "After opening period: reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["material.*does not exist", "material.*not found",
+                     "no material master", "material.*unknown",
+                     "material.*not created", "material number.*invalid"],
+        "title":    "Material Master Does Not Exist",
+        "tcode":    "MM01",
+        "team":     "Material master / master data team",
+        "urgency":  "Medium — create material or reject IDoc",
+        "steps": [
+            "Verify whether material <MATERIAL> should exist",
+            "If yes: open MM01, create material with required views",
+            "  → Basic Data 1/2, Purchasing, MRP 1-4, Plant data, etc.",
+            "If no: mark IDoc as no further processing (WE02 → status 68)",
+            "After creating material: reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["customer.*does not exist", "customer.*not found",
+                     "no customer master", "debitor.*existiert nicht",
+                     "kunnr.*not found"],
+        "title":    "Customer Master Does Not Exist",
+        "tcode":    "XD01",
+        "team":     "Customer master / SD master data team",
+        "urgency":  "Medium — create customer or reject IDoc",
+        "steps": [
+            "Verify whether customer <PARTNER> should exist",
+            "If yes: open XD01, create customer in company code + sales area",
+            "  → General data, Company code data, Sales area data",
+            "If no: mark IDoc as no further processing (WE02 → right-click → status)",
+            "After creating customer: reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["vendor.*does not exist", "vendor.*not found",
+                     "no vendor master", "kreditor.*existiert nicht",
+                     "lifnr.*not found"],
+        "title":    "Vendor Master Does Not Exist",
+        "tcode":    "XK01",
+        "team":     "Vendor master / MM master data team",
+        "urgency":  "Medium — create vendor or reject IDoc",
+        "steps": [
+            "Verify whether vendor <PARTNER> should exist",
+            "If yes: open XK01, create vendor in company code + purchasing org",
+            "  → General data, Company code data, Purchasing organisation data",
+            "If no: mark IDoc as no further processing",
+            "After creating vendor: reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["company code.*does not exist", "company code.*not defined",
+                     "bukrs.*not found", "no company code", "buchungskreis"],
+        "title":    "Company Code Not Defined",
+        "tcode":    "OX02",
+        "team":     "Finance / Basis team",
+        "urgency":  "Critical — no posting is possible without company code",
+        "steps": [
+            "Open tcode OX02 (or SPRO → Enterprise Structure → Definition → FI)",
+            "Create company code with: code, name, country, currency, language",
+            "Assign company code to controlling area (OX19) if needed",
+            "Run tcode OBY6 to copy chart of accounts settings",
+            "Reprocess IDoc via BD87 after setup is complete",
+        ],
+    },
+    {
+        "patterns": ["port.*does not exist", "no port", "port.*not found",
+                     "rfc.*port", "we21", "port definition"],
+        "title":    "IDoc Port Not Defined",
+        "tcode":    "WE21",
+        "team":     "Basis / EDI team",
+        "urgency":  "High — IDocs cannot be dispatched without a port",
+        "steps": [
+            "Open tcode WE21",
+            "Select port type: RFC / File / TRFC / ABAP-PI",
+            "Create port with name matching what WE20 partner profile expects",
+            "For RFC port: enter RFC destination (SM59) pointing to target system",
+            "Save port definition",
+            "Update WE20 partner profile to reference the new port",
+            "Reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["authorization", "authorisation", "not authorised",
+                     "authority check", "no authorization", "auth.*failed",
+                     "berechtigungs"],
+        "title":    "Authorization Missing",
+        "tcode":    "SU01 / PFCG / SU53",
+        "team":     "Basis / Security team",
+        "urgency":  "High — background user lacks required authorisation",
+        "steps": [
+            "Open SU53 as the failing user (or check /nSU53 after the error)",
+            "  → Note the missing authorization object and field values",
+            "Open PFCG → find the role assigned to the background user",
+            "  → Add missing authorization object with required values",
+            "  → Generate and save role, then run user comparison",
+            "OR open SU01 → assign additional profile (e.g. EDI_ALL, S_IDOC_ALL)",
+            "Reprocess IDoc via BD87 after fixing authorization",
+        ],
+    },
+    {
+        "patterns": ["syntax error", "syntax check", "segment.*error",
+                     "field.*too long", "mandatory field.*missing",
+                     "idoc.*structure", "wrong segment"],
+        "title":    "IDoc Syntax / Segment Error",
+        "tcode":    "WE02 / WE19",
+        "team":     "EDI / Integration team",
+        "urgency":  "Medium — fix data in IDoc or in sending system",
+        "steps": [
+            "Open WE02, find IDoc <IDOCNUM>, review segment data",
+            "Identify the field causing the syntax error",
+            "Option A — fix IDoc directly:",
+            "  Open WE19, enter IDoc number, go to Change mode",
+            "  Edit the offending segment field, save",
+            "Option B — fix sending system:",
+            "  Correct the source data in the sending system",
+            "  Ask the sending system to resend the IDoc",
+            "Reprocess corrected IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["process code", "no inbound function module",
+                     "function module.*not found", "procod", "nacfn",
+                     "inbound.*function module"],
+        "title":    "Process Code / Function Module Missing",
+        "tcode":    "WE20 / WE64 / SE37",
+        "team":     "Basis / EDI team",
+        "urgency":  "High — IDoc cannot be processed without a process code",
+        "steps": [
+            "Open WE20 → find partner <PARTNER> → open Inbound Parameters",
+            "Check whether process code exists for message type <MESTYP>",
+            "If process code is missing or wrong:",
+            "  Open WE64 to verify process code → function module mapping",
+            "  Create/correct the process code to point to the correct FM",
+            "  In WE20, update the partner profile row with correct process code",
+            "  Press Ctrl+S to save",
+            "Reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["duplicate", "already posted", "already exists",
+                     "document already", "doppelt", "doppelter"],
+        "title":    "Duplicate / Already Posted Document",
+        "tcode":    "WE02 / SE16N (EDIDS)",
+        "team":     "Business user / application support",
+        "urgency":  "Low — confirm whether duplicate is valid before acting",
+        "steps": [
+            "Open WE02, find IDoc <IDOCNUM> — check the error message details",
+            "Search for the original document (check VBELN/BELNR in EDIDD segments)",
+            "If the document was genuinely already posted:",
+            "  The IDoc is correct — mark as no further processing",
+            "  In WE02 right-click IDoc → Set status → 68 (No further processing)",
+            "If this is a false duplicate (different data, same key):",
+            "  Investigate the key field collision and correct via WE19",
+            "  Reprocess via BD87",
+        ],
+    },
+    {
+        "patterns": ["exchange rate", "currency.*not found", "no exchange rate",
+                     "kurs.*nicht", "ob08", "tcurr"],
+        "title":    "Exchange Rate Not Maintained",
+        "tcode":    "OB08",
+        "team":     "Finance / Treasury team",
+        "urgency":  "Medium — posting fails until rate is entered",
+        "steps": [
+            "Open tcode OB08",
+            "Enter exchange rate type (usually M for standard), currency pair",
+            "Enter valid-from date and rate",
+            "Save",
+            "Reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["gl account", "g/l account", "account.*does not exist",
+                     "no account", "sachkonto", "fs00", "coa"],
+        "title":    "GL Account Does Not Exist",
+        "tcode":    "FS00",
+        "team":     "Finance team",
+        "urgency":  "Medium — posting requires valid GL account",
+        "steps": [
+            "Open tcode FS00",
+            "Enter GL account number and company code",
+            "Create account with: account group, short/long text, balance sheet/P&L",
+            "Assign to chart of accounts and add company code data",
+            "Save",
+            "Reprocess IDoc via BD87",
+        ],
+    },
+    {
+        "patterns": ["queue", "smq1", "smq2", "trfc", "bgRFC",
+                     "locked queue", "queue.*backlog"],
+        "title":    "ALE / qRFC Queue Backlog or Lock",
+        "tcode":    "SMQ1 (outbound)  or  SMQ2 (inbound)",
+        "team":     "Basis team",
+        "urgency":  "High — queued IDocs will not process until queue is released",
+        "steps": [
+            "Open SMQ1 (outbound queues) or SMQ2 (inbound queues)",
+            "Filter by queue name or RFC destination",
+            "Select locked/error entries, click Activate to release",
+            "Check RFC destination (SM59) is reachable",
+            "If RFC connection is down: fix network/logon, then release queue",
+            "Reprocess IDoc via BD87 or let queue process automatically",
+        ],
+    },
+]
+
+
+def _lookup_guidance(reason: str, what_was_done: str = "") -> dict | None:
+    """
+    Match the reason/error text against _CANNOT_SOLVE_GUIDANCE patterns.
+    Returns the first matching guidance entry, or None if no match.
+    """
+    text = (reason + " " + what_was_done).lower()
+    for entry in _CANNOT_SOLVE_GUIDANCE:
+        for pat in entry["patterns"]:
+            import re as _re
+            try:
+                if _re.search(pat.lower(), text):
+                    return entry
+            except Exception:
+                if pat.lower() in text:
+                    return entry
+    return None
 
 
 def set_idoc_resolution(idoc_number: str, classification: str,
@@ -1970,13 +2230,16 @@ def set_idoc_resolution(idoc_number: str, classification: str,
     """
     Record and display the final classification for an IDoc processing attempt.
 
-    classification must be one of:
-      SOLVED_BY_AGENT   — fixed entirely by the agent, no human help needed
-      HUMAN_THEN_AGENT  — human performed a manual step; agent completed the rest
-      CANNOT_SOLVE      — IDoc is still in error; explain why and what is needed
+    For CANNOT_SOLVE, automatically appends structured next-step guidance
+    based on the error type, even if next_steps is not provided by the agent.
     """
     label = _CLASS_LABEL.get(classification, classification)
     w = 66
+
+    # For CANNOT_SOLVE, look up structured guidance automatically
+    guidance = None
+    if classification == "CANNOT_SOLVE":
+        guidance = _lookup_guidance(reason, what_was_done)
 
     print(f"\n{'╔' + '═'*w + '╗'}", flush=True)
     print(f"║  IDoc {idoc_number}  —  {label:<{w - len(idoc_number) - 8}}║",
@@ -1985,10 +2248,10 @@ def set_idoc_resolution(idoc_number: str, classification: str,
 
     def _row(key, val):
         val = str(val)
-        while val:
-            chunk, val = val[:w - len(key) - 4], val[w - len(key) - 4:]
-            print(f"║  {key:<14}: {chunk:<{w - len(key) - 4}}║", flush=True)
-            key = ""   # only print key on first line
+        lines = [val[i:i+(w-len(key)-4)] for i in range(0, len(val), w-len(key)-4)] or [""]
+        for line in lines:
+            print(f"║  {key:<14}: {line:<{w - len(key) - 4}}║", flush=True)
+            key = ""
 
     if reason:
         _row("Reason", reason)
@@ -1996,6 +2259,28 @@ def set_idoc_resolution(idoc_number: str, classification: str,
         _row("Done", what_was_done)
     if next_steps:
         _row("Next steps", next_steps)
+
+    # ── Structured guidance block (CANNOT_SOLVE only) ─────────────────────────
+    if guidance:
+        print(f"{'╠' + '═'*w + '╣'}", flush=True)
+        print(f"║  SUGGESTED NEXT STEPS — {guidance['title']:<{w-26}}║", flush=True)
+        print(f"{'╠' + '─'*w + '╣'}", flush=True)
+        _row("Tcode",   guidance["tcode"])
+        _row("Team",    guidance["team"])
+        _row("Urgency", guidance["urgency"])
+        print(f"║  {'Steps':<14}:{'':>{w-16}}║", flush=True)
+        for i, step in enumerate(guidance["steps"], 1):
+            # Wrap long steps
+            prefix = f"  {i}. "
+            line = step
+            first = True
+            while line:
+                avail = w - 2
+                chunk = line[:avail]
+                line  = line[avail:]
+                pad   = prefix if first else "     "
+                first = False
+                print(f"║{pad}{chunk:<{avail - len(pad) + 2}}║", flush=True)
 
     print(f"{'╚' + '═'*w + '╝'}", flush=True)
 
@@ -2005,11 +2290,19 @@ def set_idoc_resolution(idoc_number: str, classification: str,
         "reason":         reason,
         "what_was_done":  what_was_done,
         "next_steps":     next_steps,
+        "guidance_title": guidance["title"] if guidance else "",
+        "guidance_tcode": guidance["tcode"] if guidance else "",
+        "guidance_team":  guidance["team"]  if guidance else "",
         "timestamp":      datetime.now().isoformat(),
     }
     _session_resolutions.append(entry)
     audit_log("IDOC_RESOLUTION", entry, status=classification)
-    return {"ok": True, "classification": classification, "idoc_number": idoc_number}
+    return {
+        "ok":             True,
+        "classification": classification,
+        "idoc_number":    idoc_number,
+        "guidance":       guidance["title"] if guidance else "no match",
+    }
 
 
 # ── Tool Definitions for Claude ────────────────────────────────────────────────
@@ -2763,9 +3056,13 @@ Classification rules — pick exactly one:
     When: IDoc is still in error state after all attempts, OR
           user confirmed the fix should not be done, OR
           fix requires action outside agent capability
-    reason       : exact blocking cause (be specific)
-    what_was_done: what was tried
-    next_steps   : exact manual steps + tcode + values the user needs
+    reason       : exact blocking cause (be specific — include error text,
+                   partner number, message type, any relevant values)
+    what_was_done: what was tried (list each attempt)
+    next_steps   : any additional manual context the user needs
+    NOTE: the system automatically appends a structured "Suggested Next Steps"
+          block (tcode, team, step-by-step guide) based on the error type.
+          You do NOT need to repeat those steps — just fill reason accurately.
 
 ═══════════════════════════════════════════════════════════
  WHEN STUCK — ASK THE USER, NEVER SILENTLY GIVE UP
