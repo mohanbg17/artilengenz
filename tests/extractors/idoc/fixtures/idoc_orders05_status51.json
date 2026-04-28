@@ -1,0 +1,66 @@
+{
+  "d": {
+    "results": [
+      {
+        "IdocNumber": "0000000000123451",
+        "Status": "51",
+        "CreationDateTime": "/Date(1745740800000)/",
+        "Direction": "2",
+        "MessageType": "ORDERS",
+        "BasicType": "ORDERS05",
+        "SenderPartnerNumber": "PARTNER_CUST_A",
+        "ReceiverPartnerNumber": "S4D_100",
+        "Client": "100",
+        "IdocStatusRecord": {
+          "results": [
+            {
+              "Counter": 1,
+              "Status": "50",
+              "StatusText": "IDoc added",
+              "LogDateTime": "/Date(1745740800000)/"
+            },
+            {
+              "Counter": 2,
+              "Status": "64",
+              "StatusText": "IDoc ready to be transferred to application",
+              "LogDateTime": "/Date(1745740830000)/"
+            },
+            {
+              "Counter": 3,
+              "Status": "51",
+              "StatusText": "Customer 0001000123 is not assigned to sales area 1000/10/00",
+              "LogDateTime": "/Date(1745740860000)/",
+              "MessageId": "V1",
+              "MessageNumber": "319",
+              "MessageV1": "0001000123",
+              "MessageV2": "1000",
+              "MessageV3": "10",
+              "MessageV4": "00",
+              "SegmentNumber": "000003",
+              "SegmentField": "PARTN"
+            }
+          ]
+        },
+        "IdocSegment": {
+          "results": [
+            {
+              "Counter": 1,
+              "SegmentName": "E1EDK01",
+              "SegmentData": "ZORD              0000000045123                       USD"
+            },
+            {
+              "Counter": 2,
+              "SegmentName": "E1EDKA1",
+              "SegmentData": "AGAG0001000123CUSTOMER_A_NAME                                              "
+            },
+            {
+              "Counter": 3,
+              "SegmentName": "E1EDP01",
+              "SegmentData": "0000010   10  EA   MATERIAL-001                                  100.000"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

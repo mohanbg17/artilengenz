@@ -1,0 +1,58 @@
+{
+  "d": {
+    "results": [
+      {
+        "IdocNumber": "0000000000123452",
+        "Status": "56",
+        "CreationDateTime": "/Date(1745744400000)/",
+        "Direction": "2",
+        "MessageType": "MATMAS",
+        "BasicType": "MATMAS05",
+        "SenderPartnerNumber": "MDG_HUB",
+        "ReceiverPartnerNumber": "S4D_100",
+        "Client": "100",
+        "IdocStatusRecord": {
+          "results": [
+            {
+              "Counter": 1,
+              "Status": "50",
+              "StatusText": "IDoc added",
+              "LogDateTime": "/Date(1745744400000)/"
+            },
+            {
+              "Counter": 2,
+              "Status": "56",
+              "StatusText": "Field MEINS contains an invalid value: ''",
+              "LogDateTime": "/Date(1745744430000)/",
+              "MessageId": "M3",
+              "MessageNumber": "807",
+              "MessageV1": "MEINS",
+              "MessageV2": "",
+              "SegmentNumber": "000005",
+              "SegmentField": "MEINS"
+            }
+          ]
+        },
+        "IdocSegment": {
+          "results": [
+            {
+              "Counter": 1,
+              "SegmentName": "E1MARAM",
+              "SegmentData": "MAT-XYZ-001                              FERT                              "
+            },
+            {
+              "Counter": 2,
+              "SegmentName": "E1MARAM",
+              "SegmentData": "MEINS field is blank in this segment which violates MARA_NOT_NULL_MEINS"
+            },
+            {
+              "Counter": 3,
+              "SegmentName": "E1MARCM",
+              "SegmentData": "MAT-XYZ-001    1000    FERT                                                "
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

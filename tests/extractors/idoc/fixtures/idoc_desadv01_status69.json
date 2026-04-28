@@ -1,0 +1,63 @@
+{
+  "d": {
+    "results": [
+      {
+        "IdocNumber": "0000000000123455",
+        "Status": "69",
+        "CreationDateTime": "/Date(1745755200000)/",
+        "Direction": "2",
+        "MessageType": "DESADV",
+        "BasicType": "DESADV01",
+        "SenderPartnerNumber": "PARTNER_CARRIER_Z",
+        "ReceiverPartnerNumber": "S4D_100",
+        "Client": "100",
+        "IdocStatusRecord": {
+          "results": [
+            {
+              "Counter": 1,
+              "Status": "01",
+              "StatusText": "IDoc generated",
+              "LogDateTime": "/Date(1745755200000)/"
+            },
+            {
+              "Counter": 2,
+              "Status": "26",
+              "StatusText": "Mandatory segment E1EDT13 missing for partner role WE",
+              "LogDateTime": "/Date(1745755230000)/",
+              "MessageId": "EF",
+              "MessageNumber": "065",
+              "MessageV1": "E1EDT13",
+              "MessageV2": "WE",
+              "SegmentNumber": "000000"
+            },
+            {
+              "Counter": 3,
+              "Status": "69",
+              "StatusText": "IDoc was edited via WE19; segment E1EDT13 added",
+              "LogDateTime": "/Date(1745755500000)/"
+            }
+          ]
+        },
+        "IdocSegment": {
+          "results": [
+            {
+              "Counter": 1,
+              "SegmentName": "E1EDL20",
+              "SegmentData": "0080005678                              ASN_OUTBOUND                        "
+            },
+            {
+              "Counter": 2,
+              "SegmentName": "E1EDT13",
+              "SegmentData": "WE  CARRIER_Z_DC                                                            "
+            },
+            {
+              "Counter": 3,
+              "SegmentName": "E1EDL24",
+              "SegmentData": "00010   MATERIAL-900                  500.000  EA                              "
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

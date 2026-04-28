@@ -1,0 +1,61 @@
+{
+  "d": {
+    "results": [
+      {
+        "IdocNumber": "0000000000123453",
+        "Status": "51",
+        "CreationDateTime": "/Date(1745748000000)/",
+        "Direction": "2",
+        "MessageType": "DELVRY",
+        "BasicType": "DELVRY07",
+        "SenderPartnerNumber": "WMS_3PL",
+        "ReceiverPartnerNumber": "S4D_100",
+        "Client": "100",
+        "IdocStatusRecord": {
+          "results": [
+            {
+              "Counter": 1,
+              "Status": "50",
+              "StatusText": "IDoc added",
+              "LogDateTime": "/Date(1745748000000)/"
+            },
+            {
+              "Counter": 2,
+              "Status": "64",
+              "StatusText": "IDoc ready to be transferred to application",
+              "LogDateTime": "/Date(1745748030000)/"
+            },
+            {
+              "Counter": 3,
+              "Status": "51",
+              "StatusText": "Confirmed quantity 250 EA exceeds open PO quantity 200 EA for PO 4500098123 item 00010",
+              "LogDateTime": "/Date(1745748060000)/",
+              "MessageId": "VL",
+              "MessageNumber": "144",
+              "MessageV1": "250",
+              "MessageV2": "200",
+              "MessageV3": "4500098123",
+              "MessageV4": "00010",
+              "SegmentNumber": "000004",
+              "SegmentField": "VRKME"
+            }
+          ]
+        },
+        "IdocSegment": {
+          "results": [
+            {
+              "Counter": 1,
+              "SegmentName": "E1EDL20",
+              "SegmentData": "0080001234                              GOODS_RECEIPT                       "
+            },
+            {
+              "Counter": 2,
+              "SegmentName": "E1EDL24",
+              "SegmentData": "00010   MATERIAL-501                  250.000  EA   4500098123     00010"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

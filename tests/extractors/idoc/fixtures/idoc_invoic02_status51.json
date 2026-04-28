@@ -1,0 +1,59 @@
+{
+  "d": {
+    "results": [
+      {
+        "IdocNumber": "0000000000123454",
+        "Status": "51",
+        "CreationDateTime": "/Date(1745751600000)/",
+        "Direction": "2",
+        "MessageType": "INVOIC",
+        "BasicType": "INVOIC02",
+        "SenderPartnerNumber": "VENDOR_X",
+        "ReceiverPartnerNumber": "S4D_100",
+        "Client": "100",
+        "IdocStatusRecord": {
+          "results": [
+            {
+              "Counter": 1,
+              "Status": "50",
+              "StatusText": "IDoc added",
+              "LogDateTime": "/Date(1745751600000)/"
+            },
+            {
+              "Counter": 2,
+              "Status": "51",
+              "StatusText": "Tax code A0 not defined for country DE in company code 1000",
+              "LogDateTime": "/Date(1745751660000)/",
+              "MessageId": "FF",
+              "MessageNumber": "713",
+              "MessageV1": "A0",
+              "MessageV2": "DE",
+              "MessageV3": "1000",
+              "SegmentNumber": "000007",
+              "SegmentField": "MWSKZ"
+            }
+          ]
+        },
+        "IdocSegment": {
+          "results": [
+            {
+              "Counter": 1,
+              "SegmentName": "E1EDK01",
+              "SegmentData": "INVO              INV-2025-04-1234                                       EUR"
+            },
+            {
+              "Counter": 2,
+              "SegmentName": "E1EDK04",
+              "SegmentData": "MWSTA0  19.000  1900.00                                                    "
+            },
+            {
+              "Counter": 3,
+              "SegmentName": "E1EDP01",
+              "SegmentData": "00010   10  EA   MATERIAL-700                              10000.00 EUR"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
