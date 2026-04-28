@@ -92,7 +92,7 @@ SELECT
   r.severity,
   r.short_text,
   r.error_id,
-  COALESCE(c.retry_count, 0) AS retry_count
+  COALESCE(c2.retry_count, 0) AS retry_count
 FROM raw.raw_errors r
 LEFT JOIN intel.v_latest_classifications c ON c.error_hash_key = r.hash_key
 LEFT JOIN (
