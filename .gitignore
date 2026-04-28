@@ -1,0 +1,17 @@
+﻿.env
+.env.*
+!.env.example
+*.key
+sk-ant-*
+ARTILEGENZ_INGEST_TOKEN*
+*token*.txt
+.venv/
+.venv.venv/
+__pycache__/
+*.pyc
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tgz
+*.zip
+vectors_*.json

@@ -1,0 +1,117 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  background-color: #0B0F18;
+  color: #D9D9D9;
+  font-family: 'Inter Tight', system-ui, sans-serif;
+}
+
+body {
+  min-height: 100vh;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(255,152,0,0.06), transparent 60%),
+    linear-gradient(180deg, #0B0F18 0%, #0B0F18 70%, #10151f 100%);
+}
+
+/* CRT-style subtle scanline overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(255,255,255,0.012) 0px,
+      rgba(255,255,255,0.012) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+  z-index: 1;
+  mix-blend-mode: overlay;
+}
+
+#root {
+  position: relative;
+  z-index: 2;
+}
+
+/* Scrollbars: thin, monospace-feeling */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #0B0F18; }
+::-webkit-scrollbar-thumb {
+  background: #2A3349;
+  border-radius: 0;
+}
+::-webkit-scrollbar-thumb:hover { background: #3a4a68; }
+
+/* Markdown styles inside the diagnosis panel */
+.md-render {
+  color: #D9D9D9;
+  line-height: 1.55;
+}
+.md-render h1,
+.md-render h2 {
+  font-family: 'Space Grotesk', sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #FFB347;
+  margin: 1.4em 0 0.5em 0;
+  border-bottom: 1px solid #2A3349;
+  padding-bottom: 0.3em;
+}
+.md-render h3 {
+  font-family: 'Space Grotesk', sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #FF9800;
+  margin: 1.1em 0 0.4em 0;
+}
+.md-render p { margin: 0.6em 0; }
+.md-render ul, .md-render ol { margin: 0.6em 0 0.8em 1.4em; }
+.md-render li { margin: 0.25em 0; }
+.md-render strong {
+  color: #FFFFFF;
+  font-weight: 600;
+}
+.md-render code {
+  font-family: 'JetBrains Mono', monospace;
+  background: #1C2238;
+  border: 1px solid #2A3349;
+  padding: 0.1em 0.4em;
+  border-radius: 2px;
+  font-size: 0.85em;
+  color: #FFB347;
+}
+.md-render pre {
+  background: #10151f;
+  border: 1px solid #2A3349;
+  padding: 0.9em 1.1em;
+  border-radius: 0;
+  overflow-x: auto;
+  margin: 0.8em 0;
+  font-size: 0.82em;
+  line-height: 1.6;
+}
+.md-render pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: #D9D9D9;
+}
+.md-render blockquote {
+  border-left: 2px solid #FF9800;
+  padding-left: 0.9em;
+  color: #9eaabe;
+  margin: 0.8em 0;
+}
